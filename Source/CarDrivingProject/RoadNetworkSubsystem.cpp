@@ -243,12 +243,18 @@ void URoadNetworkSubsystem::BuildEdgeCandidates()
 
 /// <summary>
 /// Detect where road splines come close at non-endpoint locations.
+/// Uses Grid Hash spatial index for O(N×K) performance instead of brute-force O(R²×S²).
 /// Must be called after BuildEdgeCandidates().
+///
+/// 偵測 spline 中段的交會點。使用 Grid Hash 空間索引加速，
+/// 時間複雜度從暴力的 O(R²×S²) 降到 O(N×K)。
+/// 必須在 BuildEdgeCandidates() 之後呼叫。
 /// </summary>
 void URoadNetworkSubsystem::DetectMidSplineJunctions()
 {
     JunctionCandidates.Empty();
 
+    // ---- 取得設定 / Get settings ----
     const ARoadWorldSettings* RoadSettings = GetRoadWorldSettings();
     if (!RoadSettings)
     {
@@ -261,21 +267,24 @@ void URoadNetworkSubsystem::DetectMidSplineJunctions()
     const float NodeMergeDist = RoadSettings->NodeMergeDistance;
     const float NodeMergeDistSq = FMath::Square(NodeMergeDist);
 
-    /*
-    Sample each road's spline at regular intervals.
-    Store as 2D structure: AllSamples[edgeIndex][sampleIndex] = {location, distance}
-    */
+    // ============================================================
+    // Step A：對每條路的 spline 取樣
+    // Step A: Sample each road's spline
+    // ============================================================
 
+    // 每個取樣點除了位置和距離，還需要知道它屬於哪條路
+    // Each sample needs to know which road it belongs to (for grid lookup later)
     struct FSplineSample
     {
-        FVector Location;    // World position
-        float Distance;      // Distance along spline
+        FVector Location;   // 世界座標 / World position
+        float Distance;     // 在 spline 上的距離(cm) / Distance along spline
+        int32 EdgeIndex;    // 屬於第幾條路 / Which road this sample belongs to
     };
 
-    TArray<TArray<FSplineSample>> AllSamples;
-    AllSamples.SetNum(EdgeCandidates.Num());
+    // 收集所有路的所有取樣點到一個扁平陣列（Grid Hash 需要用索引引用點）
+    // Collect all samples from all roads into one flat array (Grid Hash indexes into this)
+    TArray<FSplineSample> AllSamples;
 
-    //for each edge
     for (int32 EdgeIdx = 0; EdgeIdx < EdgeCandidates.Num(); ++EdgeIdx)
     {
         const FRoadEdgeCandidate& Edge = EdgeCandidates[EdgeIdx];
@@ -286,85 +295,198 @@ void URoadNetworkSubsystem::DetectMidSplineJunctions()
 
         const float SplineLength = Edge.InputSpline->GetSplineLength();
 
-        // divide the spline by the intervals to be the samples
+        // 從起點到終點，每隔 SampleStep 取一個點
+        // Sample from start to end at regular intervals
         for (float Dist = 0.0f; Dist <= SplineLength; Dist += SampleStep)
         {
             FSplineSample Sample;
             Sample.Location = Edge.InputSpline->GetLocationAtDistanceAlongSpline(
                 Dist, ESplineCoordinateSpace::World);
             Sample.Distance = Dist;
-            AllSamples[EdgeIdx].Add(Sample);
+            Sample.EdgeIndex = EdgeIdx;
+            AllSamples.Add(Sample);
         }
     }
 
-    /*
-    Compare samples between different roads to find mid-spline intersections.
-    */
-    for (int32 IdxA = 0; IdxA < EdgeCandidates.Num(); ++IdxA)
+    // ============================================================
+    // Step B：用 Grid Hash 空間索引取代暴力比較
+    // Step B: Use Grid Hash spatial index instead of brute-force
+    //
+    // 原理：把世界切成 CellSize×CellSize×CellSize 的格子，
+    // 每個點只跟同格和 26 個鄰格（3×3×3）裡的點比較。
+    // 遠處格子的點直接跳過，不需要計算距離。
+    //
+    // Principle: divide world into CellSize×CellSize×CellSize cells,
+    // each point only compares with points in same + 26 neighbor cells (3×3×3).
+    // Points in distant cells are skipped entirely — no distance calc needed.
+    //
+    //   ┌─────┬─────┬─────┬─────┐
+    //   │     │ ●A  │     │     │  ← A 在格子(1,0) / A in cell(1,0)
+    //   ├─────┼─────┼─────┼─────┤
+    //   │     │  ●B │     │     │  ← B 在鄰格(1,1) → 比較 ✓ / neighbor → compare
+    //   ├─────┼─────┼─────┼─────┤
+    //   │     │     │     │ ●C  │  ← C 在遠格(3,2) → 跳過 ✗ / far → skip
+    //   └─────┴─────┴─────┴─────┘
+    // ============================================================
+
+    // ---- Step B.1：建立格子 / Build the grid ----
+    //
+    // 格子大小 = DetectionRadius，這樣鄰格內的點距離最多 2×CellSize，
+    // 檢查 3×3×3 = 27 格就保證不漏掉任何在偵測半徑內的配對。
+    //
+    // Cell size = DetectionRadius, so adjacent cells are at most 2×CellSize apart.
+    // Checking 3×3×3 = 27 cells guarantees no missed pairs within detection radius.
+
+    const float CellSize = DetectionRadius;
+
+    // 把世界座標轉成格子座標的 helper lambda
+    // Lambda: convert world position → grid cell coordinate
+    auto WorldToCell = [CellSize](const FVector& Pos) -> FIntVector
     {
-        for (int32 IdxB = IdxA + 1; IdxB < EdgeCandidates.Num(); ++IdxB)
+        return FIntVector(
+            FMath::FloorToInt(Pos.X / CellSize),
+            FMath::FloorToInt(Pos.Y / CellSize),
+            FMath::FloorToInt(Pos.Z / CellSize)
+        );
+    };
+
+    // Grid：Key = 格子座標，Value = 該格子裡所有取樣點在 AllSamples 中的索引
+    // Grid: Key = cell coordinate, Value = indices into AllSamples for that cell
+    TMap<FIntVector, TArray<int32>> Grid;
+
+    // 把每個取樣點丟進對應的格子
+    // Insert each sample into its corresponding grid cell
+    for (int32 SampleIdx = 0; SampleIdx < AllSamples.Num(); ++SampleIdx)
+    {
+        const FIntVector CellKey = WorldToCell(AllSamples[SampleIdx].Location);
+        Grid.FindOrAdd(CellKey).Add(SampleIdx);
+    }
+
+    UE_LOG(LogTemp, Log,
+        TEXT("DetectMidSplineJunctions: %d samples in %d grid cells (CellSize=%.0f)"),
+        AllSamples.Num(), Grid.Num(), CellSize);
+
+    // ---- Step B.2：遍歷每個格子，只比較鄰格的點 ----
+    // ---- Iterate cells, compare only neighbor cell points ----
+    //
+    // 對每個有點的格子，檢查自己和 26 個鄰格（3×3×3 立方體），
+    // 只比較來自「不同路」的點配對。
+    //
+    // For each occupied cell, check itself + 26 neighbors (3×3×3 cube).
+    // Only compare pairs from DIFFERENT roads.
+
+    for (const auto& CellPair : Grid)
+    {
+        const FIntVector& CellKey = CellPair.Key;
+        const TArray<int32>& CellSamples = CellPair.Value;
+
+        // 遍歷 3×3×3 鄰域（包含自己）
+        // Iterate 3×3×3 neighborhood (including self)
+        for (int32 DX = -1; DX <= 1; ++DX)
         {
-            // Compare all sample point pairs between road A and road B
-            for (const FSplineSample& SampleA : AllSamples[IdxA])
+            for (int32 DY = -1; DY <= 1; ++DY)
             {
-                for (const FSplineSample& SampleB : AllSamples[IdxB])
+                for (int32 DZ = -1; DZ <= 1; ++DZ)
                 {
-                    const float DistSq = FVector::DistSquared(
-                        SampleA.Location, SampleB.Location);
+                    const FIntVector NeighborKey(
+                        CellKey.X + DX,
+                        CellKey.Y + DY,
+                        CellKey.Z + DZ
+                    );
 
-                    if (DistSq > DetectionRadiusSq)
+                    // 鄰格不存在就跳過（那裡沒有任何取樣點）
+                    // Skip if neighbor cell has no samples
+                    const TArray<int32>* NeighborSamples = Grid.Find(NeighborKey);
+                    if (!NeighborSamples)
                     {
                         continue;
                     }
 
-                    // 過濾：太靠近端點的不算（已被正常 node merge 處理）
-                    // Filter: skip if too close to spline endpoints
-                    const FRoadEdgeCandidate& EdgeA = EdgeCandidates[IdxA];
-                    const FRoadEdgeCandidate& EdgeB = EdgeCandidates[IdxB];
-
-                    const FVector JunctionLoc =
-                        (SampleA.Location + SampleB.Location) * 0.5f;
-
-                    const bool bNearEndpointA =
-                        FVector::DistSquared(JunctionLoc, EdgeA.StartWorldLocation) <= NodeMergeDistSq
-                        || FVector::DistSquared(JunctionLoc, EdgeA.EndWorldLocation) <= NodeMergeDistSq;
-
-                    const bool bNearEndpointB =
-                        FVector::DistSquared(JunctionLoc, EdgeB.StartWorldLocation) <= NodeMergeDistSq
-                        || FVector::DistSquared(JunctionLoc, EdgeB.EndWorldLocation) <= NodeMergeDistSq;
-
-                    if (bNearEndpointA || bNearEndpointB)
+                    // 比較本格的每個點 vs 鄰格的每個點
+                    // Compare each sample in this cell vs each in neighbor cell
+                    for (int32 IdxA : CellSamples)
                     {
-                        continue;
-                    }
-
-                    // 合併：跟已有的候選太近就不重複加入
-                    // Merge: skip if too close to an existing junction candidate
-                    bool bAlreadyExists = false;
-                    for (const FRoadJunctionCandidate& Existing : JunctionCandidates)
-                    {
-                        if (FVector::DistSquared(Existing.WorldLocation, JunctionLoc)
-                            <= DetectionRadiusSq)
+                        for (int32 IdxB : *NeighborSamples)
                         {
-                            bAlreadyExists = true;
-                            break;
+                            const FSplineSample& SampleA = AllSamples[IdxA];
+                            const FSplineSample& SampleB = AllSamples[IdxB];
+
+                            // 跳過同一條路的點（我們只找不同路的交會）
+                            // Skip same-road pairs (we only want inter-road junctions)
+                            if (SampleA.EdgeIndex == SampleB.EdgeIndex)
+                            {
+                                continue;
+                            }
+
+                            // 避免重複比較：只比較 EdgeA < EdgeB 的配對
+                            // Avoid duplicates: only compare when EdgeA < EdgeB
+                            if (SampleA.EdgeIndex > SampleB.EdgeIndex)
+                            {
+                                continue;
+                            }
+
+                            // 距離檢查（用距離平方避免開根號）
+                            // Distance check (squared to avoid sqrt)
+                            const float DistSq = FVector::DistSquared(
+                                SampleA.Location, SampleB.Location);
+
+                            if (DistSq > DetectionRadiusSq)
+                            {
+                                continue;
+                            }
+
+                            // 過濾：太靠近端點的不算（已被 BuildNodeCandidates 的 merge 處理）
+                            // Filter: skip if too close to spline endpoints (handled by node merge)
+                            const FRoadEdgeCandidate& EdgeA = EdgeCandidates[SampleA.EdgeIndex];
+                            const FRoadEdgeCandidate& EdgeB = EdgeCandidates[SampleB.EdgeIndex];
+
+                            // 取兩點的平均位置作為叉路位置
+                            // Average of the two sample positions = junction location
+                            const FVector JunctionLoc =
+                                (SampleA.Location + SampleB.Location) * 0.5f;
+
+                            const bool bNearEndpointA =
+                                FVector::DistSquared(JunctionLoc, EdgeA.StartWorldLocation) <= NodeMergeDistSq
+                                || FVector::DistSquared(JunctionLoc, EdgeA.EndWorldLocation) <= NodeMergeDistSq;
+
+                            const bool bNearEndpointB =
+                                FVector::DistSquared(JunctionLoc, EdgeB.StartWorldLocation) <= NodeMergeDistSq
+                                || FVector::DistSquared(JunctionLoc, EdgeB.EndWorldLocation) <= NodeMergeDistSq;
+
+                            if (bNearEndpointA || bNearEndpointB)
+                            {
+                                continue;
+                            }
+
+                            // 合併：跟已有的候選太近就不重複加入
+                            // Merge: skip if too close to an existing junction candidate
+                            bool bAlreadyExists = false;
+                            for (const FRoadJunctionCandidate& Existing : JunctionCandidates)
+                            {
+                                if (FVector::DistSquared(Existing.WorldLocation, JunctionLoc)
+                                    <= DetectionRadiusSq)
+                                {
+                                    bAlreadyExists = true;
+                                    break;
+                                }
+                            }
+
+                            if (bAlreadyExists)
+                            {
+                                continue;
+                            }
+
+                            // 新增叉路候選 / Add new junction candidate
+                            FRoadJunctionCandidate NewJunction;
+                            NewJunction.WorldLocation = JunctionLoc;
+                            NewJunction.EdgeCandidateIndexA = SampleA.EdgeIndex;
+                            NewJunction.DistanceOnSplineA = SampleA.Distance;
+                            NewJunction.EdgeCandidateIndexB = SampleB.EdgeIndex;
+                            NewJunction.DistanceOnSplineB = SampleB.Distance;
+
+                            JunctionCandidates.Add(NewJunction);
                         }
                     }
-
-                    if (bAlreadyExists)
-                    {
-                        continue;
-                    }
-
-                    // 新增叉路候選 / Add new junction candidate
-                    FRoadJunctionCandidate NewJunction;
-                    NewJunction.WorldLocation = JunctionLoc;
-                    NewJunction.EdgeCandidateIndexA = IdxA;
-                    NewJunction.DistanceOnSplineA = SampleA.Distance;
-                    NewJunction.EdgeCandidateIndexB = IdxB;
-                    NewJunction.DistanceOnSplineB = SampleB.Distance;
-
-                    JunctionCandidates.Add(NewJunction);
                 }
             }
         }
