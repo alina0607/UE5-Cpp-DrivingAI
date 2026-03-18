@@ -1,0 +1,342 @@
+// Fill out your copyright notice in the Description page of Project Settings.
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "RoadTypes.generated.h"
+
+class AActor;
+class USplineComponent;
+
+/// <summary>
+/// FRoadRuntimeData stores the runtime information of one road segment
+/// extracted from Blueprint road actors.
+/// </summary>
+USTRUCT(BlueprintType)
+struct CARDRIVINGPROJECT_API FRoadRuntimeData
+{
+	GENERATED_BODY()
+
+	/// <summary>
+	/// Original road Blueprint actor placed in the level
+	/// </summary>
+	UPROPERTY(BlueprintReadOnly)
+    TObjectPtr<AActor> RoadActor = nullptr;
+
+	/// <summary>
+	/// Spline component used by this road
+	/// </summary>
+	UPROPERTY(BlueprintReadOnly)
+	TObjectPtr<USplineComponent> InputSpline = nullptr;
+
+    /// <summary>
+    /// Start position of the road in world space
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    FVector StartWorldLocation = FVector::ZeroVector;
+
+    /// <summary>
+    /// End position of the road in world space
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    FVector EndWorldLocation = FVector::ZeroVector;
+
+    /// <summary>
+    /// Road length in meters
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    double LengthMeters = 0.0;
+
+    /// <summary>
+    /// Whether this road uses spline mode
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    bool bUseSpline = false;
+
+    /// <summary>
+    /// Whether this road forms a closed loop
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    bool bClosedLoop = false;
+
+    /// <summary>
+    /// Road type value read from the Blueprint
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    uint8 RoadType = 0;
+};
+
+/// <summary>
+/// One candidate graph edge generated from one road runtime entry.
+/// </summary>
+USTRUCT(BlueprintType)
+struct CARDRIVINGPROJECT_API FRoadEdgeCandidate
+{
+    GENERATED_BODY()
+
+    /// <summary>
+    /// Original road actor that produced this edge candidate.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    TObjectPtr<AActor> RoadActor = nullptr;
+
+    /// <summary>
+    /// Spline component used by this road.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    TObjectPtr<class USplineComponent> InputSpline = nullptr;
+
+    /// <summary>
+    /// Start position of this edge candidate in world space.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    FVector StartWorldLocation = FVector::ZeroVector;
+
+    /// <summary>
+    /// End position of this edge candidate in world space.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    FVector EndWorldLocation = FVector::ZeroVector;
+
+    /// <summary>
+    /// Road length in meters.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    double LengthMeters = 0.0;
+
+    /// <summary>
+    /// Road type copied from FRoadRuntimeData.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    uint8 RoadType = 0;
+
+    /// <summary>
+    /// Whether this road is a closed loop.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    bool bClosedLoop = false;
+};
+
+/// <summary>
+/// FRoadGraphNodeCandidate represents one candidate graph node
+/// built from road endpoints before final graph connectivity is assigned.
+/// </summary>
+USTRUCT(BlueprintType)
+struct CARDRIVINGPROJECT_API FRoadGraphNodeCandidate
+{
+    GENERATED_BODY()
+
+    /// <summary>
+    /// Temporary node id assigned during node candidate generation.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    int32 NodeId = INDEX_NONE;
+
+    /// <summary>
+    /// Representative world position of this node candidate.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    FVector WorldLocation = FVector::ZeroVector;
+
+    /// <summary>
+    /// Number of endpoints merged into this node candidate.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    int32 MergedEndpointCount = 0;
+};
+
+/// <summary>
+/// FRoadGraphEdge represents one finalized edge in the road graph.
+/// </summary>
+USTRUCT(BlueprintType)
+struct CARDRIVINGPROJECT_API FRoadGraphEdge
+{
+    GENERATED_BODY()
+
+    /// <summary>
+    /// Unique id of this graph edge.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    int32 EdgeId = INDEX_NONE;
+
+    /// <summary>
+    /// Start node id of this edge.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    int32 StartNodeId = INDEX_NONE;
+
+    /// <summary>
+    /// End node id of this edge.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    int32 EndNodeId = INDEX_NONE;
+
+    /// <summary>
+    /// Original road actor associated with this edge.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    TObjectPtr<AActor> RoadActor = nullptr;
+
+    /// <summary>
+    /// Spline component used by this edge.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    TObjectPtr<class USplineComponent> InputSpline = nullptr;
+
+    /// <summary>
+    /// Start distance along the spline in centimeters.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    float StartDistanceOnSpline = 0.0f;
+
+    /// <summary>
+    /// End distance along the spline in centimeters.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    float EndDistanceOnSpline = 0.0f;
+
+    /// <summary>
+    /// World-space start position of this edge.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    FVector StartWorldLocation = FVector::ZeroVector;
+
+    /// <summary>
+    /// World-space end position of this edge.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    FVector EndWorldLocation = FVector::ZeroVector;
+
+    /// <summary>
+    /// Length of this edge in meters.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    double LengthMeters = 0.0;
+
+    /// <summary>
+    /// Road type associated with this edge.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    uint8 RoadType = 0;
+};
+
+/// <summary>
+/// Final node inside the road graph
+/// </summary>
+USTRUCT(BlueprintType)
+struct CARDRIVINGPROJECT_API FRoadGraphNode
+{
+    GENERATED_BODY()
+
+    /// <summary>
+    /// Node identifier
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    int32 NodeId = INDEX_NONE;
+
+    /// <summary>
+    /// World location of node
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    FVector WorldLocation = FVector::ZeroVector;
+
+    /// <summary>
+    /// All edges connected to this node
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    TArray<int32> ConnectedEdgeIds;
+};
+
+/// <summary>
+/// FRoadGraphNeighbor represents one reachable neighboring node.
+/// </summary>
+USTRUCT(BlueprintType)
+struct CARDRIVINGPROJECT_API FRoadGraphNeighbor
+{
+    GENERATED_BODY()
+
+    /// <summary>
+    /// Neighbor node id.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    int32 NeighborNodeId = INDEX_NONE;
+
+    /// <summary>
+    /// Edge id used to reach this neighbor.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    int32 EdgeId = INDEX_NONE;
+
+    /// <summary>
+    /// Traversal cost of this edge. First version uses road length.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    float Cost = 0.0f;
+};
+
+/// <summary>
+/// FRoadGraphPath represents a node path returned by A* search.
+/// </summary>
+USTRUCT(BlueprintType)
+struct CARDRIVINGPROJECT_API FRoadGraphPath
+{
+    GENERATED_BODY()
+
+    /// <summary>
+    /// Whether a path was successfully found.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    bool bPathFound = false;
+
+    /// <summary>
+    /// Ordered node id sequence of the path.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    TArray<int32> NodePath;
+
+    /// <summary>
+    /// Total path cost.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    float TotalCost = 0.0f;
+};
+
+/// <summary>
+/// Junction candidate: detected where two road splines come close
+/// to each other at non-endpoint locations.
+/// </summary>
+USTRUCT(BlueprintType)
+struct CARDRIVINGPROJECT_API FRoadJunctionCandidate
+{
+    GENERATED_BODY()
+
+    /// <summary>
+    /// World position of the junction (average of the two closest sample points)
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    FVector WorldLocation = FVector::ZeroVector;
+
+    /// <summary>
+    /// Index of road A in the EdgeCandidates array
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    int32 EdgeCandidateIndexA = INDEX_NONE;
+
+    /// <summary>
+    /// Distance along road A's spline where the junction occurs (cm)
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    float DistanceOnSplineA = 0.0f;
+
+    /// <summary>
+    /// Index of road B in the EdgeCandidates array
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    int32 EdgeCandidateIndexB = INDEX_NONE;
+
+    /// <summary>
+    /// Distance along road B's spline where the junction occurs (cm)
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    float DistanceOnSplineB = 0.0f;
+};

@@ -1,0 +1,22 @@
+# UE5 Build
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+Build/
+
+
+*.umap
+*.uasset
+
+# Visual Studio
+.vs/
+*.sln
+*.suo
+
+# Rider
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
