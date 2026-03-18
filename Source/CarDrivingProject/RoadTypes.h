@@ -302,8 +302,9 @@ struct CARDRIVINGPROJECT_API FRoadGraphPath
 };
 
 /// <summary>
-/// Junction candidate: detected where two road splines come close
-/// to each other at non-endpoint locations.
+/// 叉路候選：多條路在同一位置交會
+/// Junction candidate: multiple roads meeting at one location.
+/// Supports T-junctions (2 roads), crossroads (3-4 roads), etc.
 /// </summary>
 USTRUCT(BlueprintType)
 struct CARDRIVINGPROJECT_API FRoadJunctionCandidate
@@ -311,32 +312,24 @@ struct CARDRIVINGPROJECT_API FRoadJunctionCandidate
     GENERATED_BODY()
 
     /// <summary>
-    /// World position of the junction (average of the two closest sample points)
+    /// 交會點的世界座標（所有交會取樣點的平均值）
+    /// World position of the junction (average of all contributing sample points)
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     FVector WorldLocation = FVector::ZeroVector;
 
     /// <summary>
-    /// Index of road A in the EdgeCandidates array
+    /// 在此路口交會的所有邊候選索引（EdgeCandidates 陣列的 index）
+    /// Indices of all edge candidates that meet at this junction
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
-    int32 EdgeCandidateIndexA = INDEX_NONE;
+    TArray<int32> ConnectedEdgeIndices;
 
     /// <summary>
-    /// Distance along road A's spline where the junction occurs (cm)
+    /// 每條邊在交會點的 spline 距離（cm），與 ConnectedEdgeIndices 一一對應
+    /// Distance along each edge's spline where the junction occurs (cm).
+    /// Parallel array with ConnectedEdgeIndices.
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
-    float DistanceOnSplineA = 0.0f;
-
-    /// <summary>
-    /// Index of road B in the EdgeCandidates array
-    /// </summary>
-    UPROPERTY(BlueprintReadOnly)
-    int32 EdgeCandidateIndexB = INDEX_NONE;
-
-    /// <summary>
-    /// Distance along road B's spline where the junction occurs (cm)
-    /// </summary>
-    UPROPERTY(BlueprintReadOnly)
-    float DistanceOnSplineB = 0.0f;
+    TArray<float> DistancesOnSpline;
 };

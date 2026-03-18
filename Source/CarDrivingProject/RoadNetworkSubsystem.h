@@ -153,7 +153,6 @@ private:
 	void HandleWorldBeginPlay();
 
 	/// <summary>
-	/// 偵測 spline 中段的交會點，必須在 BuildEdgeCandidates() 之後呼叫
 	/// Detect where road splines come close at non-endpoint locations.
 	/// Must be called after BuildEdgeCandidates().
 	/// </summary>
