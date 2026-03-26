@@ -127,6 +127,57 @@ bool URoadBPReflectionLibrary::ExtractRoadCoreData(AActor* RoadActor, FRoadRunti
         }
     }
 
+    // Read "Two Roads" as a bool property.
+    if (FBoolProperty* BoolProp = FindFProperty<FBoolProperty>(ActorClass, TEXT("Two Roads")))
+    {
+        OutData.bTwoRoads = BoolProp->GetPropertyValue_InContainer(RoadActor);
+    }
+
+    // Read "Two Roads Gap, M" as a double property.
+    // 兩條平行路面之間的間距（公尺）
+    if (FDoubleProperty* DoubleProp = FindFProperty<FDoubleProperty>(ActorClass, TEXT("Two Roads Gap, M")))
+    {
+        OutData.TwoRoadsGapM = DoubleProp->GetPropertyValue_InContainer(RoadActor);
+    }
+
+    // Read "Road Width Multiplier" as a double property.
+    // 路面寬度乘數（預設 1.0）
+    if (FDoubleProperty* DoubleProp = FindFProperty<FDoubleProperty>(ActorClass, TEXT("Road Width Multiplier")))
+    {
+        OutData.RoadWidthMultiplier = DoubleProp->GetPropertyValue_InContainer(RoadActor);
+    }
+
+    // Read "Additional Width, m" as a double property.
+    // 額外路面寬度（公尺）
+    if (FDoubleProperty* DoubleProp = FindFProperty<FDoubleProperty>(ActorClass, TEXT("Additional Width, m")))
+    {
+        OutData.AdditionalWidthM = DoubleProp->GetPropertyValue_InContainer(RoadActor);
+    }
+
+    // 從 "Road Settings" struct 讀取 GuardrailSideOffset（路面半寬）
+    // Read GuardrailSideOffset (road half-width) from "Road Settings" struct
+    if (FStructProperty* StructProp = FindFProperty<FStructProperty>(ActorClass, TEXT("Road Settings")))
+    {
+        UScriptStruct* InnerStruct = StructProp->Struct;
+        const void* StructData = StructProp->ContainerPtrToValuePtr<void>(RoadActor);
+
+        // BP struct 欄位名稱帶有 GUID 後綴，無法用 FindFProperty 直接找
+        // 改用遍歷找名稱開頭為 "GuardrailSideOffset" 的欄位
+        // BP struct field names have GUID suffixes, so we iterate and match by prefix
+        for (TFieldIterator<FProperty> It(InnerStruct); It; ++It)
+        {
+            FProperty* InnerProp = *It;
+            if (InnerProp->GetName().StartsWith(TEXT("GuardrailSideOffset")))
+            {
+                if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(InnerProp))
+                {
+                    OutData.GuardrailSideOffsetCm = DoubleProp->GetPropertyValue_InContainer(StructData);
+                }
+                break;
+            }
+        }
+    }
+
     /*
     UE_LOG(LogTemp, Warning, TEXT("=== ExtractRoadCoreData Result ==="));
     UE_LOG(LogTemp, Warning, TEXT("Actor: %s"), *RoadActor->GetName());

@@ -82,4 +82,11 @@ public:
     /// </summary>
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Road Network")
     float SplineSampleStep = 200.0f;
+
+    /// <summary>
+    /// 標準車道寬度（cm）。3.5m 為國際通用標準
+    /// Standard lane width in cm. 3.5m is the international standard.
+    /// </summary>
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Road Network")
+    float LaneWidthCm = 350.0f;
 };

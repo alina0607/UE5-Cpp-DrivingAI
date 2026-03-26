@@ -64,6 +64,43 @@ struct CARDRIVINGPROJECT_API FRoadRuntimeData
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     uint8 RoadType = 0;
+
+    /// <summary>
+    /// BP 是否勾選 "Two Roads"（在 spline 兩側各生成一條路面 mesh）
+    /// Whether this road uses the "Two Roads" mode (two parallel road meshes).
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    bool bTwoRoads = false;
+
+    /// <summary>
+    /// 兩條平行路面之間的間距（公尺），僅在 bTwoRoads=true 時有意義
+    /// Gap between the two parallel roads in meters (only relevant when bTwoRoads is true).
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    double TwoRoadsGapM = 0.0;
+
+    /// <summary>
+    /// 路面寬度乘數（BP 的 "Road Width Multiplier"）
+    /// Road width multiplier from the Blueprint asset.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    double RoadWidthMultiplier = 1.0;
+
+    /// <summary>
+    /// 額外路面寬度（公尺，BP 的 "Additional Width, m"）
+    /// Additional road width in meters from the Blueprint asset.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    double AdditionalWidthM = 0.0;
+
+    /// <summary>
+    /// 從 Road Settings struct 讀取的 GuardrailSideOffset（cm）
+    /// = 路面半寬（spline 中心到路面邊緣的距離）
+    /// GuardrailSideOffset from Road Settings struct (cm).
+    /// = road half-width (distance from spline center to road edge).
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    double GuardrailSideOffsetCm = 350.0;
 };
 
 /// <summary>
@@ -115,6 +152,41 @@ struct CARDRIVINGPROJECT_API FRoadEdgeCandidate
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     bool bClosedLoop = false;
+
+    /// <summary>
+    /// BP 是否勾選 "Two Roads"（兩側各一條路面）
+    /// Whether this road uses "Two Roads" mode.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    bool bTwoRoads = false;
+
+    /// <summary>
+    /// 兩條路面的間距（公尺）
+    /// Gap between the two parallel roads in meters.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    double TwoRoadsGapM = 0.0;
+
+    /// <summary>
+    /// 路面寬度乘數
+    /// Road width multiplier from BP.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    double RoadWidthMultiplier = 1.0;
+
+    /// <summary>
+    /// 額外路面寬度（公尺）
+    /// Additional road width in meters from BP.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    double AdditionalWidthM = 0.0;
+
+    /// <summary>
+    /// 路面半寬（cm），從 BP Road Settings 讀取
+    /// Road half-width (cm) from BP Road Settings.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    double GuardrailSideOffsetCm = 350.0;
 };
 
 /// <summary>
@@ -218,6 +290,41 @@ struct CARDRIVINGPROJECT_API FRoadGraphEdge
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     uint8 RoadType = 0;
+
+    /// <summary>
+    /// 該邊是否為 Two Roads 模式（BP 在 spline 兩側各生成一條路面）
+    /// Whether this edge uses "Two Roads" mode (two parallel road meshes).
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    bool bTwoRoads = false;
+
+    /// <summary>
+    /// Two Roads 的間距（公尺），只在 bTwoRoads=true 時有意義
+    /// Gap between the two parallel roads in meters (only when bTwoRoads=true).
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    double TwoRoadsGapM = 0.0;
+
+    /// <summary>
+    /// 路面寬度乘數
+    /// Road width multiplier from BP.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    double RoadWidthMultiplier = 1.0;
+
+    /// <summary>
+    /// 額外路面寬度（公尺）
+    /// Additional road width in meters from BP.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    double AdditionalWidthM = 0.0;
+
+    /// <summary>
+    /// 路面半寬（cm），從 BP Road Settings 讀取
+    /// Road half-width (cm) from BP Road Settings.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    double GuardrailSideOffsetCm = 350.0;
 };
 
 /// <summary>

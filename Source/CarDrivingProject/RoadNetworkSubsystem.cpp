@@ -90,13 +90,6 @@ void URoadNetworkSubsystem::BuildRoadCache()
         return;
     }
 
-    // 印出所有 WorldSettings 設定值，確認 Editor 裡改的有生效
-    // Print all WorldSettings values to verify Editor changes took effect
-    UE_LOG(LogTemp, Warning,
-        TEXT("BuildRoadCache Settings: NodeMergeDistance=%.0f | JunctionDetectionRadius=%.0f | SplineSampleStep=%.0f"),
-        RoadSettings->NodeMergeDistance,
-        RoadSettings->JunctionDetectionRadius,
-        RoadSettings->SplineSampleStep);
 
     TArray<AActor*> FoundRoadActors;
     UGameplayStatics::GetAllActorsOfClass(World, RoadSettings->RoadActorClass, FoundRoadActors);
@@ -130,20 +123,6 @@ void URoadNetworkSubsystem::BuildRoadCache()
             AllRoads.Add(RoadData);
         }
     }
-    UE_LOG(LogTemp, Warning, TEXT("BuildRoadCache: Cached %d roads"), AllRoads.Num());
-
-    for (const FRoadRuntimeData& RoadData : AllRoads)
-    {
-        FRoadDrivingRule Rule = URoadRuleLibrary::GetDrivingRuleFromRoadData(RoadData);
-
-        UE_LOG(LogTemp, Warning, TEXT("Road %s | RoadType=%d | Rule=%s | Implemented=%s | AllowOvertaking=%s"),
-            RoadData.RoadActor ? *RoadData.RoadActor->GetActorLabel() : TEXT("NULL"),
-            (int32)RoadData.RoadType,
-            *Rule.RuleName,
-            Rule.bImplemented ? TEXT("true") : TEXT("false"),
-            Rule.bAllowOvertaking ? TEXT("true") : TEXT("false"));
-    }
-
     BuildEdgeCandidates();
     DetectMidSplineJunctions();
     BuildNodeCandidates();
@@ -151,69 +130,6 @@ void URoadNetworkSubsystem::BuildRoadCache()
     BuildGraphNodes();
     DrawDebugGraph();
 
-    for (const FRoadGraphNode& Node : GraphNodes)
-    {
-        TArray<FRoadGraphNeighbor> Neighbors = GetNeighborNodes(Node.NodeId);
-
-        FString NeighborText;
-        for (const FRoadGraphNeighbor& Neighbor : Neighbors)
-        {
-            NeighborText += FString::Printf(TEXT("%d "), Neighbor.NeighborNodeId);
-        }
-
-        UE_LOG(
-            LogTemp,
-            Warning,
-            TEXT("Node %d | NeighborCount=%d | Neighbors=%s"),
-            Node.NodeId,
-            Neighbors.Num(),
-            *NeighborText
-        );
-    }
-
-    if (GraphNodes.Num() > 0)
-    {
-        /* 
-        Test nearest node lookup using the first graph node's own location.
-        */
-        const FVector TestLocation = GraphNodes[0].WorldLocation;
-        const int32 NearestNodeId = FindNearestGraphNode(TestLocation);
-
-        UE_LOG(
-            LogTemp,
-            Warning,
-            TEXT("Test FindNearestGraphNode | Input=(%.2f, %.2f, %.2f) | Result=%d"),
-            TestLocation.X,
-            TestLocation.Y,
-            TestLocation.Z,
-            NearestNodeId
-        );
-    }
-
-    if (GraphNodes.Num() >= 2)
-    {
-        const int32 StartNodeId = 0;
-        const int32 GoalNodeId = 3;
-
-        const FRoadGraphPath TestPath = FindPathAStar(StartNodeId, GoalNodeId);
-
-        FString PathText;
-        for (int32 NodeId : TestPath.NodePath)
-        {
-            PathText += FString::Printf(TEXT("%d "), NodeId);
-        }
-
-        UE_LOG(
-            LogTemp,
-            Warning,
-            TEXT("Test AStar | Start=%d | Goal=%d | Found=%s | Cost=%.2f | Path=%s"),
-            StartNodeId,
-            GoalNodeId,
-            TestPath.bPathFound ? TEXT("true") : TEXT("false"),
-            TestPath.TotalCost,
-            *PathText
-        );
-    }
 }
 
 /// <summary>
@@ -241,8 +157,28 @@ void URoadNetworkSubsystem::BuildEdgeCandidates()
         Candidate.LengthMeters = RoadData.LengthMeters;
         Candidate.RoadType = RoadData.RoadType;
         Candidate.bClosedLoop = RoadData.bClosedLoop;
+        Candidate.bTwoRoads = RoadData.bTwoRoads;
+        Candidate.TwoRoadsGapM = RoadData.TwoRoadsGapM;
+        Candidate.RoadWidthMultiplier = RoadData.RoadWidthMultiplier;
+        Candidate.AdditionalWidthM = RoadData.AdditionalWidthM;
+        Candidate.GuardrailSideOffsetCm = RoadData.GuardrailSideOffsetCm;
 
         EdgeCandidates.Add(Candidate);
+    }
+
+    // 印出每條邊的詳細資訊（含 TwoRoads 狀態）以便驗證
+    // Log each edge candidate's details including TwoRoads status
+    for (int32 i = 0; i < EdgeCandidates.Num(); ++i)
+    {
+        const FRoadEdgeCandidate& EC = EdgeCandidates[i];
+        UE_LOG(LogTemp, Warning,
+            TEXT("  Edge[%d] %s | RoadType=%d | TwoRoads=%s | Gap=%.1fm | Length=%.1fm"),
+            i,
+            EC.RoadActor ? *EC.RoadActor->GetActorLabel() : TEXT("NULL"),
+            EC.RoadType,
+            EC.bTwoRoads ? TEXT("true") : TEXT("false"),
+            EC.TwoRoadsGapM,
+            EC.LengthMeters);
     }
 
     UE_LOG(LogTemp, Warning, TEXT("BuildEdgeCandidates: Built %d edge candidates"), EdgeCandidates.Num());
@@ -406,21 +342,7 @@ void URoadNetworkSubsystem::DetectMidSplineJunctions()
                                 continue;
                             }
 
-                            // ---- 端點過濾：用 spline 距離判斷，不用世界座標 ----
                             // Endpoint filter: use distance along spline, NOT world-space distance.
-                            //
-                            // 為什麼？因為世界座標判斷不可靠：
-                            // DetectionRadius=500cm 會找到離端點很遠的取樣點，
-                            // 但它們的 spline 距離可能很靠近端點。
-                            //
-                            // 判斷方式：看取樣點在自己 spline 上離起點/終點多遠
-                            // - 離起點 < NodeMergeDist → 在端點附近
-                            // - 離終點 < NodeMergeDist → 在端點附近
-                            // - 兩邊都在端點附近 → 端點對端點（路接隧道）→ 跳過
-                            // - 只有一邊在端點 → T 字路口 → 保留
-                            //
-                            // Why? World-space check is unreliable with large DetectionRadius.
-                            // Instead, check each sample's distance along its OWN spline.
                             // If close to start (dist~0) or end (dist~splineLength) → near endpoint.
 
                             const FRoadEdgeCandidate& EdgeA = EdgeCandidates[SampleA.EdgeIndex];
@@ -431,10 +353,6 @@ void URoadNetworkSubsystem::DetectMidSplineJunctions()
                             const float SplineLengthB = EdgeB.InputSpline
                                 ? EdgeB.InputSpline->GetSplineLength() : 0.0f;
 
-                            // 用 DetectionRadius 當門檻（不是 NodeMergeDist）
-                            // 因為 DetectionRadius 決定了多遠的點會被抓到，
-                            // 如果取樣點在這個範圍內又靠近自己端點，就是端點連接不是叉路。
-                            //
                             // Use DetectionRadius as threshold (not NodeMergeDist).
                             // If a sample is within detection range AND near its own endpoint,
                             // it's an endpoint connection, not a junction.
@@ -446,24 +364,20 @@ void URoadNetworkSubsystem::DetectMidSplineJunctions()
                                 SampleB.Distance <= DetectionRadius
                                 || (SplineLengthB - SampleB.Distance) <= DetectionRadius;
 
-                            // 兩邊都在端點附近 → 端點對端點（路接隧道、路接路）→ 跳過
                             // Both near their own endpoints → endpoint-to-endpoint → skip
                             if (bSampleANearOwnEndpoint && bSampleBNearOwnEndpoint)
                             {
                                 continue;
                             }
 
-                            // 到這裡代表至少一邊是 spline 中段 → 可能是真正的 T 字路口
                             // At least one side is mid-spline → potential real junction
 
                             const FVector JunctionLoc =
                                 (SampleA.Location + SampleB.Location) * 0.5f;
 
-                            // ---- 合併到既有 junction 或新增 ----
                             // Merge into existing junction or create new one.
                             // This handles crossroads: if 3+ roads meet at one point,
                             // they all get added to the same junction.
-
                             int32 ExistingJunctionIdx = INDEX_NONE;
                             for (int32 JIdx = 0; JIdx < JunctionCandidates.Num(); ++JIdx)
                             {
@@ -477,7 +391,6 @@ void URoadNetworkSubsystem::DetectMidSplineJunctions()
 
                             if (ExistingJunctionIdx != INDEX_NONE)
                             {
-                                // 已有 junction → 把新的 edge 加進去（避免重複）
                                 // Existing junction → add new edges if not already present
                                 FRoadJunctionCandidate& Existing = JunctionCandidates[ExistingJunctionIdx];
 
@@ -494,7 +407,6 @@ void URoadNetworkSubsystem::DetectMidSplineJunctions()
                             }
                             else
                             {
-                                // 新 junction → 兩條 edge 都加進去
                                 // New junction → add both edges
                                 FRoadJunctionCandidate NewJunction;
                                 NewJunction.WorldLocation = JunctionLoc;
@@ -510,32 +422,6 @@ void URoadNetworkSubsystem::DetectMidSplineJunctions()
                 }
             }
         }
-    }
-
-    UE_LOG(LogTemp, Warning,
-        TEXT("DetectMidSplineJunctions: Found %d junction candidates"),
-        JunctionCandidates.Num());
-
-    // 印出每個叉路的詳細資訊方便除錯
-    // Print details of each junction for debugging
-    for (int32 i = 0; i < JunctionCandidates.Num(); ++i)
-    {
-        const FRoadJunctionCandidate& J = JunctionCandidates[i];
-
-        // 組合所有連接邊的字串 / Build string of all connected edges
-        FString EdgesStr;
-        for (int32 k = 0; k < J.ConnectedEdgeIndices.Num(); ++k)
-        {
-            if (k > 0) { EdgesStr += TEXT(", "); }
-            EdgesStr += FString::Printf(TEXT("E%d@%.0f"),
-                J.ConnectedEdgeIndices[k], J.DistancesOnSpline[k]);
-        }
-
-        UE_LOG(LogTemp, Warning,
-            TEXT("  Junction[%d] Loc=(%.0f,%.0f,%.0f) | Edges=[%s]"),
-            i,
-            J.WorldLocation.X, J.WorldLocation.Y, J.WorldLocation.Z,
-            *EdgesStr);
     }
 }
 
@@ -592,68 +478,21 @@ void URoadNetworkSubsystem::BuildNodeCandidates()
             NodeCandidates.Add(NewNode);
         };
 
-    // 對每條路的起點和終點做合併或新增
     // Process start and end point of each edge candidate
     for (int32 i = 0; i < EdgeCandidates.Num(); ++i)
     {
         const FRoadEdgeCandidate& Edge = EdgeCandidates[i];
 
-        // 合併前記錄 node 數量，合併後比較就知道是 merge 還是 new
-        // Track node count before/after to detect merge vs new
-        const int32 CountBefore1 = NodeCandidates.Num();
         AddOrMergePoint(Edge.StartWorldLocation);
-        const bool bMergedStart = (NodeCandidates.Num() == CountBefore1);
-
-        const int32 CountBefore2 = NodeCandidates.Num();
         AddOrMergePoint(Edge.EndWorldLocation);
-        const bool bMergedEnd = (NodeCandidates.Num() == CountBefore2);
-
-        UE_LOG(LogTemp, Log,
-            TEXT("  Edge%d START=(%.0f,%.0f,%.0f) %s | END=(%.0f,%.0f,%.0f) %s"),
-            i,
-            Edge.StartWorldLocation.X, Edge.StartWorldLocation.Y, Edge.StartWorldLocation.Z,
-            bMergedStart ? TEXT("MERGED") : TEXT("NEW"),
-            Edge.EndWorldLocation.X, Edge.EndWorldLocation.Y, Edge.EndWorldLocation.Z,
-            bMergedEnd ? TEXT("MERGED") : TEXT("NEW"));
     }
 
-    // ---- Step 2.1：加入 junction 候選的位置作為 node candidate ----
     // Add junction locations as node candidates so A* can route through junctions
     for (int32 JIdx = 0; JIdx < JunctionCandidates.Num(); ++JIdx)
     {
         const FRoadJunctionCandidate& Junction = JunctionCandidates[JIdx];
-
-        const int32 CountBefore = NodeCandidates.Num();
         AddOrMergePoint(Junction.WorldLocation);
-        const bool bMerged = (NodeCandidates.Num() == CountBefore);
-
-        UE_LOG(LogTemp, Log,
-            TEXT("  Junction[%d] Loc=(%.0f,%.0f,%.0f) %s"),
-            JIdx,
-            Junction.WorldLocation.X, Junction.WorldLocation.Y, Junction.WorldLocation.Z,
-            bMerged ? TEXT("MERGED into existing node") : TEXT("NEW node"));
     }
-
-    // 印出所有 node 之間的距離，找出哪些應該合併但沒有
-    // Print distances between all nodes to find unmerged pairs
-    for (int32 i = 0; i < NodeCandidates.Num(); ++i)
-    {
-        for (int32 j = i + 1; j < NodeCandidates.Num(); ++j)
-        {
-            const float Dist = FVector::Dist(
-                NodeCandidates[i].WorldLocation, NodeCandidates[j].WorldLocation);
-            if (Dist < 1000.0f)
-            {
-                UE_LOG(LogTemp, Warning,
-                    TEXT("  NODE PROXIMITY: N%d <-> N%d = %.1f cm %s"),
-                    i, j, Dist,
-                    Dist <= MergeDistance ? TEXT("(SHOULD HAVE MERGED!)") : TEXT(""));
-            }
-        }
-    }
-
-    UE_LOG(LogTemp, Warning, TEXT("BuildNodeCandidates: Built %d node candidates (MergeDistance=%.0f)"),
-        NodeCandidates.Num(), MergeDistance);
 }
 
 /// <summary>
@@ -686,7 +525,6 @@ void URoadNetworkSubsystem::BuildGraphEdges()
 {
     GraphEdges.Empty();
 
-    // 對每個 EdgeCandidate，收集所有落在它上面的 junction 切割點
     // For each EdgeCandidate, collect all junction split points on its spline
     for (int32 EdgeIdx = 0; EdgeIdx < EdgeCandidates.Num(); ++EdgeIdx)
     {
@@ -695,8 +533,7 @@ void URoadNetworkSubsystem::BuildGraphEdges()
         const float SplineLengthCm = EdgeCandidate.InputSpline
             ? EdgeCandidate.InputSpline->GetSplineLength() : 0.0f;
 
-        // ---- 收集切割點 / Collect split points ----
-        // 每個切割點 = (spline 距離, 世界座標)
+        // ---- Collect split points ----
         // Each split point = (distance along spline, world location)
         struct FSplitPoint
         {
@@ -706,13 +543,12 @@ void URoadNetworkSubsystem::BuildGraphEdges()
 
         TArray<FSplitPoint> SplitPoints;
 
-        // 起點 / Start point
+        //Start point
         FSplitPoint StartSplit;
         StartSplit.DistanceOnSpline = 0.0f;
         StartSplit.WorldLocation = EdgeCandidate.StartWorldLocation;
         SplitPoints.Add(StartSplit);
 
-        // 加入所有落在這條邊上的 junction
         // Add all junctions that fall on this edge
         for (const FRoadJunctionCandidate& Junction : JunctionCandidates)
         {
@@ -724,30 +560,29 @@ void URoadNetworkSubsystem::BuildGraphEdges()
                     JunctionSplit.DistanceOnSpline = Junction.DistancesOnSpline[k];
                     JunctionSplit.WorldLocation = Junction.WorldLocation;
                     SplitPoints.Add(JunctionSplit);
-                    break; // 同一個 junction 不會在同一條邊上出現兩次
+                    break; //dont add same junction at same time
                 }
             }
         }
 
-        // 終點 / End point
+        //End point
         FSplitPoint EndSplit;
         EndSplit.DistanceOnSpline = SplineLengthCm;
         EndSplit.WorldLocation = EdgeCandidate.EndWorldLocation;
         SplitPoints.Add(EndSplit);
 
-        // 按 spline 距離排序 / Sort by distance along spline
+        //Sort by distance along spline
         SplitPoints.Sort([](const FSplitPoint& A, const FSplitPoint& B)
         {
             return A.DistanceOnSpline < B.DistanceOnSpline;
         });
 
-        // ---- 對每對相鄰切割點建立子邊 / Create sub-edges between adjacent split points ----
+        // ---- Create sub-edges between adjacent split points ----
         for (int32 i = 0; i < SplitPoints.Num() - 1; ++i)
         {
             const FSplitPoint& From = SplitPoints[i];
             const FSplitPoint& To = SplitPoints[i + 1];
 
-            // 跳過零長度的子邊（切割點重合時）
             // Skip zero-length sub-edges (when split points coincide)
             if (FMath::IsNearlyEqual(From.DistanceOnSpline, To.DistanceOnSpline, 1.0f))
             {
@@ -762,7 +597,6 @@ void URoadNetworkSubsystem::BuildGraphEdges()
                 continue;
             }
 
-            // 跳過起終點是同一個 node 的邊（自環）
             // Skip self-loops
             if (StartNodeId == EndNodeId)
             {
@@ -780,8 +614,12 @@ void URoadNetworkSubsystem::BuildGraphEdges()
             NewEdge.StartWorldLocation = From.WorldLocation;
             NewEdge.EndWorldLocation = To.WorldLocation;
             NewEdge.RoadType = EdgeCandidate.RoadType;
+            NewEdge.bTwoRoads = EdgeCandidate.bTwoRoads;
+            NewEdge.TwoRoadsGapM = EdgeCandidate.TwoRoadsGapM;
+            NewEdge.RoadWidthMultiplier = EdgeCandidate.RoadWidthMultiplier;
+            NewEdge.AdditionalWidthM = EdgeCandidate.AdditionalWidthM;
+            NewEdge.GuardrailSideOffsetCm = EdgeCandidate.GuardrailSideOffsetCm;
 
-            // 子邊長度 = 該段 spline 的長度（公分轉公尺）
             // Sub-edge length = spline segment length (cm → meters)
             NewEdge.LengthMeters = (To.DistanceOnSpline - From.DistanceOnSpline) / 100.0;
 
@@ -1265,7 +1103,7 @@ void URoadNetworkSubsystem::DrawDebugGraph()
         }
     }
 
-    // ---- 畫叉路候選（紅色球體，比 node 大）/ Draw junction candidates (red, larger than nodes) ----
+    // ---- Draw junction candidates (red, larger than nodes) ----
     for (int32 i = 0; i < JunctionCandidates.Num(); ++i)
     {
         const FRoadJunctionCandidate& J = JunctionCandidates[i];
@@ -1282,7 +1120,6 @@ void URoadNetworkSubsystem::DrawDebugGraph()
             12.0f
         );
 
-        // 在球體上方印出叉路編號和連接的邊
         // Print junction index and connected edges above the sphere
         FString JEdgesStr;
         for (int32 k = 0; k < J.ConnectedEdgeIndices.Num(); ++k)
@@ -1311,4 +1148,85 @@ void URoadNetworkSubsystem::DrawDebugGraph()
         bHasFinalEdges ? GraphEdges.Num() : EdgeCandidates.Num(),
         JunctionCandidates.Num()
     );
+
+    // ---- 寫死測試：用 A* 找路徑並畫黃色粗線 ----
+    // Hardcoded test: run A* between two nodes and draw the path in yellow
+    if (bHasFinalEdges && bHasFinalNodes)
+    {
+        const int32 TestStartNode = 9;
+        const int32 TestGoalNode = 2;
+
+        const FRoadGraphPath TestPath = FindPathAStar(TestStartNode, TestGoalNode);
+
+        UE_LOG(LogTemp, Warning,
+            TEXT("Test AStar | Start=%d | Goal=%d | Found=%s | Cost=%.2f | Path=%s"),
+            TestStartNode, TestGoalNode,
+            TestPath.bPathFound ? TEXT("true") : TEXT("false"),
+            TestPath.TotalCost,
+            *FString::JoinBy(TestPath.NodePath, TEXT(" "),
+                [](int32 N) { return FString::Printf(TEXT("%d"), N); }));
+
+        if (TestPath.bPathFound)
+        {
+            // 對路徑中每對相鄰 node，找到連接的 edge 並沿 spline 畫黃色粗線
+            // For each adjacent node pair in the path, find the connecting edge
+            // and draw it as a thick yellow line along the spline
+            for (int32 i = 0; i < TestPath.NodePath.Num() - 1; ++i)
+            {
+                const int32 FromNode = TestPath.NodePath[i];
+                const int32 ToNode = TestPath.NodePath[i + 1];
+
+                for (const FRoadGraphEdge& Edge : GraphEdges)
+                {
+                    const bool bMatch =
+                        (Edge.StartNodeId == FromNode && Edge.EndNodeId == ToNode)
+                        || (Edge.StartNodeId == ToNode && Edge.EndNodeId == FromNode);
+
+                    if (!bMatch)
+                    {
+                        continue;
+                    }
+
+                    if (!Edge.InputSpline)
+                    {
+                        break;
+                    }
+
+                    // 沿 spline 取樣畫線（抬高 80cm 避免跟路面重疊）
+                    // Sample along spline and draw (raised 80cm to avoid z-fighting)
+                    const float FromDist = Edge.StartDistanceOnSpline;
+                    const float ToDist = Edge.EndDistanceOnSpline;
+                    const int32 NumSteps = FMath::Max(1,
+                        FMath::CeilToInt(FMath::Abs(ToDist - FromDist) / 300.0f));
+
+                    FVector PrevPt = Edge.InputSpline->GetLocationAtDistanceAlongSpline(
+                        FromDist, ESplineCoordinateSpace::World);
+
+                    for (int32 S = 1; S <= NumSteps; ++S)
+                    {
+                        const float D = FMath::Lerp(FromDist, ToDist,
+                            static_cast<float>(S) / static_cast<float>(NumSteps));
+
+                        const FVector Pt = Edge.InputSpline->GetLocationAtDistanceAlongSpline(
+                            D, ESplineCoordinateSpace::World);
+
+                        DrawDebugLine(
+                            World,
+                            PrevPt + FVector(0.0f, 0.0f, 80.0f),
+                            Pt + FVector(0.0f, 0.0f, 80.0f),
+                            FColor::Yellow,
+                            false,
+                            Duration,
+                            0,
+                            EdgeThickness * 2.5f
+                        );
+
+                        PrevPt = Pt;
+                    }
+
+                    break;  // 找到了就不用繼續搜尋
+                }
+            }
+        }
+    }
 }
