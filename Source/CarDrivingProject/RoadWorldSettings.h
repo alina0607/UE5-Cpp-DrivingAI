@@ -64,6 +64,13 @@ public:
     float DebugEdgeThickness = 20.0f;
 
     /// <summary>
+    /// Debug 線條的 Z 軸抬高量（cm）— 避免被路面遮住
+    /// Z offset for debug lines (cm) — raise above road surface.
+    /// </summary>
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Road Debug")
+    float DebugDrawZOffset = 500.0f;
+
+    /// <summary>
     /// Debug draw duration in seconds.
     /// </summary>
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Road Debug")

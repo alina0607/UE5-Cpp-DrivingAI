@@ -162,6 +162,8 @@ void URoadNetworkSubsystem::BuildEdgeCandidates()
         Candidate.RoadWidthMultiplier = RoadData.RoadWidthMultiplier;
         Candidate.AdditionalWidthM = RoadData.AdditionalWidthM;
         Candidate.GuardrailSideOffsetCm = RoadData.GuardrailSideOffsetCm;
+        Candidate.AutoLaneWidthCm = RoadData.AutoLaneWidthCm;
+        Candidate.AutoMedianCm = RoadData.AutoMedianCm;
 
         EdgeCandidates.Add(Candidate);
     }
@@ -619,6 +621,8 @@ void URoadNetworkSubsystem::BuildGraphEdges()
             NewEdge.RoadWidthMultiplier = EdgeCandidate.RoadWidthMultiplier;
             NewEdge.AdditionalWidthM = EdgeCandidate.AdditionalWidthM;
             NewEdge.GuardrailSideOffsetCm = EdgeCandidate.GuardrailSideOffsetCm;
+            NewEdge.AutoLaneWidthCm = EdgeCandidate.AutoLaneWidthCm;
+            NewEdge.AutoMedianCm = EdgeCandidate.AutoMedianCm;
 
             // Sub-edge length = spline segment length (cm → meters)
             NewEdge.LengthMeters = (To.DistanceOnSpline - From.DistanceOnSpline) / 100.0;
@@ -912,6 +916,10 @@ void URoadNetworkSubsystem::DrawDebugGraph()
     const float Duration = RoadSettings->DebugDrawDuration;
     const float NodeRadius = RoadSettings->DebugNodeRadius;
     const float EdgeThickness = RoadSettings->DebugEdgeThickness;
+    const float ZOff = RoadSettings->DebugDrawZOffset;
+    const FVector EdgeZOffset(0.0f, 0.0f, ZOff);
+    const FVector NodeZOffset(0.0f, 0.0f, ZOff);
+    const FVector AStarZOffset(0.0f, 0.0f, ZOff + 200.0f); // A* 比 edge 再高 200
 
     const bool bHasFinalNodes = GraphNodes.Num() > 0;
     const bool bHasFinalEdges = GraphEdges.Num() > 0;
@@ -945,7 +953,7 @@ void URoadNetworkSubsystem::DrawDebugGraph()
                         Edge.InputSpline->GetLocationAtDistanceAlongSpline(
                             StartDist,
                             ESplineCoordinateSpace::World
-                        );
+                        ) + EdgeZOffset;
 
                     for (int32 SegmentIndex = 1; SegmentIndex <= NumSegments; ++SegmentIndex)
                     {
@@ -956,7 +964,7 @@ void URoadNetworkSubsystem::DrawDebugGraph()
                             Edge.InputSpline->GetLocationAtDistanceAlongSpline(
                                 CurrentDist,
                                 ESplineCoordinateSpace::World
-                            );
+                            ) + EdgeZOffset;
 
                         DrawDebugLine(
                             World,
@@ -990,11 +998,11 @@ void URoadNetworkSubsystem::DrawDebugGraph()
                 if (RoadSettings->bDrawDebugEdgeLabels)
                 {
                     const FVector MidPoint =
-                        (Edge.StartWorldLocation + Edge.EndWorldLocation) * 0.5f;
+                        (Edge.StartWorldLocation + Edge.EndWorldLocation) * 0.5f + EdgeZOffset;
 
                     DrawDebugString(
                         World,
-                        MidPoint + FVector(0.0f, 0.0f, 150.0f),
+                        MidPoint + FVector(0.0f, 0.0f, 100.0f),
                         FString::Printf(
                             TEXT("E%d  %d->%d"),
                             Edge.EdgeId,
@@ -1037,9 +1045,11 @@ void URoadNetworkSubsystem::DrawDebugGraph()
         {
             for (const FRoadGraphNode& Node : GraphNodes)
             {
+                const FVector NodeDrawPos = Node.WorldLocation + NodeZOffset;
+
                 DrawDebugSphere(
                     World,
-                    Node.WorldLocation,
+                    NodeDrawPos,
                     NodeRadius,
                     12,
                     FColor::Green,
@@ -1049,12 +1059,11 @@ void URoadNetworkSubsystem::DrawDebugGraph()
                     10.0f
                 );
 
-                // Optionally draw node id and connected edge count.
                 if (RoadSettings->bDrawDebugNodeLabels)
                 {
                     DrawDebugString(
                         World,
-                        Node.WorldLocation + FVector(0.0f, 0.0f, 250.0f),
+                        NodeDrawPos + FVector(0.0f, 0.0f, 150.0f),
                         FString::Printf(
                             TEXT("N%d  E:%d"),
                             Node.NodeId,
@@ -1108,9 +1117,11 @@ void URoadNetworkSubsystem::DrawDebugGraph()
     {
         const FRoadJunctionCandidate& J = JunctionCandidates[i];
 
+        const FVector JunctionDrawPos = J.WorldLocation + NodeZOffset;
+
         DrawDebugSphere(
             World,
-            J.WorldLocation,
+            JunctionDrawPos,
             NodeRadius * 1.5f,   // Slightly larger than normal nodes
             12,
             FColor::Red,         // Red = junction
@@ -1130,7 +1141,7 @@ void URoadNetworkSubsystem::DrawDebugGraph()
 
         DrawDebugString(
             World,
-            J.WorldLocation + FVector(0.0f, 0.0f, 350.0f),
+            JunctionDrawPos + FVector(0.0f, 0.0f, 150.0f),
             FString::Printf(TEXT("J%d [%s]"), i, *JEdgesStr),
             nullptr,
             FColor::Red,
@@ -1192,15 +1203,15 @@ void URoadNetworkSubsystem::DrawDebugGraph()
                         break;
                     }
 
-                    // 沿 spline 取樣畫線（抬高 80cm 避免跟路面重疊）
-                    // Sample along spline and draw (raised 80cm to avoid z-fighting)
+                    // 沿 spline 取樣畫線（比 edge 再高 200cm，方便辨識）
+                    // Sample along spline and draw (higher than edges for visibility)
                     const float FromDist = Edge.StartDistanceOnSpline;
                     const float ToDist = Edge.EndDistanceOnSpline;
                     const int32 NumSteps = FMath::Max(1,
-                        FMath::CeilToInt(FMath::Abs(ToDist - FromDist) / 300.0f));
+                        FMath::CeilToInt(FMath::Abs(ToDist - FromDist) / 200.0f));
 
                     FVector PrevPt = Edge.InputSpline->GetLocationAtDistanceAlongSpline(
-                        FromDist, ESplineCoordinateSpace::World);
+                        FromDist, ESplineCoordinateSpace::World) + AStarZOffset;
 
                     for (int32 S = 1; S <= NumSteps; ++S)
                     {
@@ -1208,17 +1219,17 @@ void URoadNetworkSubsystem::DrawDebugGraph()
                             static_cast<float>(S) / static_cast<float>(NumSteps));
 
                         const FVector Pt = Edge.InputSpline->GetLocationAtDistanceAlongSpline(
-                            D, ESplineCoordinateSpace::World);
+                            D, ESplineCoordinateSpace::World) + AStarZOffset;
 
                         DrawDebugLine(
                             World,
-                            PrevPt + FVector(0.0f, 0.0f, 80.0f),
-                            Pt + FVector(0.0f, 0.0f, 80.0f),
+                            PrevPt,
+                            Pt,
                             FColor::Yellow,
                             false,
                             Duration,
                             0,
-                            EdgeThickness * 2.5f
+                            EdgeThickness * 3.0f
                         );
 
                         PrevPt = Pt;

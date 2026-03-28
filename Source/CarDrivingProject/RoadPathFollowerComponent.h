@@ -10,6 +10,17 @@ class URoadNetworkSubsystem;
 class USplineComponent;
 
 /// <summary>
+/// 方向燈狀態 / Turn signal state
+/// </summary>
+UENUM(BlueprintType)
+enum class ETurnSignal : uint8
+{
+	None   UMETA(DisplayName = "None"),
+	Left   UMETA(DisplayName = "Left"),
+	Right  UMETA(DisplayName = "Right"),
+};
+
+/// <summary>
 /// 路徑跟隨內部用的片段資料：一段 spline 上從 A 開到 B
 /// Internal path segment: drive along a spline from StartDist to EndDist.
 /// </summary>
@@ -18,78 +29,46 @@ struct FPathSegmentInternal
 {
 	GENERATED_BODY()
 
-	/// <summary>
-	/// 要走的 spline
-	/// Spline to follow
-	/// </summary>
 	UPROPERTY()
 	TObjectPtr<USplineComponent> Spline = nullptr;
 
-	/// <summary>
-	/// 起始 spline 距離（cm）
-	/// Start distance along spline (cm)
-	/// </summary>
 	float StartDist = 0.0f;
-
-	/// <summary>
-	/// 結束 spline 距離（cm）
-	/// End distance along spline (cm)
-	/// </summary>
 	float EndDist = 0.0f;
 
-	/// <summary>
-	/// 行進方向：+1.0 = 沿 spline 正向，-1.0 = 反向
-	/// Travel direction: +1 = forward along spline, -1 = reverse
-	/// </summary>
+	/// +1.0 = 沿 spline 正向，-1.0 = 反向 / +1 forward, -1 reverse
 	float Direction = 1.0f;
 
-	/// <summary>
-	/// 該邊是否為 Two Roads 模式
-	/// Whether this edge uses Two Roads mode
-	/// </summary>
 	bool bTwoRoads = false;
-
-	/// <summary>
-	/// Two Roads 的間距（公尺）
-	/// Two Roads gap in meters
-	/// </summary>
 	double TwoRoadsGapM = 0.0;
-
-	/// <summary>
-	/// 該邊的道路類型（從 FRoadGraphEdge 取得）
-	/// Road type for this segment (from FRoadGraphEdge)
-	/// </summary>
 	uint8 RoadType = 0;
-
-	/// <summary>
-	/// 快取的行駛規則（避免每幀查表）
-	/// Cached driving rule (avoids per-tick lookup)
-	/// </summary>
 	FRoadDrivingRule DrivingRule;
-
-	/// <summary>
-	/// 路面寬度乘數（從 BP 讀取）
-	/// Road width multiplier from BP.
-	/// </summary>
 	double RoadWidthMultiplier = 1.0;
-
-	/// <summary>
-	/// 額外路面寬度（公尺，從 BP 讀取）
-	/// Additional road width in meters from BP.
-	/// </summary>
 	double AdditionalWidthM = 0.0;
-
-	/// <summary>
-	/// 路面半寬（cm），從 BP Road Settings 讀取
-	/// Road half-width (cm), directly from BP's GuardrailSideOffset.
-	/// </summary>
 	double GuardrailSideOffsetCm = 350.0;
+	float AutoLaneWidthCm = 0.0f;
+	float AutoMedianCm = 0.0f;
+
+	/// 該段 spline 的長度（cm，用於剩餘距離計算）
+	/// Segment travel length in cm (for remaining distance calculation)
+	float GetTravelLength() const { return FMath::Abs(EndDist - StartDist); }
 };
 
 /// <summary>
-/// 車輛路徑跟隨元件：掛在任何 Actor 上，讓它沿著 A* 路徑行駛
-/// Vehicle path follower component: attach to any Actor to make it
-/// drive along an A* path on the road network, offset to the right lane.
+/// 路徑完成事件 / Path completion event delegate
+/// </summary>
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnPathEvent, bool, bSuccess);
+
+/// <summary>
+/// 車輛路徑跟隨元件 — Layer 3 Motion Control
+///
+/// 核心機制 / Core mechanisms:
+///   1. 追蹤點模型（Pursuit Point）— 車追向前方目標點，自然產生平滑轉彎
+///   2. 加速/煞車 — 起步加速、終點前減速、彎道自動降速
+///   3. 車道切換插值 — RequestLaneChange() 平滑橫向移動
+///   4. 路口過渡混合 — 段與段銜接處 blend 避免突變
+///
+/// Vehicle path follower with pursuit point model, speed control,
+/// lane change interpolation, and junction blending.
 /// </summary>
 UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
 class CARDRIVINGPROJECT_API URoadPathFollowerComponent : public UActorComponent
@@ -103,129 +82,266 @@ public:
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType,
 		FActorComponentTickFunction* ThisTickFunction) override;
 
-	// ---- 可在 Editor 裡設定的參數 / Editor-configurable parameters ----
+	// ================================================================
+	//  導航 / Navigation
+	// ================================================================
 
-	/// <summary>
-	/// A* 起始 Node ID（寫死測試用）
-	/// Start node ID for hardcoded A* test
-	/// </summary>
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path")
+	/// A* 起始 Node ID（寫死測試用）/ Start node for A* test
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Navigation")
 	int32 StartNodeId = 9;
 
-	/// <summary>
-	/// A* 目標 Node ID（寫死測試用）
-	/// Goal node ID for hardcoded A* test
-	/// </summary>
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path")
+	/// A* 目標 Node ID（寫死測試用）/ Goal node for A* test
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Navigation")
 	int32 GoalNodeId = 2;
 
-	/// <summary>
-	/// 行駛速度（cm/s）
-	/// Travel speed in cm/s (500 = 5 m/s ≈ 18 km/h)
-	/// </summary>
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path")
-	float Speed = 500.0f;
-
-	/// <summary>
-	/// 目前車道索引（0 = 最右邊的預設車道）
-	/// Current lane index (0 = rightmost default lane)
-	/// </summary>
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path")
-	int32 CurrentLaneIndex = 0;
-
-	/// <summary>
-	/// bTwoRoads=true 時的額外中間偏移（cm）
-	/// 補償分隔道路中間的路燈、分隔島等空間
-	/// 會從路面寬度中扣除，確保車道不會超出路面
-	///
-	/// Extra median offset for Two Roads mode (cm).
-	/// Compensates for median lights/dividers between separated roads.
-	/// Subtracted from road surface width so lanes stay within bounds.
-	/// </summary>
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path")
-	float TwoRoadsMedianOffsetCm = 0.0f;
-
-	/// <summary>
-	/// bTwoRoads=false 時的額外中間偏移（cm）
-	/// 補償共用路面中間的分隔帶（如 2+2-Lane Wide Road 的中央分隔島）
-	/// 會從路面半寬中扣除，確保車道不會超出路面
-	///
-	/// Extra median offset for shared road surface (cm).
-	/// Compensates for center median on roads like 2+2-Lane Wide Road.
-	/// Subtracted from half-width so lanes stay within bounds.
-	/// </summary>
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path")
-	float SharedRoadMedianOffsetCm = 0.0f;
-
-	/// <summary>
-	/// bTwoRoads=true 時的路肩寬度（cm）
-	/// 最外側車道邊緣到護欄之間的距離
-	///
-	/// Shoulder width for Two Roads mode (cm).
-	/// Distance from outer lane edge to guardrail.
-	/// </summary>
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path")
-	float TwoRoadsShoulderWidthCm = 0.0f;
-
-	/// <summary>
-	/// bTwoRoads=false 時的路肩寬度（cm）
-	/// 最外側車道邊緣到護欄之間的距離（如 2+2-Lane Wide Road）
-	///
-	/// Shoulder width for shared road surface (cm).
-	/// Distance from outer lane edge to guardrail (e.g. 2+2-Lane Wide Road).
-	/// </summary>
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path")
-	float SharedRoadShoulderWidthCm = 0.0f;
-
-	/// <summary>
-	/// 是否在 BeginPlay 時自動開始跟隨路徑
-	/// Whether to automatically start following on BeginPlay
-	/// </summary>
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path")
+	/// 是否在 BeginPlay 時自動開始 / Auto-start on BeginPlay
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Navigation")
 	bool bAutoStart = true;
 
-	/// <summary>
-	/// 手動觸發開始跟隨路徑
-	/// Manually start following the path
-	/// </summary>
+	// ================================================================
+	//  速度控制 / Speed Control
+	// ================================================================
+
+	/// 最大速度（cm/s）1500 = 15 m/s ≈ 54 km/h
+	/// Max speed (cm/s). 1500 = 15 m/s ~ 54 km/h
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Speed", meta = (ClampMin = "0"))
+	float MaxSpeed = 1500.0f;
+
+	/// 加速度（cm/s²）/ Acceleration (cm/s²)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Speed", meta = (ClampMin = "0"))
+	float Acceleration = 400.0f;
+
+	/// 煞車減速度（cm/s²）/ Brake deceleration (cm/s²)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Speed", meta = (ClampMin = "0"))
+	float BrakeDeceleration = 800.0f;
+
+	/// 終點前多遠開始煞車（cm）/ Distance before end to start braking (cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Speed", meta = (ClampMin = "0"))
+	float BrakeDistance = 1500.0f;
+
+	/// 彎道減速靈敏度：值越大，越小的彎就會減速
+	/// Curve slowdown sensitivity: higher = slows for gentler curves
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Speed", meta = (ClampMin = "0.1"))
+	float CurveSensitivity = 2.0f;
+
+	/// 彎道最低速度比例（0.3 = 最低降到 MaxSpeed × 30%）
+	/// Min speed ratio in curves (0.3 = floor at MaxSpeed × 30%)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Speed", meta = (ClampMin = "0.05", ClampMax = "1.0"))
+	float CurveMinSpeedRatio = 0.3f;
+
+	// ================================================================
+	//  平滑移動 / Smooth Movement
+	// ================================================================
+
+	/// 追蹤點前瞻時間（秒）— 車追向 CurrentSpeed × LookAheadTime 前方的位置
+	/// 值越大轉彎越圓滑但延遲越高；值越小越貼合路線但可能抖動
+	///
+	/// Look-ahead time (sec) — vehicle steers toward position this far ahead.
+	/// Higher = smoother turns but more latency; lower = tighter but jittery.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Smoothing", meta = (ClampMin = "0.05", ClampMax = "2.0"))
+	float LookAheadTime = 0.5f;
+
+	/// 追蹤點最小前瞻距離（cm）— 低速時保底不低於此值
+	/// Min look-ahead distance (cm) — floor when speed is very low
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Smoothing", meta = (ClampMin = "50"))
+	float MinLookAheadDist = 200.0f;
+
+	/// 位置插值速度 — 越大越貼合路線，越小越平滑
+	/// Position interp speed — higher = tighter path adherence
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Smoothing", meta = (ClampMin = "1.0"))
+	float PositionInterpSpeed = 8.0f;
+
+	/// 直行時旋轉插值速度 — 車頭微調的平滑程度
+	/// Rotation interp speed on straight roads — heading fine-tuning
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Smoothing", meta = (ClampMin = "1.0"))
+	float RotationInterpSpeed = 5.0f;
+
+	/// 最大轉向角速度（度/秒）— 車頭每秒最多轉多少度
+	/// 越低轉彎越慢越自然；90° 轉彎在 45°/s 下需要 2 秒
+	///
+	/// Max steering rate (deg/sec) — limits heading change per second.
+	/// Lower = slower, more natural turns. A 90° turn at 45°/s takes 2 sec.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Smoothing", meta = (ClampMin = "5.0", ClampMax = "180.0"))
+	float MaxTurnRateDegPerSec = 40.0f;
+
+	/// 路口過渡混合距離（cm）— 越大轉彎越圓滑
+	/// Junction blend distance (cm) — larger = smoother turns
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Smoothing", meta = (ClampMin = "10"))
+	float JunctionBlendDistance = 1500.0f;
+
+	/// 路口減速開始距離（cm）— 距離路口多遠開始減速
+	/// Junction slowdown start distance (cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Speed", meta = (ClampMin = "100"))
+	float JunctionSlowdownDistance = 2500.0f;
+
+	/// 路口最低速度比例（0.15 = 轉彎時最低降到 MaxSpeed × 15%）
+	/// Junction min speed ratio (0.15 = floor at MaxSpeed × 15% during turn)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Speed", meta = (ClampMin = "0.05", ClampMax = "1.0"))
+	float JunctionMinSpeedRatio = 0.15f;
+
+	// ================================================================
+	//  車道 / Lane Control
+	// ================================================================
+
+	/// 目前車道索引（0 = 最內側）/ Current lane index (0 = innermost)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane")
+	int32 CurrentLaneIndex = 0;
+
+	/// 車道切換橫向速度（cm/s）/ Lane change lateral speed (cm/s)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane", meta = (ClampMin = "50"))
+	float LaneChangeSpeed = 250.0f;
+
+	// ---- 車道偏移微調 / Lane Offset Adjustments ----
+
+	/// bTwoRoads=true 中間偏移微調 / Two Roads median adjust (cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane Offset")
+	float TwoRoadsMedianAdjustCm = 0.0f;
+
+	/// bTwoRoads=true 車道寬度微調 / Two Roads lane width adjust (cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane Offset")
+	float TwoRoadsLaneWidthAdjustCm = 0.0f;
+
+	/// bTwoRoads=false 中間偏移微調（僅 RoadType=4）/ Shared median adjust (RoadType=4 only)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane Offset")
+	float SharedRoadMedianAdjustCm = 0.0f;
+
+	/// bTwoRoads=false 車道寬度微調 / Shared lane width adjust (cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane Offset")
+	float SharedRoadLaneWidthAdjustCm = 0.0f;
+
+	// ================================================================
+	//  API
+	// ================================================================
+
+	/// 手動開始跟隨 / Manually start path following
 	UFUNCTION(BlueprintCallable, Category = "Road Path")
 	void StartFollowing();
 
-private:
-
 	/// <summary>
-	/// 從 A* 結果建立內部路徑片段
-	/// Build internal path segments from A* result
+	/// 請求切換到指定車道（平滑插值過渡）
+	/// Request smooth lane change to target lane index.
 	/// </summary>
+	UFUNCTION(BlueprintCallable, Category = "Road Path")
+	void RequestLaneChange(int32 TargetLane);
+
+	/// 取得目前實際速度（cm/s）/ Get current actual speed
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path")
+	float GetCurrentSpeed() const { return CurrentSpeed; }
+
+	/// 是否正在換道中 / Is a lane change in progress?
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path")
+	bool IsChangingLane() const { return bIsChangingLane; }
+
+	/// 取得目前方向燈狀態 / Get current turn signal state
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path")
+	ETurnSignal GetTurnSignal() const { return CurrentTurnSignal; }
+
+	/// 路徑完成或失敗時廣播 / Broadcast on path complete/fail
+	UPROPERTY(BlueprintAssignable, Category = "Road Path")
+	FOnPathEvent OnPathComplete;
+
+private:
 	void BuildPathSegments(const FRoadGraphPath& AStarPath);
 
 	/// <summary>
-	/// 內部路徑片段陣列
-	/// Internal path segments to follow
+	/// 計算指定段+距離處的世界位置（含橫向偏移）
+	/// Compute world position at segment/distance with lateral offset.
+	/// 同時輸出行進方向和右方向量
+	/// Also outputs travel direction and right vector.
 	/// </summary>
-	TArray<FPathSegmentInternal> PathSegments;
+	void SampleSplineAtDist(
+		const FPathSegmentInternal& Seg, float Dist, float LateralOffset,
+		FVector& OutPosition, FVector& OutTravelDir, FVector& OutTravelRight) const;
 
 	/// <summary>
-	/// 目前正在走第幾段
-	/// Current segment index
+	/// 取得追蹤點（沿路徑往前看 AheadDist 距離的位置）
+	/// 可以跨段，如果前方在下一段就自動切過去
+	///
+	/// Get pursuit point: look ahead by AheadDist along path.
+	/// Crosses segment boundaries if needed.
 	/// </summary>
+	FVector GetPursuitPoint(float LateralOffset) const;
+
+	/// <summary>
+	/// 從目前位置到路徑終點的剩餘距離（cm）
+	/// Remaining distance from current position to end of path (cm).
+	/// </summary>
+	float GetRemainingDistance() const;
+
+	/// <summary>
+	/// 取得目前 spline 位置的曲率（1/cm，越大 = 越急彎）
+	/// Get curvature at current spline position (1/cm, higher = sharper).
+	/// </summary>
+	float GetCurrentCurvature() const;
+
+	/// <summary>
+	/// 計算指定車道的橫向偏移量（cm）
+	/// Compute lateral offset for given lane index on current segment.
+	/// </summary>
+	float ComputeTargetLaneOffset(int32 LaneIdx) const;
+
+	/// <summary>
+	/// 計算當前幀的目標速度（考慮加速、彎道減速、終點煞車）
+	/// Compute target speed this frame (acceleration, curve, braking).
+	/// </summary>
+	float ComputeDesiredSpeed() const;
+
+	// ---- 內部狀態 / Internal State ----
+
+	TArray<FPathSegmentInternal> PathSegments;
 	int32 CurrentSegmentIndex = 0;
 
-	/// <summary>
-	/// 目前在該段 spline 上的距離（cm）
-	/// Current distance along the current segment's spline (cm)
-	/// </summary>
-	float CurrentDistance = 0.0f;
+	/// 在 spline 上的參考點距離（cm）— 邏輯位置，車的實際位置會平滑追上
+	/// Reference point distance on spline (cm) — vehicle smoothly pursues this
+	float ReferenceDistance = 0.0f;
 
-	/// <summary>
-	/// 是否正在跟隨路徑
-	/// Whether currently following a path
-	/// </summary>
+	/// 目前實際速度（cm/s）
+	/// Current actual speed (cm/s)
+	float CurrentSpeed = 0.0f;
+
+	/// 目前橫向偏移（cm）— 平滑插值中，可能跟目標車道偏移不同
+	/// Current lateral offset (cm) — interpolating, may differ from target lane
+	float CurrentLateralOffset = 0.0f;
+
+	/// 車道切換目標索引
+	/// Lane change target index
+	int32 TargetLaneIndex = 0;
+
+	/// 是否正在車道切換中
+	/// Whether a lane change is in progress
+	bool bIsChangingLane = false;
+
 	bool bIsFollowing = false;
-
-	/// <summary>
-	/// 等待第一次 Tick 才啟動（因為 BeginPlay 時 road graph 還沒建好）
-	/// Wait for first Tick to start (road graph not ready during BeginPlay)
-	/// </summary>
 	bool bPendingStart = false;
+
+	// ---- 路口曲線 / Junction Curve ----
+	// 用 Hermite 曲線穿過路口，取代 blend+offset patch
+	// Hermite curve through junction, replacing blend+offset patches
+
+	/// 是否正在走路口曲線
+	/// Whether car is following a junction curve
+	bool bOnJunctionCurve = false;
+
+	FVector JCurveP0 = FVector::ZeroVector;  // 起點 / start pos
+	FVector JCurveT0 = FVector::ZeroVector;  // 起點切線 / start tangent
+	FVector JCurveP1 = FVector::ZeroVector;  // 終點 / end pos
+	FVector JCurveT1 = FVector::ZeroVector;  // 終點切線 / end tangent
+	float JCurveLength = 0.0f;               // 曲線近似長度
+	float JCurveProgress = 0.0f;             // 目前走了多遠
+	float JCurveNextRefDist = 0.0f;          // 曲線結束後新段的 RefDist
+
+	/// 剛離開曲線，下一幀直接設位置（跳過 VInterpTo 避免跳躍）
+	/// Just exited curve — skip VInterpTo for one frame to avoid lag jump
+	bool bJustExitedCurve = false;
+
+	/// 方向燈 / Turn signal
+	ETurnSignal CurrentTurnSignal = ETurnSignal::None;
+
+	/// 計算接近路口時的轉彎方向（用於方向燈和減速）
+	/// Determine turn direction at upcoming junction (for signal & slowdown)
+	ETurnSignal ComputeUpcomingTurnDirection() const;
+
+	/// 到下一個路口的距離（用於減速判斷）
+	/// Distance to next junction (for slowdown calculation)
+	float GetDistanceToNextJunction() const;
 };

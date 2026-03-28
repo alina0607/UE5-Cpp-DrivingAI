@@ -101,6 +101,24 @@ struct CARDRIVINGPROJECT_API FRoadRuntimeData
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     double GuardrailSideOffsetCm = 350.0;
+
+    /// <summary>
+    /// 從 CatsEyesPositions 自動計算的單一車道寬度（cm）
+    /// 右側正值位置的相鄰差值平均
+    /// Auto-calculated lane width from CatsEyesPositions (cm).
+    /// Average of gaps between consecutive positive marker positions.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    float AutoLaneWidthCm = 0.0f;
+
+    /// <summary>
+    /// 從 CatsEyesPositions 自動計算的中間偏移（cm）
+    /// 右側第一個正值標記的位置（0 = 無中間帶）
+    /// Auto-calculated median offset from CatsEyesPositions (cm).
+    /// Position of the first non-negative marker on the right side.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    float AutoMedianCm = 0.0f;
 };
 
 /// <summary>
@@ -187,6 +205,20 @@ struct CARDRIVINGPROJECT_API FRoadEdgeCandidate
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     double GuardrailSideOffsetCm = 350.0;
+
+    /// <summary>
+    /// 從 CatsEyesPositions 自動計算的車道寬度（cm）
+    /// Auto-calculated lane width from CatsEyesPositions (cm).
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    float AutoLaneWidthCm = 0.0f;
+
+    /// <summary>
+    /// 從 CatsEyesPositions 自動計算的中間偏移（cm）
+    /// Auto-calculated median offset from CatsEyesPositions (cm).
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    float AutoMedianCm = 0.0f;
 };
 
 /// <summary>
@@ -325,6 +357,20 @@ struct CARDRIVINGPROJECT_API FRoadGraphEdge
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     double GuardrailSideOffsetCm = 350.0;
+
+    /// <summary>
+    /// 從 CatsEyesPositions 自動計算的車道寬度（cm）
+    /// Auto-calculated lane width from CatsEyesPositions (cm).
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    float AutoLaneWidthCm = 0.0f;
+
+    /// <summary>
+    /// 從 CatsEyesPositions 自動計算的中間偏移（cm）
+    /// Auto-calculated median offset from CatsEyesPositions (cm).
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    float AutoMedianCm = 0.0f;
 };
 
 /// <summary>
