@@ -433,53 +433,45 @@ float URoadPathFollowerComponent::ComputeDesiredSpeed() const
 	}
 
 	// ---- 路口減速 / Junction approach slowdown ----
-	// 在路口前 JunctionSlowdownDistance 開始減速，到路口時降到 JunctionMinSpeedRatio
-	// Slow down within JunctionSlowdownDistance of junction,
-	// reaching JunctionMinSpeedRatio at the junction point
+	// 在 JunctionBlendDistance 處就要到最低速（不是路口中心點）
+	// 確保車以慢速進入 Hermite 曲線，速度無斷層
+	// Reach min speed at JunctionBlendDistance (not junction center).
+	// Ensures car enters Hermite curve already at low speed — no speed discontinuity.
 	const float DistToJunction = GetDistanceToNextJunction();
 	const bool bNextSegExists = (CurrentSegmentIndex + 1 < PathSegments.Num());
 
 	if (bNextSegExists && DistToJunction < JunctionSlowdownDistance)
 	{
-		// 偵測轉彎角度 — 直行的路口不需要大幅減速
-		// Detect turn angle — straight-through junctions need less slowdown
 		const ETurnSignal TurnDir = ComputeUpcomingTurnDirection();
 
 		if (TurnDir != ETurnSignal::None)
 		{
-			// 有轉彎：速度隨距離線性插值
-			// Turning: linearly interpolate speed by distance
-			// 離路口越近 → Alpha 越大 → 速度越低
-			// Closer to junction → higher Alpha → lower speed
-			const float Alpha = 1.0f - FMath::Clamp(
-				DistToJunction / JunctionSlowdownDistance, 0.0f, 1.0f);
+			float Alpha;
+			if (DistToJunction <= JunctionBlendDistance)
+			{
+				// 已在曲線觸發區 → 保持最低速
+				// Inside curve trigger zone → hold minimum
+				Alpha = 1.0f;
+			}
+			else
+			{
+				// SlowdownDistance→BlendDistance 之間 SmoothStep 減速
+				// SmoothStep deceleration from SlowdownDistance to BlendDistance
+				Alpha = 1.0f - (DistToJunction - JunctionBlendDistance)
+						/ (JunctionSlowdownDistance - JunctionBlendDistance);
+				Alpha = FMath::SmoothStep(0.0f, 1.0f, Alpha);
+			}
 			const float JunctionSpeed = FMath::Lerp(
 				MaxSpeed, MaxSpeed * JunctionMinSpeedRatio, Alpha);
 			Desired = FMath::Min(Desired, JunctionSpeed);
 		}
 	}
 
-	// 正在走路口 Hermite 曲線時也要限速
-	// 前 60% 維持最低速，後 40% 才開始恢復
-	// Also limit speed during active junction Hermite curve.
-	// Hold min speed for first 60%, gradually recover in last 40%.
+	// 曲線全程維持最低速，出曲線後才由 FInterpTo 慢慢加速
+	// Hold min speed for entire curve. Post-curve FInterpTo ramps up naturally.
 	if (bOnJunctionCurve)
 	{
-		const float CurveRatio = FMath::Clamp(
-			JCurveProgress / FMath::Max(JCurveLength, 1.0f), 0.0f, 1.0f);
-
-		// 前 60% 維持最低速，後 40% 才恢復
-		// Hold min speed for first 60% of curve, recover in last 40%
-		float RecoverAlpha = 0.0f;
-		if (CurveRatio > 0.6f)
-		{
-			RecoverAlpha = (CurveRatio - 0.6f) / 0.4f; // 0→1 in last 40%
-			RecoverAlpha = FMath::SmoothStep(0.0f, 1.0f, RecoverAlpha);
-		}
-
-		const float RecoverSpeed = FMath::Lerp(
-			MaxSpeed * JunctionMinSpeedRatio, MaxSpeed, RecoverAlpha);
-		Desired = FMath::Min(Desired, RecoverSpeed);
+		Desired = FMath::Min(Desired, MaxSpeed * JunctionMinSpeedRatio);
 	}
 
 	// ---- 終點煞車 / End-of-path braking ----
@@ -562,12 +554,13 @@ void URoadPathFollowerComponent::TickComponent(
 
 	if (CurrentSpeed < DesiredSpeed)
 	{
-		// 加速 / Accelerate
-		CurrentSpeed = FMath::Min(CurrentSpeed + Acceleration * DeltaTime, DesiredSpeed);
+		// 加速：平滑漸進 / Accelerate smoothly
+		CurrentSpeed = FMath::FInterpTo(CurrentSpeed, DesiredSpeed, DeltaTime, 0.5f);
 	}
 	else
 	{
-		// 減速（用煞車減速度）/ Decelerate (use brake)
+		// 減速：用實際煞車減速度，確保能準時到達目標速
+		// Brake with real deceleration so car reaches target speed in time
 		CurrentSpeed = FMath::Max(CurrentSpeed - BrakeDeceleration * DeltaTime, DesiredSpeed);
 	}
 
@@ -583,44 +576,22 @@ void URoadPathFollowerComponent::TickComponent(
 		JCurveProgress += CurrentSpeed * DeltaTime;
 		const float T = FMath::Clamp(JCurveProgress / FMath::Max(JCurveLength, 1.0f), 0.0f, 1.0f);
 
-		// Hermite 曲線目標位置
-		// Hermite curve target position
+		// 直接用 Hermite 曲線位置（車已在最低速，VInterpTo lag 可忽略）
+		// Direct Hermite position (car already at min speed, VInterpTo lag negligible)
 		const FVector CurvePos = FMath::CubicInterp(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T);
 
-		// 入彎混合：前 20% 用漸增速度的 VInterpTo 銜接
-		// 曲線前 20% 幾乎是直線（沿 T0 方向），VInterpTo 不會壓平弧度
-		// 到 T=0.2 時 VInterpTo 速度已經很高，切到直接定位幾乎無感
-		//
-		// Entry blend: first 20% uses VInterpTo with ramping speed.
-		// Curve barely turns in first 20% (follows T0 direction), so no arc flattening.
-		// By T=0.2, interp speed is high enough that switch to direct is imperceptible.
-		FVector FinalPos;
-		constexpr float BlendInEnd = 0.20f;
-		if (T < BlendInEnd)
-		{
-			const float BlendIn = T / BlendInEnd; // 0→1
-			// 速度從正常(8)漸增到極高(100≈直接) / Ramp from normal(8) to very high(100≈direct)
-			const float RampSpeed = FMath::Lerp(PositionInterpSpeed, 100.0f, BlendIn);
-			const FVector CurrentPos = Owner->GetActorLocation();
-			FinalPos = FMath::VInterpTo(CurrentPos, CurvePos, DeltaTime, RampSpeed);
-		}
-		else
-		{
-			FinalPos = CurvePos;
-		}
-
-		// 切線方向做旋轉（RInterpTo 平滑）
-		// Tangent-based rotation (RInterpTo smoothed)
+		// 直接用切線方向旋轉（Hermite 切線天生平滑，不需 RInterpTo）
+		// T=0 切線 = 車當前朝向，T=1 = 下一段方向 → 入出都連續
+		// Direct tangent rotation (Hermite tangent is inherently smooth, no RInterpTo needed)
+		// T=0 tangent = car's current heading, T=1 = next segment direction → continuous
 		const FVector CurveTangent = FMath::CubicInterpDerivative(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T);
-		const FRotator CurrentRot = Owner->GetActorRotation();
-		FRotator FinalRot = CurrentRot;
+		FRotator FinalRot = Owner->GetActorRotation();
 		if (CurveTangent.SizeSquared() > 1.0f)
 		{
-			FinalRot = FMath::RInterpTo(
-				CurrentRot, CurveTangent.Rotation(), DeltaTime, RotationInterpSpeed);
+			FinalRot = CurveTangent.Rotation();
 		}
 
-		Owner->SetActorLocationAndRotation(FinalPos, FinalRot);
+		Owner->SetActorLocationAndRotation(CurvePos, FinalRot);
 
 		UE_LOG(LogTemp, Verbose,
 			TEXT("JUNCTION_CURVE: T=%.2f Progress=%.0f/%.0f Speed=%.0f"),
@@ -631,7 +602,8 @@ void URoadPathFollowerComponent::TickComponent(
 			// 曲線走完 → 進入新段
 			// Curve complete → enter new segment
 			bOnJunctionCurve = false;
-			bJustExitedCurve = true;  // 下一幀跳過 VInterpTo / skip VInterpTo next frame
+			// 曲線 P1 ≈ spline 取樣位置，VInterpTo 自然銜接
+			// Curve P1 ≈ spline sample position, VInterpTo handles transition naturally
 			CurrentSegmentIndex++;
 
 			if (CurrentSegmentIndex >= PathSegments.Num())
@@ -741,11 +713,9 @@ void URoadPathFollowerComponent::TickComponent(
 		JCurveP0 = Owner->GetActorLocation();
 		JCurveP1 = NextPos;
 
-		// 切線長度 ≈ 兩端點距離，讓曲線形狀合理
-		// Tangent magnitude ≈ distance between endpoints for good curve shape
-		// 切線強度 = 距離 × 0.5，控制曲線弧度
-		// Tangent magnitude = distance × 0.5, controls curve roundness
-		const float TangentScale = (JCurveP1 - JCurveP0).Size() * 0.5f;
+		// 切線強度 = 距離 × JunctionCurveTangentScale，控制曲線弧度
+		// Tangent magnitude = distance × TangentScale, controls curve roundness
+		const float TangentScale = (JCurveP1 - JCurveP0).Size() * JunctionCurveTangentScale;
 		JCurveT0 = Owner->GetActorForwardVector() * TangentScale;
 		JCurveT1 = NextDir.GetSafeNormal() * TangentScale;
 
@@ -762,7 +732,21 @@ void URoadPathFollowerComponent::TickComponent(
 			(JCurveP1 - JCurveP0).Size(), JCurveLength, JCurveNextRefDist,
 			CurrentLateralOffset, NextSegLaneOffset);
 
-		return; // 下一幀開始走曲線
+		// 立刻走第一步，不浪費一幀（消除入彎停頓）
+		// Execute first curve step immediately (eliminates 1-frame stall at entry)
+		{
+			JCurveProgress = CurrentSpeed * DeltaTime;
+			const float T0Frame = FMath::Clamp(JCurveProgress / FMath::Max(JCurveLength, 1.0f), 0.0f, 1.0f);
+			const FVector FirstPos = FMath::CubicInterp(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T0Frame);
+			const FVector FirstTan = FMath::CubicInterpDerivative(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T0Frame);
+			FRotator FirstRot = Owner->GetActorRotation();
+			if (FirstTan.SizeSquared() > 1.0f)
+			{
+				FirstRot = FirstTan.Rotation();
+			}
+			Owner->SetActorLocationAndRotation(FirstPos, FirstRot);
+		}
+		return;
 	}
 
 	// ---- 檢查段結束（沒有下一段時才會到這裡）----
@@ -799,18 +783,7 @@ void URoadPathFollowerComponent::TickComponent(
 			FMath::Clamp(Ratio, 0.0f, 1.0f));
 	}
 
-	FVector FinalPos;
-	if (bJustExitedCurve)
-	{
-		// 剛離開曲線的首幀：直接設位置，避免延遲跳躍
-		// First frame after curve: direct position, skip lag jump
-		FinalPos = RefPos;
-		bJustExitedCurve = false;
-	}
-	else
-	{
-		FinalPos = FMath::VInterpTo(CurrentPos, RefPos, DeltaTime, EffectiveInterpSpeed);
-	}
+	const FVector FinalPos = FMath::VInterpTo(CurrentPos, RefPos, DeltaTime, EffectiveInterpSpeed);
 
 	const FVector Velocity = FinalPos - CurrentPos;
 	FRotator FinalRot = CurrentRot;

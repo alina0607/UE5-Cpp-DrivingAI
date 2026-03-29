@@ -169,15 +169,22 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Smoothing", meta = (ClampMin = "10"))
 	float JunctionBlendDistance = 1500.0f;
 
+	/// 路口曲線切線強度 — 控制轉彎弧度
+	/// 0.5=較直 0.7=圓弧 0.9=僵硬（兩直線接合感）1.2+=S型過衝
+	/// Junction curve tangent scale — controls turn arc roundness
+	/// 0.5=flatter 0.7=round arc 0.9=stiff (two straight lines) 1.2+=S-overshoot
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Smoothing", meta = (ClampMin = "0.2", ClampMax = "1.5"))
+	float JunctionCurveTangentScale = 0.7f;
+
 	/// 路口減速開始距離（cm）— 距離路口多遠開始減速
 	/// Junction slowdown start distance (cm)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Speed", meta = (ClampMin = "100"))
-	float JunctionSlowdownDistance = 2500.0f;
+	float JunctionSlowdownDistance = 4000.0f;
 
-	/// 路口最低速度比例（0.15 = 轉彎時最低降到 MaxSpeed × 15%）
-	/// Junction min speed ratio (0.15 = floor at MaxSpeed × 15% during turn)
+	/// 路口最低速度比例（0.25 = 轉彎時最低降到 MaxSpeed × 25% ≈ 13.5 km/h）
+	/// Junction min speed ratio (0.25 = floor at MaxSpeed × 25% during turn)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Speed", meta = (ClampMin = "0.05", ClampMax = "1.0"))
-	float JunctionMinSpeedRatio = 0.15f;
+	float JunctionMinSpeedRatio = 0.25f;
 
 	// ================================================================
 	//  車道 / Lane Control
@@ -329,10 +336,6 @@ private:
 	float JCurveLength = 0.0f;               // 曲線近似長度
 	float JCurveProgress = 0.0f;             // 目前走了多遠
 	float JCurveNextRefDist = 0.0f;          // 曲線結束後新段的 RefDist
-
-	/// 剛離開曲線，下一幀直接設位置（跳過 VInterpTo 避免跳躍）
-	/// Just exited curve — skip VInterpTo for one frame to avoid lag jump
-	bool bJustExitedCurve = false;
 
 	/// 方向燈 / Turn signal
 	ETurnSignal CurrentTurnSignal = ETurnSignal::None;
