@@ -106,6 +106,8 @@ public:
 	//  速度控制 / Speed Control
 	// ================================================================
 
+
+
 	/// 最大速度（cm/s）1500 = 15 m/s ≈ 54 km/h
 	/// Max speed (cm/s). 1500 = 15 m/s ~ 54 km/h
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Speed", meta = (ClampMin = "0"))
@@ -136,6 +138,10 @@ public:
 	// ================================================================
 	//  平滑移動 / Smooth Movement
 	// ================================================================
+
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Smoothing", meta = (ClampMin = "0.01"))
+	float OffsetBoostRate = 0.5f;
 
 	/// 追蹤點前瞻時間（秒）— 車追向 CurrentSpeed × LookAheadTime 前方的位置
 	/// 值越大轉彎越圓滑但延遲越高；值越小越貼合路線但可能抖動
@@ -201,6 +207,11 @@ public:
 	/// 車道切換橫向速度（cm/s）/ Lane change lateral speed (cm/s)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane", meta = (ClampMin = "50"))
 	float LaneChangeSpeed = 250.0f;
+
+	/// 轉彎前自動換道觸發距離（cm）— 比減速距離更早，讓車有足夠時間換道
+	/// Auto lane change trigger distance before junction (cm) — earlier than slowdown
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane", meta = (ClampMin = "500"))
+	float AutoLaneChangeDistance = 8000.0f;
 
 	// ---- 車道偏移微調 / Lane Offset Adjustments ----
 

@@ -552,11 +552,11 @@ void URoadPathFollowerComponent::TickComponent(
 			CurrentTurnSignal = ETurnSignal::None;
 		}
 
-		// 自動換道：接近路口時才實際換道（避免太早換）
-		// Auto lane change: only execute when approaching junction
+		// 自動換道：用 AutoLaneChangeDistance（比減速更早），讓車有時間完成換道
+		// Auto lane change: use AutoLaneChangeDistance (earlier than slowdown)
 		const float DistToJunction = GetDistanceToNextJunction();
 		if (UpcomingTurn != ETurnSignal::None && !bIsChangingLane
-			&& DistToJunction < JunctionSlowdownDistance)
+			&& DistToJunction < AutoLaneChangeDistance)
 		{
 			const int32 CurLaneCount = Seg.DrivingRule.ForwardLaneCount;
 			int32 DesiredLane = TargetLaneIndex;
@@ -726,13 +726,27 @@ void URoadPathFollowerComponent::TickComponent(
 
 	// 接近路口且下一段存在 → 生成 Hermite 曲線並開始走
 	// Approaching junction with next segment → create Hermite curve
-	if (bNextSegExists && DistToEnd < JunctionBlendDistance)
+	//
+	// 多車道轉彎時動態加大 BlendDistance：車在外側車道時離轉角更近，
+	// 需要更大的弧線空間。用 CurrentLateralOffset 按比例增加。
+	// Dynamic blend for multi-lane turns: outer lanes are closer to the corner,
+	// need a bigger arc. Scale up by CurrentLateralOffset.
+	float EffectiveBlendDist = JunctionBlendDistance;
+	if (CurrentTurnSignal != ETurnSignal::None)
+	{
+		// 每 100cm 的車道偏移，額外增加 25% 的 BlendDistance
+		// For every 100cm of lane offset, add 25% more BlendDistance
+		const float OffsetBoost = (CurrentLateralOffset / 100.0f) * OffsetBoostRate;
+		EffectiveBlendDist *= (1.0f + FMath::Max(OffsetBoost, 0.0f));
+	}
+
+	if (bNextSegExists && DistToEnd < EffectiveBlendDist)
 	{
 		const FPathSegmentInternal& NextSeg = PathSegments[CurrentSegmentIndex + 1];
 
-		// 曲線終點：深入下一段 JunctionBlendDistance 的位置
-		// Curve end: JunctionBlendDistance into next segment
-		const float EntryDist = JunctionBlendDistance;
+		// 曲線終點：深入下一段 EffectiveBlendDist 的位置
+		// Curve end: EffectiveBlendDist into next segment
+		const float EntryDist = EffectiveBlendDist;
 		const float NextSampleDist = NextSeg.StartDist + EntryDist * NextSeg.Direction;
 
 		// 根據轉彎方向決定新段的目標車道
@@ -790,8 +804,8 @@ void URoadPathFollowerComponent::TickComponent(
 		bOnJunctionCurve = true;
 
 		UE_LOG(LogTemp, Warning,
-			TEXT("JUNCTION_CURVE_START: P0→P1 dist=%.0f CurveLen=%.0f NextRefDist=%.0f CurOffset=%.0f NextOffset=%.0f TurnSignal=%d NextLanes=%d NextLaneIdx=%d"),
-			(JCurveP1 - JCurveP0).Size(), JCurveLength, JCurveNextRefDist,
+			TEXT("JUNCTION_CURVE_START: P0→P1 dist=%.0f CurveLen=%.0f BlendDist=%.0f NextRefDist=%.0f CurOffset=%.0f NextOffset=%.0f TurnSignal=%d NextLanes=%d NextLaneIdx=%d"),
+			(JCurveP1 - JCurveP0).Size(), JCurveLength, EffectiveBlendDist, JCurveNextRefDist,
 			CurrentLateralOffset, NextSegLaneOffset,
 			(int32)CurrentTurnSignal, NextLaneCount, JCurveNextLaneIndex);
 
@@ -839,9 +853,9 @@ void URoadPathFollowerComponent::TickComponent(
 	// Ramp up interp speed approaching junction so VInterpTo lag → ~0
 	// → seamless transition when Hermite curve starts
 	float EffectiveInterpSpeed = PositionInterpSpeed;
-	if (bNextSegExists && DistToEnd < JunctionBlendDistance * 2.0f)
+	if (bNextSegExists && DistToEnd < EffectiveBlendDist * 2.0f)
 	{
-		const float Ratio = 1.0f - (DistToEnd / (JunctionBlendDistance * 2.0f));
+		const float Ratio = 1.0f - (DistToEnd / (EffectiveBlendDist * 2.0f));
 		EffectiveInterpSpeed = FMath::Lerp(PositionInterpSpeed, 50.0f,
 			FMath::Clamp(Ratio, 0.0f, 1.0f));
 	}
