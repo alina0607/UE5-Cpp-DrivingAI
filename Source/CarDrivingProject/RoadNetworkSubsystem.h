@@ -144,7 +144,6 @@ private:
 	TArray<FRoadGraphNode> GraphNodes;
 
 	/// <summary>
-	/// 偵測到的中段叉路候選清單
 	/// Detected mid-spline junction candidates
 	/// </summary>
 	UPROPERTY()

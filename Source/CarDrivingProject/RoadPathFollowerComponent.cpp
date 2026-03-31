@@ -182,6 +182,57 @@ void URoadPathFollowerComponent::BuildPathSegments(const FRoadGraphPath& AStarPa
 			break;
 		}
 	}
+
+	// ---- 用 Graph Node 世界座標預計算每個路口的轉彎方向 ----
+	// ---- Precompute turn direction at each junction using graph node world positions ----
+	// 三點法：NodeA(段起點) → NodeB(路口) → NodeC(下一段終點)
+	// Three-point method: NodeA(seg start) → NodeB(junction) → NodeC(next seg end)
+	const TArray<FRoadGraphNode>& GraphNodeList = Sub->GetGraphNodes();
+	for (int32 i = 0; i + 1 < PathSegments.Num(); ++i)
+	{
+		// Nodes: [0]─Seg[0]─[1]─Seg[1]─[2]─Seg[2]─[3]...
+		// 段 i 的路口 = Nodes[i+1]
+		const int32 IdA = Nodes[i];
+		const int32 IdB = Nodes[i + 1];
+		const int32 IdC = Nodes[i + 2];
+
+		// 安全檢查：確保 NodeId 在範圍內
+		if (IdA >= GraphNodeList.Num() || IdB >= GraphNodeList.Num() || IdC >= GraphNodeList.Num())
+		{
+			PathSegments[i].TurnAtEnd = ETurnSignal::None;
+			continue;
+		}
+
+		const FVector PosA = GraphNodeList[IdA].WorldLocation;
+		const FVector PosB = GraphNodeList[IdB].WorldLocation;
+		const FVector PosC = GraphNodeList[IdC].WorldLocation;
+
+		const FVector DirAB = (PosB - PosA).GetSafeNormal2D();
+		const FVector DirBC = (PosC - PosB).GetSafeNormal2D();
+		const float Dot = FVector::DotProduct(DirAB, DirBC);
+		const float CrossZ = FVector::CrossProduct(DirAB, DirBC).Z;
+
+		if (Dot > 0.985f)
+		{
+			PathSegments[i].TurnAtEnd = ETurnSignal::None;
+		}
+		else
+		{
+			// UE 左手座標系：+Y = 右，CrossZ > 0 = 右轉，< 0 = 左轉
+			// UE left-handed coords: +Y = right, CrossZ > 0 = right turn, < 0 = left
+			PathSegments[i].TurnAtEnd = (CrossZ > 0.0f) ? ETurnSignal::Right : ETurnSignal::Left;
+		}
+
+		UE_LOG(LogTemp, Warning,
+			TEXT("  Seg[%d] TurnAtEnd=%s | Dot=%.4f CrossZ=%.1f | A=(%d:%.0f,%.0f) B=(%d:%.0f,%.0f) C=(%d:%.0f,%.0f)"),
+			i,
+			(PathSegments[i].TurnAtEnd == ETurnSignal::Left) ? TEXT("LEFT") :
+			(PathSegments[i].TurnAtEnd == ETurnSignal::Right) ? TEXT("RIGHT") : TEXT("NONE"),
+			Dot, CrossZ,
+			IdA, PosA.X, PosA.Y,
+			IdB, PosB.X, PosB.Y,
+			IdC, PosC.X, PosC.Y);
+	}
 }
 
 // ============================================================================
@@ -379,43 +430,6 @@ float URoadPathFollowerComponent::GetDistanceToNextJunction() const
 }
 
 // ============================================================================
-//  ComputeUpcomingTurnDirection — 偵測即將到來的轉彎方向
-//  Detect upcoming turn direction by comparing current and next segment.
-// ============================================================================
-ETurnSignal URoadPathFollowerComponent::ComputeUpcomingTurnDirection() const
-{
-	if (CurrentSegmentIndex + 1 >= PathSegments.Num()) return ETurnSignal::None;
-
-	const FPathSegmentInternal& CurSeg = PathSegments[CurrentSegmentIndex];
-	const FPathSegmentInternal& NextSeg = PathSegments[CurrentSegmentIndex + 1];
-
-	if (!CurSeg.Spline || !NextSeg.Spline) return ETurnSignal::None;
-
-	// 取得當前段末端的行進方向
-	// Get travel direction at end of current segment
-	const FRotator CurRot = CurSeg.Spline->GetRotationAtDistanceAlongSpline(
-		CurSeg.EndDist, ESplineCoordinateSpace::World);
-	const FVector CurDir = CurRot.Vector() * CurSeg.Direction;
-
-	// 取得下一段起點的行進方向
-	// Get travel direction at start of next segment
-	const FRotator NextRot = NextSeg.Spline->GetRotationAtDistanceAlongSpline(
-		NextSeg.StartDist, ESplineCoordinateSpace::World);
-	const FVector NextDir = NextRot.Vector() * NextSeg.Direction;
-
-	// 用叉積判斷左右：CrossZ > 0 = 左轉，< 0 = 右轉
-	// Cross product Z: > 0 = left turn, < 0 = right turn
-	const float CrossZ = FVector::CrossProduct(CurDir, NextDir).Z;
-
-	// 角度太小（< ~10°）視為直行，不打方向燈
-	// If angle is small (< ~10°), treat as going straight
-	const float DotProduct = FVector::DotProduct(CurDir.GetSafeNormal(), NextDir.GetSafeNormal());
-	if (DotProduct > 0.985f) return ETurnSignal::None;  // cos(10°) ≈ 0.985
-
-	return (CrossZ > 0.0f) ? ETurnSignal::Left : ETurnSignal::Right;
-}
-
-// ============================================================================
 //  ComputeDesiredSpeed — 綜合計算目標速度
 //  Compute desired speed considering acceleration, curves, junctions, braking.
 // ============================================================================
@@ -442,9 +456,9 @@ float URoadPathFollowerComponent::ComputeDesiredSpeed() const
 
 	if (bNextSegExists && DistToJunction < JunctionSlowdownDistance)
 	{
-		const ETurnSignal TurnDir = ComputeUpcomingTurnDirection();
-
-		if (TurnDir != ETurnSignal::None)
+		// 用 CurrentTurnSignal（Step 0 每幀更新）決定是否減速
+		// Use CurrentTurnSignal (updated in Step 0 each tick) for slowdown decision
+		if (CurrentTurnSignal != ETurnSignal::None)
 		{
 			float Alpha;
 			if (DistToJunction <= JunctionBlendDistance)
@@ -517,32 +531,54 @@ void URoadPathFollowerComponent::TickComponent(
 	}
 
 	// ================================================================
-	//  0. 方向燈：偵測即將轉彎方向
-	//     Turn signal: detect upcoming turn direction
+	//  0. 方向燈 + 自動換道（預計算，不依賴距離門檻）
+	//     Turn signal + auto lane change (precomputed, no distance threshold)
 	// ================================================================
 	{
-		const float DistToJunction = GetDistanceToNextJunction();
-		const bool bNextSegExists = (CurrentSegmentIndex + 1 < PathSegments.Num());
-
-		if (bNextSegExists && DistToJunction < JunctionSlowdownDistance)
+		// 方向燈：直接讀 BuildPathSegments 預計算的 TurnAtEnd
+		// 進入段的第一幀就知道轉彎方向，不需要等接近路口
+		// Turn signal: read precomputed TurnAtEnd immediately on segment entry
+		const ETurnSignal UpcomingTurn = Seg.TurnAtEnd;
+		if (UpcomingTurn != ETurnSignal::None && CurrentTurnSignal != UpcomingTurn)
 		{
-			// 接近路口，偵測轉彎方向並打方向燈
-			// Approaching junction — detect turn and signal
-			const ETurnSignal UpcomingTurn = ComputeUpcomingTurnDirection();
-			if (UpcomingTurn != ETurnSignal::None && CurrentTurnSignal != UpcomingTurn)
+			CurrentTurnSignal = UpcomingTurn;
+			UE_LOG(LogTemp, Warning,
+				TEXT("PathFollower: Turn signal → %s (Seg[%d])"),
+				(CurrentTurnSignal == ETurnSignal::Left) ? TEXT("LEFT") : TEXT("RIGHT"),
+				CurrentSegmentIndex);
+		}
+		else if (UpcomingTurn == ETurnSignal::None && !bOnJunctionCurve)
+		{
+			CurrentTurnSignal = ETurnSignal::None;
+		}
+
+		// 自動換道：接近路口時才實際換道（避免太早換）
+		// Auto lane change: only execute when approaching junction
+		const float DistToJunction = GetDistanceToNextJunction();
+		if (UpcomingTurn != ETurnSignal::None && !bIsChangingLane
+			&& DistToJunction < JunctionSlowdownDistance)
+		{
+			const int32 CurLaneCount = Seg.DrivingRule.ForwardLaneCount;
+			int32 DesiredLane = TargetLaneIndex;
+
+			if (UpcomingTurn == ETurnSignal::Left)
 			{
-				CurrentTurnSignal = UpcomingTurn;
-				UE_LOG(LogTemp, Log,
-					TEXT("PathFollower: Turn signal → %s (junction in %.0f cm)"),
-					(CurrentTurnSignal == ETurnSignal::Left) ? TEXT("LEFT") : TEXT("RIGHT"),
+				DesiredLane = 0;
+			}
+			else
+			{
+				DesiredLane = CurLaneCount - 1;
+			}
+
+			if (DesiredLane != TargetLaneIndex && CurLaneCount > 1)
+			{
+				RequestLaneChange(DesiredLane);
+				UE_LOG(LogTemp, Warning,
+					TEXT("PathFollower: Auto lane change → Lane %d for %s turn (junction in %.0f cm)"),
+					DesiredLane,
+					(UpcomingTurn == ETurnSignal::Left) ? TEXT("LEFT") : TEXT("RIGHT"),
 					DistToJunction);
 			}
-		}
-		else if (!bOnJunctionCurve)
-		{
-			// 不在路口附近且不在走曲線，關閉方向燈
-			// Not near junction and not on curve — signal off
-			CurrentTurnSignal = ETurnSignal::None;
 		}
 	}
 
@@ -618,8 +654,15 @@ void URoadPathFollowerComponent::TickComponent(
 			Seg = PathSegments[CurrentSegmentIndex];
 			ReferenceDistance = JCurveNextRefDist;
 
-			// 更新橫向偏移到新段的正確值
-			// Update lateral offset to new segment's correct value
+			// 重置方向燈（新段會重新判斷）
+			// Reset turn signal (new segment will re-evaluate)
+			CurrentTurnSignal = ETurnSignal::None;
+
+			// 更新車道和橫向偏移到新段的正確值
+			// Update lane index and lateral offset to new segment's correct value
+			TargetLaneIndex = JCurveNextLaneIndex;
+			CurrentLaneIndex = JCurveNextLaneIndex;
+			bIsChangingLane = false;
 			CurrentLateralOffset = ComputeTargetLaneOffset(TargetLaneIndex);
 
 			UE_LOG(LogTemp, Warning,
@@ -692,11 +735,30 @@ void URoadPathFollowerComponent::TickComponent(
 		const float EntryDist = JunctionBlendDistance;
 		const float NextSampleDist = NextSeg.StartDist + EntryDist * NextSeg.Direction;
 
-		// 用下一段的正確 lane offset
-		// Use next segment's correct lane offset
+		// 根據轉彎方向決定新段的目標車道
+		// Determine target lane in next segment based on turn direction
+		const int32 NextLaneCount = NextSeg.DrivingRule.ForwardLaneCount;
+		if (CurrentTurnSignal == ETurnSignal::Right)
+		{
+			// 右轉 → 新段最外側車道 / Right turn → outermost lane
+			JCurveNextLaneIndex = NextLaneCount - 1;
+		}
+		else if (CurrentTurnSignal == ETurnSignal::Left)
+		{
+			// 左轉 → 對應車道，超出則取最大 / Left turn → same lane, clamped
+			JCurveNextLaneIndex = FMath::Min(TargetLaneIndex, NextLaneCount - 1);
+		}
+		else
+		{
+			// 直行 → 對應車道，超出則取最大 / Straight → same lane, clamped
+			JCurveNextLaneIndex = FMath::Min(TargetLaneIndex, NextLaneCount - 1);
+		}
+
+		// 用新段目標車道的 offset 取樣曲線終點
+		// Sample curve endpoint using next segment's target lane offset
 		const float NextSegLaneOffset = ComputeLaneOffsetCm(
 			NextSeg.bTwoRoads, NextSeg.TwoRoadsGapM, NextSeg.RoadType,
-			TargetLaneIndex,
+			JCurveNextLaneIndex,
 			NextSeg.AutoLaneWidthCm, NextSeg.AutoMedianCm,
 			TwoRoadsMedianAdjustCm, TwoRoadsLaneWidthAdjustCm,
 			SharedRoadMedianAdjustCm, SharedRoadLaneWidthAdjustCm);
@@ -728,9 +790,10 @@ void URoadPathFollowerComponent::TickComponent(
 		bOnJunctionCurve = true;
 
 		UE_LOG(LogTemp, Warning,
-			TEXT("JUNCTION_CURVE_START: P0→P1 dist=%.0f CurveLen=%.0f NextRefDist=%.0f CurOffset=%.0f NextOffset=%.0f"),
+			TEXT("JUNCTION_CURVE_START: P0→P1 dist=%.0f CurveLen=%.0f NextRefDist=%.0f CurOffset=%.0f NextOffset=%.0f TurnSignal=%d NextLanes=%d NextLaneIdx=%d"),
 			(JCurveP1 - JCurveP0).Size(), JCurveLength, JCurveNextRefDist,
-			CurrentLateralOffset, NextSegLaneOffset);
+			CurrentLateralOffset, NextSegLaneOffset,
+			(int32)CurrentTurnSignal, NextLaneCount, JCurveNextLaneIndex);
 
 		// 立刻走第一步，不浪費一幀（消除入彎停頓）
 		// Execute first curve step immediately (eliminates 1-frame stall at entry)

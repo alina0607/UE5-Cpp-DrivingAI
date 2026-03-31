@@ -48,6 +48,10 @@ struct FPathSegmentInternal
 	float AutoLaneWidthCm = 0.0f;
 	float AutoMedianCm = 0.0f;
 
+	/// 此段結束時（路口處）的轉彎方向，BuildPathSegments 時用 Node 世界座標預計算
+	/// Turn direction at end of this segment (precomputed from graph node world locations)
+	ETurnSignal TurnAtEnd = ETurnSignal::None;
+
 	/// 該段 spline 的長度（cm，用於剩餘距離計算）
 	/// Segment travel length in cm (for remaining distance calculation)
 	float GetTravelLength() const { return FMath::Abs(EndDist - StartDist); }
@@ -336,13 +340,10 @@ private:
 	float JCurveLength = 0.0f;               // 曲線近似長度
 	float JCurveProgress = 0.0f;             // 目前走了多遠
 	float JCurveNextRefDist = 0.0f;          // 曲線結束後新段的 RefDist
+	int32 JCurveNextLaneIndex = 0;           // 曲線結束後新段的車道 / lane for next seg
 
 	/// 方向燈 / Turn signal
 	ETurnSignal CurrentTurnSignal = ETurnSignal::None;
-
-	/// 計算接近路口時的轉彎方向（用於方向燈和減速）
-	/// Determine turn direction at upcoming junction (for signal & slowdown)
-	ETurnSignal ComputeUpcomingTurnDirection() const;
 
 	/// 到下一個路口的距離（用於減速判斷）
 	/// Distance to next junction (for slowdown calculation)

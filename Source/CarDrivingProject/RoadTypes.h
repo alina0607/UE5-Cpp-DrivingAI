@@ -66,36 +66,30 @@ struct CARDRIVINGPROJECT_API FRoadRuntimeData
     uint8 RoadType = 0;
 
     /// <summary>
-    /// BP 是否勾選 "Two Roads"（在 spline 兩側各生成一條路面 mesh）
     /// Whether this road uses the "Two Roads" mode (two parallel road meshes).
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     bool bTwoRoads = false;
 
     /// <summary>
-    /// 兩條平行路面之間的間距（公尺），僅在 bTwoRoads=true 時有意義
     /// Gap between the two parallel roads in meters (only relevant when bTwoRoads is true).
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     double TwoRoadsGapM = 0.0;
 
     /// <summary>
-    /// 路面寬度乘數（BP 的 "Road Width Multiplier"）
     /// Road width multiplier from the Blueprint asset.
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     double RoadWidthMultiplier = 1.0;
 
     /// <summary>
-    /// 額外路面寬度（公尺，BP 的 "Additional Width, m"）
     /// Additional road width in meters from the Blueprint asset.
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     double AdditionalWidthM = 0.0;
 
     /// <summary>
-    /// 從 Road Settings struct 讀取的 GuardrailSideOffset（cm）
-    /// = 路面半寬（spline 中心到路面邊緣的距離）
     /// GuardrailSideOffset from Road Settings struct (cm).
     /// = road half-width (distance from spline center to road edge).
     /// </summary>
@@ -103,8 +97,6 @@ struct CARDRIVINGPROJECT_API FRoadRuntimeData
     double GuardrailSideOffsetCm = 350.0;
 
     /// <summary>
-    /// 從 CatsEyesPositions 自動計算的單一車道寬度（cm）
-    /// 右側正值位置的相鄰差值平均
     /// Auto-calculated lane width from CatsEyesPositions (cm).
     /// Average of gaps between consecutive positive marker positions.
     /// </summary>
@@ -112,8 +104,6 @@ struct CARDRIVINGPROJECT_API FRoadRuntimeData
     float AutoLaneWidthCm = 0.0f;
 
     /// <summary>
-    /// 從 CatsEyesPositions 自動計算的中間偏移（cm）
-    /// 右側第一個正值標記的位置（0 = 無中間帶）
     /// Auto-calculated median offset from CatsEyesPositions (cm).
     /// Position of the first non-negative marker on the right side.
     /// </summary>
@@ -172,49 +162,42 @@ struct CARDRIVINGPROJECT_API FRoadEdgeCandidate
     bool bClosedLoop = false;
 
     /// <summary>
-    /// BP 是否勾選 "Two Roads"（兩側各一條路面）
     /// Whether this road uses "Two Roads" mode.
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     bool bTwoRoads = false;
 
     /// <summary>
-    /// 兩條路面的間距（公尺）
     /// Gap between the two parallel roads in meters.
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     double TwoRoadsGapM = 0.0;
 
     /// <summary>
-    /// 路面寬度乘數
     /// Road width multiplier from BP.
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     double RoadWidthMultiplier = 1.0;
 
     /// <summary>
-    /// 額外路面寬度（公尺）
     /// Additional road width in meters from BP.
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     double AdditionalWidthM = 0.0;
 
     /// <summary>
-    /// 路面半寬（cm），從 BP Road Settings 讀取
     /// Road half-width (cm) from BP Road Settings.
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     double GuardrailSideOffsetCm = 350.0;
 
     /// <summary>
-    /// 從 CatsEyesPositions 自動計算的車道寬度（cm）
     /// Auto-calculated lane width from CatsEyesPositions (cm).
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     float AutoLaneWidthCm = 0.0f;
 
     /// <summary>
-    /// 從 CatsEyesPositions 自動計算的中間偏移（cm）
     /// Auto-calculated median offset from CatsEyesPositions (cm).
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
@@ -324,49 +307,42 @@ struct CARDRIVINGPROJECT_API FRoadGraphEdge
     uint8 RoadType = 0;
 
     /// <summary>
-    /// 該邊是否為 Two Roads 模式（BP 在 spline 兩側各生成一條路面）
     /// Whether this edge uses "Two Roads" mode (two parallel road meshes).
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     bool bTwoRoads = false;
 
     /// <summary>
-    /// Two Roads 的間距（公尺），只在 bTwoRoads=true 時有意義
     /// Gap between the two parallel roads in meters (only when bTwoRoads=true).
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     double TwoRoadsGapM = 0.0;
 
     /// <summary>
-    /// 路面寬度乘數
     /// Road width multiplier from BP.
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     double RoadWidthMultiplier = 1.0;
 
     /// <summary>
-    /// 額外路面寬度（公尺）
     /// Additional road width in meters from BP.
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     double AdditionalWidthM = 0.0;
 
     /// <summary>
-    /// 路面半寬（cm），從 BP Road Settings 讀取
     /// Road half-width (cm) from BP Road Settings.
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     double GuardrailSideOffsetCm = 350.0;
 
     /// <summary>
-    /// 從 CatsEyesPositions 自動計算的車道寬度（cm）
     /// Auto-calculated lane width from CatsEyesPositions (cm).
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     float AutoLaneWidthCm = 0.0f;
 
     /// <summary>
-    /// 從 CatsEyesPositions 自動計算的中間偏移（cm）
     /// Auto-calculated median offset from CatsEyesPositions (cm).
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
@@ -455,7 +431,6 @@ struct CARDRIVINGPROJECT_API FRoadGraphPath
 };
 
 /// <summary>
-/// 叉路候選：多條路在同一位置交會
 /// Junction candidate: multiple roads meeting at one location.
 /// Supports T-junctions (2 roads), crossroads (3-4 roads), etc.
 /// </summary>
@@ -465,21 +440,18 @@ struct CARDRIVINGPROJECT_API FRoadJunctionCandidate
     GENERATED_BODY()
 
     /// <summary>
-    /// 交會點的世界座標（所有交會取樣點的平均值）
     /// World position of the junction (average of all contributing sample points)
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     FVector WorldLocation = FVector::ZeroVector;
 
     /// <summary>
-    /// 在此路口交會的所有邊候選索引（EdgeCandidates 陣列的 index）
     /// Indices of all edge candidates that meet at this junction
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     TArray<int32> ConnectedEdgeIndices;
 
     /// <summary>
-    /// 每條邊在交會點的 spline 距離（cm），與 ConnectedEdgeIndices 一一對應
     /// Distance along each edge's spline where the junction occurs (cm).
     /// Parallel array with ConnectedEdgeIndices.
     /// </summary>

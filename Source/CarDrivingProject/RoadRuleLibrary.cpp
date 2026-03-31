@@ -20,7 +20,6 @@ FRoadDrivingRule URoadRuleLibrary::GetDrivingRuleFromRoadType(uint8 InRoadType)
     {
     case 0:
     {
-        // 單車道路：只有一條車道，雙向共用（需要會車讓行）
         // Single-lane road: one lane shared by both directions (yield on encounter)
         Rule.RuleName = TEXT("1-Lane Road");
         Rule.bIsOneWay = false;
