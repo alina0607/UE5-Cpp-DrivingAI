@@ -21,6 +21,28 @@ enum class ETurnSignal : uint8
 };
 
 /// <summary>
+/// 導航狀態 / Navigation state
+/// </summary>
+UENUM(BlueprintType)
+enum class ENavState : uint8
+{
+	Idle     UMETA(DisplayName = "Idle"),       // 沒有路線 / No route
+	Driving  UMETA(DisplayName = "Driving"),    // 正常行駛 / Normal driving
+	Parking  UMETA(DisplayName = "Parking"),    // 靠邊停車中 / Pulling over
+	Parked   UMETA(DisplayName = "Parked"),     // 已停好 / Parked
+};
+
+/// <summary>
+/// 停車模式 / Parking mode at path end
+/// </summary>
+UENUM(BlueprintType)
+enum class EParkingMode : uint8
+{
+	RoadsideStop  UMETA(DisplayName = "Roadside Stop"),  // 路邊靠肩停車 / Pull over to shoulder
+	StopInPlace   UMETA(DisplayName = "Stop In Place"),  // 原地停車 / Stop where path ends
+};
+
+/// <summary>
 /// 路徑跟隨內部用的片段資料：一段 spline 上從 A 開到 B
 /// Internal path segment: drive along a spline from StartDist to EndDist.
 /// </summary>
@@ -101,6 +123,10 @@ public:
 	/// 是否在 BeginPlay 時自動開始 / Auto-start on BeginPlay
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Navigation")
 	bool bAutoStart = true;
+
+	/// 路徑完成時的停車模式 / Parking mode when path ends
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Navigation")
+	EParkingMode ParkingMode = EParkingMode::RoadsideStop;
 
 	// ================================================================
 	//  速度控制 / Speed Control
@@ -213,6 +239,20 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane", meta = (ClampMin = "500"))
 	float AutoLaneChangeDistance = 8000.0f;
 
+	// ================================================================
+	//  停車 / Parking
+	// ================================================================
+
+	/// 進入最後一段後，剩餘距離低於此值時開始靠邊（cm）
+	/// Start pulling over when remaining distance drops below this (cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Parking", meta = (ClampMin = "0"))
+	float ParkingPullOverDistance = 8000.0f;
+
+	/// 停車回正前移距離（cm）— 停到路肩後慢慢前移多遠來轉正車頭
+	/// Straighten creep distance (cm) — how far to creep forward while aligning
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Parking", meta = (ClampMin = "50"))
+	float ParkingStraightenDistance = 500.0f;
+
 	// ---- 車道偏移微調 / Lane Offset Adjustments ----
 
 	/// bTwoRoads=true 中間偏移微調 / Two Roads median adjust (cm)
@@ -235,9 +275,28 @@ public:
 	//  API
 	// ================================================================
 
-	/// 手動開始跟隨 / Manually start path following
+	/// 手動開始跟隨（用 StartNodeId / GoalNodeId，測試用）
+	/// Manually start path following using hardcoded node IDs (for testing)
 	UFUNCTION(BlueprintCallable, Category = "Road Path")
 	void StartFollowing();
+
+	/// 導航到世界座標位置（自動 SnapToRoad 找最近 node）
+	/// Navigate to a world position (auto snap to nearest graph node)
+	UFUNCTION(BlueprintCallable, Category = "Road Path|Navigation")
+	void NavigateToLocation(const FVector& Destination);
+
+	/// 導航到指定 Graph Node ID（從車目前位置出發）
+	/// Navigate to a specific graph node (start from car's current position)
+	UFUNCTION(BlueprintCallable, Category = "Road Path|Navigation")
+	void NavigateToNode(int32 TargetNodeId);
+
+	/// 取得目前導航狀態 / Get current navigation state
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path|Navigation")
+	ENavState GetNavState() const { return NavState; }
+
+	/// 取得目的地世界座標 / Get destination world location
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path|Navigation")
+	FVector GetDestinationLocation() const { return DestinationWorldLocation; }
 
 	/// <summary>
 	/// 請求切換到指定車道（平滑插值過渡）
@@ -355,6 +414,38 @@ private:
 
 	/// 方向燈 / Turn signal
 	ETurnSignal CurrentTurnSignal = ETurnSignal::None;
+
+	// ---- 導航狀態 / Navigation State ----
+
+	/// 目前導航狀態 / Current navigation state
+	ENavState NavState = ENavState::Idle;
+
+	/// 目的地 Node ID / Destination graph node ID
+	int32 DestinationNodeId = INDEX_NONE;
+
+	/// 目的地世界座標 / Destination world location
+	FVector DestinationWorldLocation = FVector::ZeroVector;
+
+	/// 停車時的目標橫向偏移（cm）— Step 0.5 計算，Step 4 使用
+	/// Parking target lateral offset (cm) — computed in Step 0.5, used in Step 4
+	float ParkingTargetOffset = 0.0f;
+
+	/// 停車回正中 / Whether car is in straightening phase
+	bool bParkingStraightening = false;
+
+	/// 回正剩餘前移距離（cm）/ Remaining creep distance for straightening
+	float ParkingStraightenRemain = 0.0f;
+
+	/// 回正目標 Yaw / Target yaw for straightening (road direction)
+	float ParkingStraightenYaw = 0.0f;
+
+	/// 內部共用的導航啟動邏輯（A* + BuildPath + 初始化）
+	/// Internal shared navigation start logic (A* + BuildPath + init)
+	void StartNavigationInternal(int32 FromNodeId, int32 ToNodeId);
+
+	/// 重置所有跟隨狀態（用於重導航）
+	/// Reset all following state (for re-routing)
+	void ResetFollowingState();
 
 	/// 到下一個路口的距離（用於減速判斷）
 	/// Distance to next junction (for slowdown calculation)

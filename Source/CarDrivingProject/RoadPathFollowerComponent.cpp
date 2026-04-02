@@ -62,9 +62,30 @@ void URoadPathFollowerComponent::BeginPlay()
 }
 
 // ============================================================================
-//  StartFollowing
+//  ResetFollowingState — 重置所有跟隨/導航狀態（重導航時使用）
+//  Reset all following/navigation state (used when re-routing).
 // ============================================================================
-void URoadPathFollowerComponent::StartFollowing()
+void URoadPathFollowerComponent::ResetFollowingState()
+{
+	bIsFollowing = false;
+	bOnJunctionCurve = false;
+	bIsChangingLane = false;
+	bParkingStraightening = false;
+	JCurveProgress = 0.0f;
+	ParkingStraightenRemain = 0.0f;
+	ParkingTargetOffset = 0.0f;
+	CurrentSpeed = 0.0f;
+	CurrentTurnSignal = ETurnSignal::None;
+	NavState = ENavState::Idle;
+	PathSegments.Empty();
+	CurrentSegmentIndex = 0;
+}
+
+// ============================================================================
+//  StartNavigationInternal — 共用的 A* + BuildPath + 初始化
+//  Shared internal: run A*, build segments, initialize state.
+// ============================================================================
+void URoadPathFollowerComponent::StartNavigationInternal(int32 FromNodeId, int32 ToNodeId)
 {
 	UWorld* World = GetWorld();
 	if (!World) return;
@@ -76,17 +97,23 @@ void URoadPathFollowerComponent::StartFollowing()
 		return;
 	}
 
-	const FRoadGraphPath AStarPath = Sub->FindPathAStar(StartNodeId, GoalNodeId);
+	// 如果正在跟隨，先重置 / If already following, reset first
+	if (bIsFollowing)
+	{
+		ResetFollowingState();
+	}
+
+	const FRoadGraphPath AStarPath = Sub->FindPathAStar(FromNodeId, ToNodeId);
 	if (!AStarPath.bPathFound)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("PathFollower: A* failed %d → %d"), StartNodeId, GoalNodeId);
+		UE_LOG(LogTemp, Warning, TEXT("PathFollower: A* failed %d → %d"), FromNodeId, ToNodeId);
 		OnPathComplete.Broadcast(false);
 		return;
 	}
 
 	UE_LOG(LogTemp, Warning,
 		TEXT("PathFollower: A* path %d → %d | %d nodes | Cost=%.1f"),
-		StartNodeId, GoalNodeId, AStarPath.NodePath.Num(), AStarPath.TotalCost);
+		FromNodeId, ToNodeId, AStarPath.NodePath.Num(), AStarPath.TotalCost);
 
 	BuildPathSegments(AStarPath);
 
@@ -97,8 +124,7 @@ void URoadPathFollowerComponent::StartFollowing()
 		return;
 	}
 
-	// 初始化所有狀態
-	// Initialize all state
+	// 初始化所有狀態 / Initialize all state
 	CurrentSegmentIndex = 0;
 	ReferenceDistance = PathSegments[0].StartDist;
 	CurrentSpeed = 0.0f;  // 從靜止開始 / start from standstill
@@ -107,11 +133,105 @@ void URoadPathFollowerComponent::StartFollowing()
 	bIsChangingLane = false;
 	bOnJunctionCurve = false;
 	JCurveProgress = 0.0f;
+	CurrentTurnSignal = ETurnSignal::None;
+	NavState = ENavState::Driving;
 	bIsFollowing = true;
 
 	UE_LOG(LogTemp, Warning,
 		TEXT("PathFollower: Started | %d segs | MaxSpeed=%.0f | Lane=%d | LateralOffset=%.0f"),
 		PathSegments.Num(), MaxSpeed, CurrentLaneIndex, CurrentLateralOffset);
+}
+
+// ============================================================================
+//  StartFollowing — 用寫死的 StartNodeId / GoalNodeId（測試用）
+//  Start following using hardcoded node IDs (for testing).
+// ============================================================================
+void URoadPathFollowerComponent::StartFollowing()
+{
+	DestinationNodeId = GoalNodeId;
+	StartNavigationInternal(StartNodeId, GoalNodeId);
+}
+
+// ============================================================================
+//  NavigateToNode — 從車目前位置導航到指定 Node ID
+//  Navigate from car's current position to a specific graph node.
+// ============================================================================
+void URoadPathFollowerComponent::NavigateToNode(int32 TargetNodeId)
+{
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	URoadNetworkSubsystem* Sub = World->GetSubsystem<URoadNetworkSubsystem>();
+	if (!Sub)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("PathFollower: RoadNetworkSubsystem not found"));
+		return;
+	}
+
+	AActor* Owner = GetOwner();
+	if (!Owner) return;
+
+	// 用車目前位置找最近 node 作為起點
+	// Snap car's current position to nearest graph node as start
+	const int32 FromNode = Sub->FindNearestGraphNode(Owner->GetActorLocation());
+	if (FromNode == INDEX_NONE)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("PathFollower: Cannot find nearest node for car position"));
+		OnPathComplete.Broadcast(false);
+		return;
+	}
+
+	// 記錄目的地資訊 / Store destination info
+	DestinationNodeId = TargetNodeId;
+	const TArray<FRoadGraphNode>& Nodes = Sub->GetGraphNodes();
+	if (TargetNodeId >= 0 && TargetNodeId < Nodes.Num())
+	{
+		DestinationWorldLocation = Nodes[TargetNodeId].WorldLocation;
+	}
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("PathFollower: NavigateToNode — from nearest Node %d to Node %d"),
+		FromNode, TargetNodeId);
+
+	StartNavigationInternal(FromNode, TargetNodeId);
+}
+
+// ============================================================================
+//  NavigateToLocation — 導航到世界座標（自動 SnapToRoad）
+//  Navigate to a world position (auto snap to nearest graph node).
+// ============================================================================
+void URoadPathFollowerComponent::NavigateToLocation(const FVector& Destination)
+{
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	URoadNetworkSubsystem* Sub = World->GetSubsystem<URoadNetworkSubsystem>();
+	if (!Sub)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("PathFollower: RoadNetworkSubsystem not found"));
+		return;
+	}
+
+	// 目的地 SnapToRoad → 最近的 graph node
+	// Snap destination to nearest graph node
+	const int32 GoalNode = Sub->FindNearestGraphNode(Destination);
+	if (GoalNode == INDEX_NONE)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("PathFollower: Cannot find nearest node for destination (%.0f, %.0f, %.0f)"),
+			Destination.X, Destination.Y, Destination.Z);
+		OnPathComplete.Broadcast(false);
+		return;
+	}
+
+	// 記錄目的地世界座標 / Store destination world location
+	DestinationWorldLocation = Destination;
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("PathFollower: NavigateToLocation — dest (%.0f, %.0f, %.0f) → Node %d"),
+		Destination.X, Destination.Y, Destination.Z, GoalNode);
+
+	NavigateToNode(GoalNode);
 }
 
 // ============================================================================
@@ -224,14 +344,10 @@ void URoadPathFollowerComponent::BuildPathSegments(const FRoadGraphPath& AStarPa
 		}
 
 		UE_LOG(LogTemp, Warning,
-			TEXT("  Seg[%d] TurnAtEnd=%s | Dot=%.4f CrossZ=%.1f | A=(%d:%.0f,%.0f) B=(%d:%.0f,%.0f) C=(%d:%.0f,%.0f)"),
+			TEXT("  Seg[%d] TurnAtEnd=%s"),
 			i,
 			(PathSegments[i].TurnAtEnd == ETurnSignal::Left) ? TEXT("LEFT") :
-			(PathSegments[i].TurnAtEnd == ETurnSignal::Right) ? TEXT("RIGHT") : TEXT("NONE"),
-			Dot, CrossZ,
-			IdA, PosA.X, PosA.Y,
-			IdB, PosB.X, PosB.Y,
-			IdC, PosC.X, PosC.Y);
+			(PathSegments[i].TurnAtEnd == ETurnSignal::Right) ? TEXT("RIGHT") : TEXT("NONE"));
 	}
 }
 
@@ -583,6 +699,33 @@ void URoadPathFollowerComponent::TickComponent(
 	}
 
 	// ================================================================
+	//  0.5 路邊停車：最後一段 → 直接偏移到路肩
+	//      Roadside parking: last segment → offset directly to shoulder
+	// ================================================================
+	if (NavState == ENavState::Driving
+		&& CurrentSegmentIndex == PathSegments.Num() - 1
+		&& ParkingMode == EParkingMode::RoadsideStop)
+	{
+		const float RemainDist = GetRemainingDistance();
+		if (RemainDist < ParkingPullOverDistance)
+		{
+			NavState = ENavState::Parking;
+
+			// 亮右方向燈 / Right turn signal
+			CurrentTurnSignal = ETurnSignal::Right;
+
+			// 停車目標 = 虛擬 lane N（超出最外車道一格，就是路肩位置）
+			// Parking target = virtual lane N (one beyond outermost = shoulder)
+			const int32 ShoulderLane = Seg.DrivingRule.ForwardLaneCount;  // 2-lane → index 2
+			ParkingTargetOffset = ComputeTargetLaneOffset(ShoulderLane);
+
+			UE_LOG(LogTemp, Warning,
+				TEXT("PathFollower: Parking — ShoulderLane=%d TargetOffset=%.0f CurOffset=%.0f remain=%.0f cm"),
+				ShoulderLane, ParkingTargetOffset, CurrentLateralOffset, RemainDist);
+		}
+	}
+
+	// ================================================================
 	//  1. 速度控制：加速到 DesiredSpeed 或煞車
 	//     Speed control: accelerate toward desired or brake
 	// ================================================================
@@ -646,7 +789,9 @@ void URoadPathFollowerComponent::TickComponent(
 			{
 				bIsFollowing = false;
 				CurrentSpeed = 0.0f;
-				UE_LOG(LogTemp, Warning, TEXT("PathFollower: Path completed!"));
+				NavState = ENavState::Parked;
+				CurrentTurnSignal = ETurnSignal::None;
+				UE_LOG(LogTemp, Warning, TEXT("PathFollower: Path completed (curve end) — NavState=Parked"));
 				OnPathComplete.Broadcast(true);
 				return;
 			}
@@ -706,6 +851,13 @@ void URoadPathFollowerComponent::TickComponent(
 			CurrentLaneIndex = TargetLaneIndex;
 			bIsChangingLane = false;
 		}
+	}
+	else if (NavState == ENavState::Parking)
+	{
+		// 停車中：直接平滑移動到路肩目標位置
+		// Parking: smoothly move to shoulder target (computed in Step 0.5)
+		CurrentLateralOffset = FMath::FInterpConstantTo(
+			CurrentLateralOffset, ParkingTargetOffset, DeltaTime, LaneChangeSpeed);
 	}
 	else
 	{
@@ -804,8 +956,8 @@ void URoadPathFollowerComponent::TickComponent(
 		bOnJunctionCurve = true;
 
 		UE_LOG(LogTemp, Warning,
-			TEXT("JUNCTION_CURVE_START: P0→P1 dist=%.0f CurveLen=%.0f BlendDist=%.0f NextRefDist=%.0f CurOffset=%.0f NextOffset=%.0f TurnSignal=%d NextLanes=%d NextLaneIdx=%d"),
-			(JCurveP1 - JCurveP0).Size(), JCurveLength, EffectiveBlendDist, JCurveNextRefDist,
+			TEXT("JUNCTION_CURVE_START: P0→P1 dist=%.0f CurveLen=%.0f NextRefDist=%.0f CurOffset=%.0f NextOffset=%.0f TurnSignal=%d NextLanes=%d NextLaneIdx=%d"),
+			(JCurveP1 - JCurveP0).Size(), JCurveLength, JCurveNextRefDist,
 			CurrentLateralOffset, NextSegLaneOffset,
 			(int32)CurrentTurnSignal, NextLaneCount, JCurveNextLaneIndex);
 
@@ -834,10 +986,79 @@ void URoadPathFollowerComponent::TickComponent(
 
 	if (bSegDone)
 	{
-		bIsFollowing = false;
-		CurrentSpeed = 0.0f;
-		UE_LOG(LogTemp, Warning, TEXT("PathFollower: Path completed (last seg)!"));
-		OnPathComplete.Broadcast(true);
+		if (NavState == ENavState::Parking && !bParkingStraightening)
+		{
+			// 開始回正階段：慢慢前移 + 漸漸轉正（模擬真實停車）
+			// Start straightening phase: creep forward + gradually align (realistic parking)
+			bParkingStraightening = true;
+			ParkingStraightenRemain = ParkingStraightenDistance;
+
+			FVector TmpPos, TmpDir, TmpRight;
+			SampleSplineAtDist(Seg, Seg.EndDist, CurrentLateralOffset, TmpPos, TmpDir, TmpRight);
+			ParkingStraightenYaw = TmpDir.Rotation().Yaw;
+
+			UE_LOG(LogTemp, Warning,
+				TEXT("PathFollower: Parking straighten start — TargetYaw=%.1f RemainDist=%.0f"),
+				ParkingStraightenYaw, ParkingStraightenRemain);
+		}
+		else if (!bParkingStraightening)
+		{
+			// 非停車模式：直接結束
+			// Not parking: end immediately
+			bIsFollowing = false;
+			CurrentSpeed = 0.0f;
+			NavState = ENavState::Parked;
+			CurrentTurnSignal = ETurnSignal::None;
+			UE_LOG(LogTemp, Warning, TEXT("PathFollower: Path completed (last seg) — NavState=Parked"));
+			OnPathComplete.Broadcast(true);
+			return;
+		}
+	}
+
+	// ---- 停車回正階段：前移 + 橫移到路肩 + 轉正 ----
+	// ---- Parking straighten: creep forward + slide to shoulder + align ----
+	if (bParkingStraightening)
+	{
+		const float CreepSpeed = MaxSpeed * 0.1f;  // 10% 最大速度慢慢前移
+		const FVector FwdDir = Owner->GetActorForwardVector();
+		FVector NewPos = Owner->GetActorLocation() + FwdDir * CreepSpeed * DeltaTime;
+
+		// 繼續橫向移動到路肩目標（bSegDone 前可能來不及到位）
+		// Continue lateral slide to shoulder (may not have reached before bSegDone)
+		CurrentLateralOffset = FMath::FInterpConstantTo(
+			CurrentLateralOffset, ParkingTargetOffset, DeltaTime, LaneChangeSpeed);
+
+		// 用最新 offset 在段終點取樣位置，用 VInterpTo 拉過去
+		// Sample end-of-segment with updated offset, pull car toward it
+		FVector TmpPos, TmpDir, TmpRight;
+		SampleSplineAtDist(Seg, Seg.EndDist, CurrentLateralOffset, TmpPos, TmpDir, TmpRight);
+		NewPos = FMath::VInterpTo(NewPos, TmpPos, DeltaTime, 10.0f);
+
+		// 轉正 / Align rotation
+		const FRotator CurRot = Owner->GetActorRotation();
+		const FRotator TargetRot = FRotator(0.0f, ParkingStraightenYaw, 0.0f);
+		const FRotator NewRot = FMath::RInterpTo(CurRot, TargetRot, DeltaTime, 3.0f);
+
+		Owner->SetActorLocationAndRotation(NewPos, NewRot);
+
+		ParkingStraightenRemain -= CreepSpeed * DeltaTime;
+		const float YawDiff = FMath::Abs(FRotator::NormalizeAxis(CurRot.Yaw - ParkingStraightenYaw));
+		const float OffsetDiff = FMath::Abs(CurrentLateralOffset - ParkingTargetOffset);
+
+		// 轉正 + 到位 才停 / Must be both aligned AND at target offset to finish
+		if (ParkingStraightenRemain <= 0.0f || (YawDiff < 1.0f && OffsetDiff < 5.0f))
+		{
+			bParkingStraightening = false;
+			bIsFollowing = false;
+			CurrentSpeed = 0.0f;
+			NavState = ENavState::Parked;
+			CurrentTurnSignal = ETurnSignal::None;
+
+			UE_LOG(LogTemp, Warning,
+				TEXT("PathFollower: Parked — Offset=%.0f TargetOffset=%.0f Yaw=%.1f"),
+				CurrentLateralOffset, ParkingTargetOffset, Owner->GetActorRotation().Yaw);
+			OnPathComplete.Broadcast(true);
+		}
 		return;
 	}
 
@@ -866,6 +1087,8 @@ void URoadPathFollowerComponent::TickComponent(
 	FRotator FinalRot = CurrentRot;
 	if (Velocity.SizeSquared() > 1.0f)
 	{
+		// 全程用 velocity 朝向 — 停車時自然轉向路肩，接近停止時自然回正
+		// Always use velocity heading — naturally steers toward shoulder, straightens near stop
 		FinalRot = FMath::RInterpTo(
 			CurrentRot, Velocity.Rotation(), DeltaTime, RotationInterpSpeed);
 	}
