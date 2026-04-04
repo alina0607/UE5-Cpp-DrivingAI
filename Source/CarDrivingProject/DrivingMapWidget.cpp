@@ -5,6 +5,7 @@
 
 #include "Camera/CameraActor.h"
 #include "Camera/CameraComponent.h"
+#include "GameFramework/SpringArmComponent.h"
 #include "Engine/Texture2D.h"
 #include "EngineUtils.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
@@ -19,11 +20,17 @@ void UDrivingMapWidget::NativeConstruct()
 	Super::NativeConstruct();
 	SetVisibility(ESlateVisibility::HitTestInvisible);
 	BuildNodeCache();
+	InitFreeCamera();
 }
 
 void UDrivingMapWidget::NativeDestruct()
 {
-	DestroyFollowCamera();
+	DeselectVehicle();
+	if (FreeCameraActor)
+	{
+		FreeCameraActor->Destroy();
+		FreeCameraActor = nullptr;
+	}
 	Super::NativeDestruct();
 }
 
@@ -40,7 +47,7 @@ void UDrivingMapWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTim
 		BuildNodeCache();
 	}
 
-	// 背景圖 Brush 設定（一次）
+	// 背景圖 Brush 設定（一次）/ Setup brush once
 	if (!bBrushReady && MapTexture)
 	{
 		SetupBrush();
@@ -48,23 +55,49 @@ void UDrivingMapWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTim
 
 	UpdateVehicleCache();
 
-	// 軌道攝影機旋轉
-	if (SelectedVehiclePtr.IsValid())
+	// ---- ESC：跟隨車輛時按 ESC 退回自由相機 ----
+	// ---- ESC: return to free camera while following vehicle ----
+	if (!bFreeCameraMode && SelectedVehiclePtr.IsValid())
 	{
 		if (APlayerController* PC = GetOwningPlayer())
 		{
-			if (PC->IsInputKeyDown(EKeys::RightMouseButton) && !bIsFullscreen)
+			if (PC->WasInputKeyJustPressed(EKeys::SpaceBar))
 			{
-				float DeltaX, DeltaY;
-				PC->GetInputMouseDelta(DeltaX, DeltaY);
-				FollowOrbitYaw += DeltaX * OrbitSensitivity;
-				FollowOrbitPitch = FMath::Clamp(
-					FollowOrbitPitch + DeltaY * OrbitSensitivity, -80.0f, -5.0f);
+				DeselectVehicle();
+				if (bIsFullscreen) ToggleMapSize();
+				return; // 這幀不再處理其他操控 / Skip rest of input this frame
 			}
 		}
 	}
 
-	UpdateFollowCamera(InDeltaTime);
+	// ---- 自由相機模式：WASD + 右鍵旋轉 ----
+	// ---- Free camera mode: WASD move + RMB rotate ----
+	if (bFreeCameraMode && !bIsFullscreen)
+	{
+		UpdateFreeCamera(InDeltaTime);
+	}
+	// ---- 跟隨模式：右鍵拖曳旋轉 CameraBoom ----
+	// ---- Follow mode: RMB drag to orbit CameraBoom ----
+	else if (!bFreeCameraMode && SelectedVehiclePtr.IsValid() && !bIsFullscreen)
+	{
+		if (APlayerController* PC = GetOwningPlayer())
+		{
+			if (PC->IsInputKeyDown(EKeys::RightMouseButton))
+			{
+				float DeltaX, DeltaY;
+				PC->GetInputMouseDelta(DeltaX, DeltaY);
+
+				USpringArmComponent* Boom = SelectedVehiclePtr->FindComponentByClass<USpringArmComponent>();
+				if (Boom)
+				{
+					FRotator BoomRot = Boom->GetRelativeRotation();
+					BoomRot.Yaw += DeltaX * OrbitSensitivity;
+					BoomRot.Pitch = FMath::Clamp(BoomRot.Pitch + DeltaY * OrbitSensitivity, -80.0f, -5.0f);
+					Boom->SetRelativeRotation(BoomRot);
+				}
+			}
+		}
+	}
 }
 
 // ================================================================
@@ -232,10 +265,14 @@ FReply UDrivingMapWidget::NativeOnMouseWheel(
 {
 	if (SelectedVehiclePtr.IsValid())
 	{
-		float Delta = InMouseEvent.GetWheelDelta();
-		FollowCameraDistance = FMath::Clamp(
-			FollowCameraDistance - Delta * ZoomSpeed,
-			MinFollowDistance, MaxFollowDistance);
+		USpringArmComponent* Boom = SelectedVehiclePtr->FindComponentByClass<USpringArmComponent>();
+		if (Boom)
+		{
+			float Delta = InMouseEvent.GetWheelDelta();
+			Boom->TargetArmLength = FMath::Clamp(
+				Boom->TargetArmLength - Delta * ZoomSpeed,
+				MinFollowDistance, MaxFollowDistance);
+		}
 		return FReply::Handled();
 	}
 	return FReply::Unhandled();
@@ -256,9 +293,9 @@ void UDrivingMapWidget::SelectVehicle(AActor* Vehicle)
 	if (!Vehicle) { DeselectVehicle(); return; }
 
 	SelectedVehiclePtr = Vehicle;
-	FollowOrbitYaw = 0.0f;
-	FollowOrbitPitch = DefaultOrbitPitch;
+	bFreeCameraMode = false;
 
+	// 記錄目的地節點 / Record destination node
 	URoadPathFollowerComponent* PF = Vehicle->FindComponentByClass<URoadPathFollowerComponent>();
 	if (PF)
 	{
@@ -275,34 +312,58 @@ void UDrivingMapWidget::SelectVehicle(AActor* Vehicle)
 		}
 	}
 
-	CreateFollowCamera();
+	// 儲存 SpringArm 原始旋轉，方便取消時還原
+	// Save original boom rotation so we can restore on deselect
+	USpringArmComponent* Boom = Vehicle->FindComponentByClass<USpringArmComponent>();
+	if (Boom)
+	{
+		OriginalBoomRotation = Boom->GetRelativeRotation();
+	}
+
+	// 直接把 ViewTarget 設成車輛本身 → 用車輛的 CameraBoom + FollowCamera
+	// Set view target to the vehicle itself → uses its own CameraBoom + FollowCamera
 	if (APlayerController* PC = GetOwningPlayer())
 	{
-		if (!OriginalViewTarget.IsValid())
-			OriginalViewTarget = PC->GetViewTarget();
-		if (FollowCamera)
-			PC->SetViewTargetWithBlend(FollowCamera, 0.5f);
+		PC->SetViewTargetWithBlend(Vehicle, 0.5f);
 	}
 }
 
 void UDrivingMapWidget::DeselectVehicle()
 {
-	SelectedVehiclePtr = nullptr;
-	SelectedDestinationNodeId = INDEX_NONE;
-
-	if (APlayerController* PC = GetOwningPlayer())
+	// 還原 SpringArm 旋轉 / Restore original boom rotation
+	if (SelectedVehiclePtr.IsValid())
 	{
-		if (OriginalViewTarget.IsValid())
-			PC->SetViewTargetWithBlend(OriginalViewTarget.Get(), 0.5f);
-		else if (APawn* Pawn = PC->GetPawn())
-			PC->SetViewTargetWithBlend(Pawn, 0.5f);
+		USpringArmComponent* Boom = SelectedVehiclePtr->FindComponentByClass<USpringArmComponent>();
+		if (Boom)
+		{
+			Boom->SetRelativeRotation(OriginalBoomRotation);
+		}
 	}
 
-	OriginalViewTarget = nullptr;
-	bFollowTargetInitialized = false;
-	FollowOrbitYaw = 0.0f;
-	FollowOrbitPitch = DefaultOrbitPitch;
-	DestroyFollowCamera();
+	// 把自由相機移到目前視角位置，避免跳回舊位置
+	// Move free camera to current view so it doesn't snap back
+	if (FreeCameraActor)
+	{
+		if (APlayerController* PC = GetOwningPlayer())
+		{
+			FVector ViewLoc;
+			FRotator ViewRot;
+			PC->GetPlayerViewPoint(ViewLoc, ViewRot);
+			FreeCameraActor->SetActorLocation(ViewLoc);
+			FreeCameraActor->SetActorRotation(ViewRot);
+		}
+	}
+
+	SelectedVehiclePtr = nullptr;
+	SelectedDestinationNodeId = INDEX_NONE;
+	bFreeCameraMode = true;
+
+	// 切回自由相機 / Switch back to free camera
+	if (APlayerController* PC = GetOwningPlayer())
+	{
+		if (FreeCameraActor)
+			PC->SetViewTargetWithBlend(FreeCameraActor, 0.3f);
+	}
 }
 
 AActor* UDrivingMapWidget::GetSelectedVehicle() const
@@ -582,69 +643,92 @@ int32 UDrivingMapWidget::FindNodeNearMapPos(
 }
 
 // ================================================================
-//  跟隨攝影機 / Follow Camera
+//  自由相機 / Free Camera
 // ================================================================
 
-void UDrivingMapWidget::CreateFollowCamera()
+void UDrivingMapWidget::InitFreeCamera()
 {
-	if (FollowCamera) return;
+	if (FreeCameraActor) return;
+
 	UWorld* World = GetWorld();
 	if (!World) return;
 
+	// 從目前玩家視角位置開始 / Start at current player view
+	FVector StartLoc = FVector(0.0, 0.0, 500.0);
+	FRotator StartRot = FRotator(-30.0, 0.0, 0.0);
+	if (APlayerController* PC = GetOwningPlayer())
+	{
+		PC->GetPlayerViewPoint(StartLoc, StartRot);
+	}
+
 	FActorSpawnParameters Params;
 	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-	FollowCamera = World->SpawnActor<ACameraActor>(FVector::ZeroVector, FRotator::ZeroRotator, Params);
-	if (FollowCamera)
+	FreeCameraActor = World->SpawnActor<ACameraActor>(StartLoc, StartRot, Params);
+
+	if (FreeCameraActor)
 	{
-		if (UCameraComponent* CamComp = FollowCamera->GetCameraComponent())
-			CamComp->SetFieldOfView(75.0f);
+		if (UCameraComponent* CamComp = FreeCameraActor->GetCameraComponent())
+		{
+			CamComp->SetFieldOfView(90.0f);
+		}
+
+		// 立即設為 ViewTarget / Set as active view target immediately
+		if (APlayerController* PC = GetOwningPlayer())
+		{
+			PC->SetViewTarget(FreeCameraActor);
+		}
 	}
+
+	bFreeCameraMode = true;
 }
 
-void UDrivingMapWidget::DestroyFollowCamera()
+void UDrivingMapWidget::UpdateFreeCamera(float DeltaTime)
 {
-	if (FollowCamera)
+	if (!FreeCameraActor) return;
+
+	APlayerController* PC = GetOwningPlayer();
+	if (!PC) return;
+
+	// ---- 右鍵旋轉 / RMB + mouse to rotate ----
+	if (PC->IsInputKeyDown(EKeys::RightMouseButton))
 	{
-		FollowCamera->Destroy();
-		FollowCamera = nullptr;
+		float DeltaX, DeltaY;
+		PC->GetInputMouseDelta(DeltaX, DeltaY);
+
+		FRotator CamRot = FreeCameraActor->GetActorRotation();
+		CamRot.Yaw   += DeltaX * FreeCameraRotateSpeed;
+		CamRot.Pitch  = FMath::Clamp(CamRot.Pitch + DeltaY * FreeCameraRotateSpeed, -89.0f, 89.0f);
+		CamRot.Roll   = 0.0f;
+		FreeCameraActor->SetActorRotation(CamRot);
+	}
+
+	// ---- WASD + QE 移動 / WASD + QE movement ----
+	FVector MoveInput = FVector::ZeroVector;
+	if (PC->IsInputKeyDown(EKeys::W)) MoveInput.X += 1.0f;
+	if (PC->IsInputKeyDown(EKeys::S)) MoveInput.X -= 1.0f;
+	if (PC->IsInputKeyDown(EKeys::D)) MoveInput.Y += 1.0f;
+	if (PC->IsInputKeyDown(EKeys::A)) MoveInput.Y -= 1.0f;
+	if (PC->IsInputKeyDown(EKeys::E)) MoveInput.Z += 1.0f;
+	if (PC->IsInputKeyDown(EKeys::Q)) MoveInput.Z -= 1.0f;
+
+	if (!MoveInput.IsNearlyZero())
+	{
+		MoveInput.Normalize();
+
+		float Speed = FreeCameraMoveSpeed;
+		if (PC->IsInputKeyDown(EKeys::LeftShift))
+		{
+			Speed *= FreeCameraFastMultiplier;
+		}
+
+		FRotator CamRot = FreeCameraActor->GetActorRotation();
+		FVector Forward = FRotationMatrix(CamRot).GetUnitAxis(EAxis::X);
+		FVector Right   = FRotationMatrix(CamRot).GetUnitAxis(EAxis::Y);
+		FVector Up      = FVector::UpVector;
+
+		FVector WorldMove = Forward * MoveInput.X + Right * MoveInput.Y + Up * MoveInput.Z;
+		FreeCameraActor->SetActorLocation(
+			FreeCameraActor->GetActorLocation() + WorldMove * Speed * DeltaTime);
 	}
 }
 
-void UDrivingMapWidget::UpdateFollowCamera(float DeltaTime)
-{
-	if (!FollowCamera || !SelectedVehiclePtr.IsValid()) return;
-
-	FVector VehiclePos = SelectedVehiclePtr->GetActorLocation();
-	FVector VehicleFwd = SelectedVehiclePtr->GetActorForwardVector();
-
-	if (!bFollowTargetInitialized)
-	{
-		SmoothedFollowTarget = VehiclePos;
-		bFollowTargetInitialized = true;
-	}
-	else
-	{
-		SmoothedFollowTarget = FMath::VInterpTo(
-			SmoothedFollowTarget, VehiclePos, DeltaTime, 3.0f);
-	}
-
-	float VehicleYaw = VehicleFwd.Rotation().Yaw;
-	float TotalYawRad = FMath::DegreesToRadians(VehicleYaw + FollowOrbitYaw + 180.0f);
-	float PitchRad = FMath::DegreesToRadians(FollowOrbitPitch);
-
-	FVector Offset;
-	Offset.X = FMath::Cos(TotalYawRad) * FMath::Cos(PitchRad) * FollowCameraDistance;
-	Offset.Y = FMath::Sin(TotalYawRad) * FMath::Cos(PitchRad) * FollowCameraDistance;
-	Offset.Z = -FMath::Sin(PitchRad) * FollowCameraDistance;
-
-	FVector TargetPos = SmoothedFollowTarget + Offset;
-	FRotator TargetRot = (SmoothedFollowTarget - TargetPos).Rotation();
-
-	FVector NewPos = FMath::VInterpTo(
-		FollowCamera->GetActorLocation(), TargetPos, DeltaTime, CameraInterpSpeed);
-	FRotator NewRot = FMath::RInterpTo(
-		FollowCamera->GetActorRotation(), TargetRot, DeltaTime, CameraInterpSpeed);
-
-	FollowCamera->SetActorLocation(NewPos);
-	FollowCamera->SetActorRotation(NewRot);
-}

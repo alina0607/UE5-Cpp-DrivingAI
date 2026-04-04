@@ -68,7 +68,7 @@ public:
     /// Z offset for debug lines (cm) — raise above road surface.
     /// </summary>
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Road Debug")
-    float DebugDrawZOffset = 500.0f;
+    float DebugDrawZOffset = 30.0f;
 
     /// <summary>
     /// Debug draw duration in seconds.

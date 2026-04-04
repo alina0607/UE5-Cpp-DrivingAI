@@ -8,6 +8,7 @@
 class ACameraActor;
 class URoadNetworkSubsystem;
 class URoadPathFollowerComponent;
+class USpringArmComponent;
 class UTexture2D;
 
 /// 地圖上的車輛快取 / Cached vehicle info for map rendering
@@ -113,26 +114,41 @@ public:
 	//  攝影機 / Camera Settings
 	// ================================================================
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Camera", meta = (ClampMin = "100"))
-	float FollowCameraDistance = 600.0f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Camera")
-	float CameraInterpSpeed = 2.5f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Camera")
-	float DefaultOrbitPitch = -20.0f;
-
+	/// 右鍵拖曳旋轉靈敏度 / Right-click drag orbit sensitivity
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Camera")
 	float OrbitSensitivity = 1.0f;
 
+	/// 滾輪縮放速度 / Scroll zoom speed
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Camera", meta = (ClampMin = "10"))
 	float ZoomSpeed = 80.0f;
 
+	/// SpringArm 最短距離 / Min arm length
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Camera", meta = (ClampMin = "50"))
 	float MinFollowDistance = 200.0f;
 
+	/// SpringArm 最長距離 / Max arm length
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Camera")
 	float MaxFollowDistance = 3000.0f;
+
+	// ================================================================
+	//  自由相機 / Free Camera
+	// ================================================================
+
+	/// 自由相機移動速度（cm/s）/ Free camera movement speed
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Free Camera")
+	float FreeCameraMoveSpeed = 1500.0f;
+
+	/// 自由相機旋轉速度 / Free camera rotation speed
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Free Camera")
+	float FreeCameraRotateSpeed = 2.5f;
+
+	/// 按住 Shift 的加速倍率 / Speed multiplier when holding Shift
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Free Camera")
+	float FreeCameraFastMultiplier = 3.0f;
+
+	/// 目前是否為自由相機模式 / Whether currently in free camera mode
+	UPROPERTY(BlueprintReadOnly, Category = "Driving Map|Free Camera")
+	bool bFreeCameraMode = true;
 
 protected:
 	virtual void NativeConstruct() override;
@@ -164,10 +180,10 @@ private:
 	TWeakObjectPtr<AActor> SelectedVehiclePtr;
 	int32 SelectedDestinationNodeId = INDEX_NONE;
 
+	/// 自由相機 Actor（遊戲開始時建立一次，永不銷毀）
+	/// Persistent free camera actor — spawned once at startup
 	UPROPERTY()
-	TObjectPtr<ACameraActor> FollowCamera;
-	UPROPERTY()
-	TWeakObjectPtr<AActor> OriginalViewTarget;
+	TObjectPtr<ACameraActor> FreeCameraActor;
 
 	// ---- 背景 Brush ----
 
@@ -208,12 +224,10 @@ private:
 
 	// ---- 攝影機 ----
 
-	void UpdateFollowCamera(float DeltaTime);
-	void CreateFollowCamera();
-	void DestroyFollowCamera();
+	/// 儲存選車前的 SpringArm 旋轉，取消時還原
+	/// Store original boom rotation before orbit, restore on deselect
+	FRotator OriginalBoomRotation = FRotator::ZeroRotator;
 
-	FVector SmoothedFollowTarget = FVector::ZeroVector;
-	bool bFollowTargetInitialized = false;
-	float FollowOrbitYaw = 0.0f;
-	float FollowOrbitPitch = -20.0f;
+	void InitFreeCamera();
+	void UpdateFreeCamera(float DeltaTime);
 };
