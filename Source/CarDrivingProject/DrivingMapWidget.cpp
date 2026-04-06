@@ -2,11 +2,15 @@
 #include "RoadNetworkSubsystem.h"
 #include "RoadPathFollowerComponent.h"
 #include "RoadTypes.h"
+#include "ParkingLotActor.h"
+#include "RoadsideParkingActor.h"
 
 #include "Camera/CameraActor.h"
 #include "Camera/CameraComponent.h"
 #include "GameFramework/SpringArmComponent.h"
 #include "Engine/Texture2D.h"
+#include "Engine/Font.h"
+#include "Styling/AppStyle.h"
 #include "EngineUtils.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
 #include "Components/SplineComponent.h"
@@ -195,7 +199,49 @@ int32 UDrivingMapWidget::NativePaint(
 		DrawArrow(Context, MapPos, MapDir, ArrowSize, Color, 2.5f);
 	}
 
-	// ---- 3. 邊框 ----
+	// ---- 3.5 選中車輛的路線粗線 / Selected vehicle route thick line ----
+	if (SelectedVehiclePtr.IsValid())
+	{
+		URoadPathFollowerComponent* PF =
+			SelectedVehiclePtr->FindComponentByClass<URoadPathFollowerComponent>();
+		if (PF)
+		{
+			TArray<FVector> RoutePoints;
+			PF->GetRouteWorldPoints(RoutePoints, 15);
+
+			if (RoutePoints.Num() > 1)
+			{
+				const FLinearColor RouteColor(1.0f, 0.6f, 0.1f, 0.85f);
+				const float RouteThickness = bIsFullscreen ? 3.5f : 2.0f;
+
+				FVector2D PrevPt = WorldToMap(RoutePoints[0], MapOrigin, MapSize);
+				for (int32 r = 1; r < RoutePoints.Num(); ++r)
+				{
+					FVector2D CurPt = WorldToMap(RoutePoints[r], MapOrigin, MapSize);
+					UWidgetBlueprintLibrary::DrawLine(Context, PrevPt, CurPt,
+						RouteColor, true, RouteThickness);
+					PrevPt = CurPt;
+				}
+			}
+
+			// 終點標記 / Destination marker
+			if (SelectedDestinationNodeId != INDEX_NONE && CachedNodes.Num() > 0)
+			{
+				for (const FMapNodeCache& NC : CachedNodes)
+				{
+					if (NC.NodeId == SelectedDestinationNodeId)
+					{
+						FVector2D DestMapPos = WorldToMap(NC.WorldLocation, MapOrigin, MapSize);
+						DrawCircle(Context, DestMapPos, bIsFullscreen ? 8.0f : 5.0f,
+							DestinationColor, 2.5f);
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	// ---- 4. 邊框 / Border ----
 	{
 		FVector2D TL = MapOrigin;
 		FVector2D TR(MapOrigin.X + MapSize.X, MapOrigin.Y);
@@ -208,7 +254,60 @@ int32 UDrivingMapWidget::NativePaint(
 		UWidgetBlueprintLibrary::DrawLine(Context, BL, TL, BorderColor, true, BorderThick);
 	}
 
-	// ---- 4. 提示文字 ----
+	// ---- 5. 停車場 & 路邊停車標示 / Parking lot & roadside parking markers ----
+	if (bIsFullscreen)
+	{
+		UWorld* ParkWorld = GetWorld();
+		if (ParkWorld)
+		{
+			// 停車場 / Parking lots
+			for (TActorIterator<AParkingLotActor> It(ParkWorld); It; ++It)
+			{
+				AParkingLotActor* Lot = *It;
+				if (!Lot) continue;
+
+				FVector2D LotMapPos = WorldToMap(Lot->GetActorLocation(), MapOrigin, MapSize);
+				DrawCircle(Context, LotMapPos, 6.0f, ParkingLotColor, 2.0f);
+				UWidgetBlueprintLibrary::DrawText(Context,
+					FString::Printf(TEXT("P %s"), *Lot->ParkingLotName),
+					FVector2D(LotMapPos.X + 8.0f, LotMapPos.Y - 6.0f), ParkingLotColor);
+
+				for (int32 s = 0; s < Lot->SpotCount; ++s)
+				{
+					FVector2D SpotPos = WorldToMap(Lot->GetSpotWorldPosition(s), MapOrigin, MapSize);
+					const bool bOcc = Lot->IsSpotOccupied(s);
+					const float Rad = bOcc ? 2.5f : 3.5f;
+					FLinearColor SpotColor = bOcc
+						? FLinearColor(0.5f, 0.5f, 0.5f, 0.5f) : ParkingLotColor;
+					DrawCircle(Context, SpotPos, Rad, SpotColor, 1.5f);
+				}
+			}
+
+			// 路邊停車範圍 / Roadside parking zones
+			for (TActorIterator<ARoadsideParkingActor> It(ParkWorld); It; ++It)
+			{
+				ARoadsideParkingActor* RSP = *It;
+				if (!RSP) continue;
+
+				for (int32 z = 0; z < RSP->GetZoneCount(); ++z)
+				{
+					FVector2D ZoneStart = WorldToMap(RSP->GetZoneWorldStart(z), MapOrigin, MapSize);
+					FVector2D ZoneEnd = WorldToMap(RSP->GetZoneWorldEnd(z), MapOrigin, MapSize);
+					UWidgetBlueprintLibrary::DrawLine(Context, ZoneStart, ZoneEnd,
+						RoadsideParkingColor, true, 3.0f);
+				}
+
+				if (RSP->GetZoneCount() > 0)
+				{
+					FVector2D NamePos = WorldToMap(RSP->GetZoneWorldStart(0), MapOrigin, MapSize);
+					UWidgetBlueprintLibrary::DrawText(Context, RSP->ZoneName,
+						FVector2D(NamePos.X + 5.0f, NamePos.Y - 12.0f), RoadsideParkingColor);
+				}
+			}
+		}
+	}
+
+	// ---- 5.5 提示文字 / Hint text ----
 	if (!bIsFullscreen)
 	{
 		FVector2D HintPos(MapOrigin.X, MapOrigin.Y - 16.0);
@@ -219,30 +318,125 @@ int32 UDrivingMapWidget::NativePaint(
 	{
 		FVector2D HintPos(MapOrigin.X, MapOrigin.Y - 18.0);
 		FString Hint = SelectedVehiclePtr.IsValid()
-			? TEXT("[LMB] Click node = set destination  |  [RMB/Esc] Close")
-			: TEXT("[LMB] Click vehicle = follow  |  [RMB/Esc] Close");
+			? TEXT("[LMB] Click node = set destination  |  [Space] Unfollow  |  [M] Close")
+			: TEXT("[LMB] Click vehicle = follow  |  [M] Close");
 		UWidgetBlueprintLibrary::DrawText(Context, Hint, HintPos,
 			FLinearColor(0.6f, 0.65f, 0.7f, 0.8f));
 	}
 
-	// ---- 5. 資訊面板 ----
+	// ---- 6. 右側資訊面板（全螢幕 + 選中車輛時）----
+	//      Right info panel — far right, semi-transparent bg, scaled font
 	if (bIsFullscreen && SelectedVehiclePtr.IsValid())
 	{
 		URoadPathFollowerComponent* PF =
 			SelectedVehiclePtr->FindComponentByClass<URoadPathFollowerComponent>();
 		if (PF)
 		{
-			float SpeedKmh = PF->GetCurrentSpeed() * 0.036f;
-			FString Info = FString::Printf(TEXT("Speed: %.1f km/h  |  State: %s"),
-				SpeedKmh,
-				*UEnum::GetValueAsString(PF->GetNavState()));
-			FVector2D InfoPos(MapOrigin.X + 10.0, MapOrigin.Y + MapSize.Y + 8.0);
-			UWidgetBlueprintLibrary::DrawText(Context, Info, InfoPos,
-				FLinearColor(0.8f, 0.9f, 1.0f, 1.0f));
+			FVector2D WidgetSize = AllottedGeometry.GetLocalSize();
+
+			// 面板定位：螢幕最右邊 / Panel: far right of screen
+			const float PanelWidth = WidgetSize.X * 0.22f;
+			const float PanelMarginRight = WidgetSize.X * 0.01f;
+			const float PanelX = WidgetSize.X - PanelWidth - PanelMarginRight;
+			const float PanelTopY = WidgetSize.Y * 0.05f;
+			const float PanelHeight = WidgetSize.Y * 0.75f;
+
+			// ---- 半透明背景 / Semi-transparent background ----
+			{
+				FPaintGeometry BgGeo = AllottedGeometry.ToPaintGeometry(
+					FVector2f(static_cast<float>(PanelWidth), static_cast<float>(PanelHeight)),
+					FSlateLayoutTransform(FVector2f(static_cast<float>(PanelX), static_cast<float>(PanelTopY)))
+				);
+				TArray<FSlateGradientStop> BgStops;
+				const FLinearColor BgColor(0.02f, 0.03f, 0.06f, InfoPanelBackgroundAlpha);
+				BgStops.Emplace(FVector2D::ZeroVector, BgColor);
+				BgStops.Emplace(FVector2D(PanelWidth, 0.0), BgColor);
+				FSlateDrawElement::MakeGradient(OutDrawElements, LayerId + 1, BgGeo,
+					BgStops, Orient_Horizontal, ESlateDrawEffect::None);
+			}
+
+			const float TextX = PanelX + 15.0f;
+			float TextY = PanelTopY + 15.0f;
+			const float LineH = 22.0f * InfoPanelFontScale;
+			const FLinearColor TitleColor(1.0f, 0.85f, 0.3f, 1.0f);
+			const FLinearColor InfoColor(0.85f, 0.9f, 1.0f, 1.0f);
+			const FLinearColor DimColor(0.5f, 0.55f, 0.6f, 0.8f);
+
+			FSlateFontInfo ScaledFont = FAppStyle::GetFontStyle("NormalFont");
+			ScaledFont.Size = static_cast<int32>(10.0f * InfoPanelFontScale);
+
+			// 輔助 lambda：在面板畫一行文字 / Helper: draw one line of scaled text
+			auto DrawPanelLine = [&](const FString& Text, const FLinearColor& Color)
+			{
+				FSlateDrawElement::MakeText(OutDrawElements, LayerId + 2,
+					AllottedGeometry.ToPaintGeometry(
+						FVector2f(PanelWidth - 30.0f, LineH),
+						FSlateLayoutTransform(FVector2f(TextX, TextY))),
+					Text, ScaledFont, ESlateDrawEffect::None, Color);
+				TextY += LineH;
+			};
+
+			DrawPanelLine(TEXT("--- Vehicle Info ---"), TitleColor);
+			TextY += LineH * 0.3f;
+
+			// 速度 / Speed
+			const float SpeedKmh = PF->GetCurrentSpeed() * 0.036f;
+			const float MaxKmh = PF->MaxSpeed * 0.036f;
+			DrawPanelLine(FString::Printf(TEXT("Speed: %.1f / %.0f km/h"), SpeedKmh, MaxKmh), InfoColor);
+
+			// 狀態 / State
+			FString StateStr;
+			switch (PF->GetNavState())
+			{
+			case ENavState::Idle:    StateStr = TEXT("Idle"); break;
+			case ENavState::Driving: StateStr = TEXT("Driving"); break;
+			case ENavState::Parking: StateStr = TEXT("Parking"); break;
+			case ENavState::Parked:  StateStr = TEXT("Parked"); break;
+			}
+			DrawPanelLine(FString::Printf(TEXT("State: %s"), *StateStr), InfoColor);
+
+			// 方向燈 / Turn signal
+			FString SignalStr = TEXT("None");
+			if (PF->GetTurnSignal() == ETurnSignal::Left) SignalStr = TEXT("LEFT");
+			else if (PF->GetTurnSignal() == ETurnSignal::Right) SignalStr = TEXT("RIGHT");
+			DrawPanelLine(FString::Printf(TEXT("Signal: %s"), *SignalStr), InfoColor);
+
+			// 車道 / Lane
+			DrawPanelLine(FString::Printf(TEXT("Lane: %d"), PF->CurrentLaneIndex), InfoColor);
+
+			// 障礙物 / Obstacle
+			const float ObDist = PF->GetObstacleDistance();
+			FString ObStr = (ObDist < 0.0f) ? TEXT("None") : FString::Printf(TEXT("%.0f cm"), ObDist);
+			DrawPanelLine(FString::Printf(TEXT("Obstacle: %s"), *ObStr), InfoColor);
+
+			// 超車 / Overtake
+			FString OvtStr;
+			FLinearColor OvtColor = InfoColor;
+			switch (PF->GetOvertakeState())
+			{
+			case EOvertakeState::None:      OvtStr = TEXT("None"); break;
+			case EOvertakeState::Passing:    OvtStr = TEXT("PASSING"); OvtColor = FLinearColor(1.0f, 0.4f, 0.1f, 1.0f); break;
+			case EOvertakeState::Returning:  OvtStr = TEXT("Returning"); OvtColor = FLinearColor(0.3f, 0.8f, 1.0f, 1.0f); break;
+			}
+			DrawPanelLine(FString::Printf(TEXT("Overtake: %s"), *OvtStr), OvtColor);
+
+			// 目的地 / Destination
+			FString DestStr = (SelectedDestinationNodeId != INDEX_NONE)
+				? FString::Printf(TEXT("Dest: Node %d"), SelectedDestinationNodeId)
+				: TEXT("Dest: None");
+			DrawPanelLine(DestStr, (SelectedDestinationNodeId != INDEX_NONE) ? InfoColor : DimColor);
+
+			TextY += LineH * 0.8f;
+			DrawPanelLine(TEXT("--- Controls ---"), TitleColor);
+			TextY += LineH * 0.3f;
+			DrawPanelLine(TEXT("Click node = Set dest"), DimColor);
+			DrawPanelLine(TEXT("[Space] = Unfollow"), DimColor);
+			DrawPanelLine(TEXT("[Scroll] = Zoom"), DimColor);
+			DrawPanelLine(TEXT("[M] = Close map"), DimColor);
 		}
 	}
 
-	return Context.MaxLayer;
+	return LayerId + 3;
 }
 
 // ================================================================
@@ -272,24 +466,48 @@ FReply UDrivingMapWidget::NativeOnMouseButtonDown(
 			return FReply::Handled();
 		}
 
-		// 已選車 → 點節點設目的地
+		// 已選車 → 點停車場或節點設目的地
+		// Selected vehicle → click parking lot or node to set destination
 		if (SelectedVehiclePtr.IsValid())
 		{
-			int32 ClickedNodeId = FindNodeNearMapPos(LocalPos, MapOrigin, MapSize, 18.0f);
-			if (ClickedNodeId != INDEX_NONE)
+			URoadPathFollowerComponent* PF =
+				SelectedVehiclePtr->FindComponentByClass<URoadPathFollowerComponent>();
+
+			// 優先偵測停車場 / Parking lot has priority
+			AActor* ClickedLot = FindParkingLotNearMapPos(LocalPos, MapOrigin, MapSize, 22.0f);
+			if (ClickedLot && PF)
 			{
-				URoadPathFollowerComponent* PF =
-					SelectedVehiclePtr->FindComponentByClass<URoadPathFollowerComponent>();
-				if (PF)
+				// 找停車場最近的 Graph Node 作為導航目的地
+				// Find nearest graph node to parking lot as navigation destination
+				if (UWorld* World = GetWorld())
 				{
-					PF->NavigateToNode(ClickedNodeId);
-					SelectedDestinationNodeId = ClickedNodeId;
+					if (URoadNetworkSubsystem* RS = World->GetSubsystem<URoadNetworkSubsystem>())
+					{
+						int32 NearestNode = RS->FindNearestGraphNode(ClickedLot->GetActorLocation());
+						if (NearestNode != INDEX_NONE)
+						{
+							PF->NavigateToNode(NearestNode);
+							SelectedDestinationNodeId = NearestNode;
+							UE_LOG(LogTemp, Log, TEXT("MapWidget: Navigate to ParkingLot '%s' → Node %d"),
+								*Cast<AParkingLotActor>(ClickedLot)->ParkingLotName, NearestNode);
+						}
+					}
 				}
+				return FReply::Handled();
+			}
+
+			// 點節點 / Click node
+			int32 ClickedNodeId = FindNodeNearMapPos(LocalPos, MapOrigin, MapSize, 18.0f);
+			if (ClickedNodeId != INDEX_NONE && PF)
+			{
+				PF->NavigateToNode(ClickedNodeId);
+				SelectedDestinationNodeId = ClickedNodeId;
 				return FReply::Handled();
 			}
 		}
 
-		DeselectVehicle();
+		// 點到地圖空白處不做任何事（不取消選取、不關地圖）
+		// Clicking empty area on map → do nothing (don't deselect, don't close)
 		return FReply::Handled();
 	}
 
@@ -468,7 +686,7 @@ void UDrivingMapWidget::BuildNodeCache()
 			Max.Y = FMath::Max(Max.Y, Node.WorldLocation.Y);
 		}
 		FVector2D Range = Max - Min;
-		FVector2D Margin = Range * 0.1;
+		FVector2D Margin = Range * static_cast<double>(MapBoundsMarginRatio);
 		WorldBoundsMin = Min - Margin;
 		WorldBoundsMax = Max + Margin;
 		if (WorldBoundsMax.X - WorldBoundsMin.X < 100.0) WorldBoundsMax.X = WorldBoundsMin.X + 100.0;
@@ -550,8 +768,14 @@ void UDrivingMapWidget::GetMapDrawRect(
 
 	if (bIsFullscreen)
 	{
-		FVector2D FullSize = WidgetSize * FullscreenCoverage;
-		OutOrigin = (WidgetSize - FullSize) * 0.5;
+		// 全螢幕地圖放左側（佔螢幕 55% 寬），右側留給路徑面板
+		// Fullscreen map on left side (55% of screen), right side for route panel
+		FVector2D FullSize;
+		FullSize.X = WidgetSize.X * 0.55;
+		FullSize.Y = WidgetSize.Y * FullscreenCoverage;
+		const float MarginY = (WidgetSize.Y - FullSize.Y) * 0.5;
+		const float MarginX = WidgetSize.X * 0.03;
+		OutOrigin = FVector2D(MarginX, MarginY);
 		OutSize = FullSize;
 	}
 	else
@@ -685,6 +909,32 @@ int32 UDrivingMapWidget::FindNodeNearMapPos(
 		}
 	}
 	return BestNodeId;
+}
+
+AActor* UDrivingMapWidget::FindParkingLotNearMapPos(
+	const FVector2D& LocalPos, const FVector2D& MapOrigin,
+	const FVector2D& MapSize, float Radius) const
+{
+	float BestDistSq = Radius * Radius;
+	AActor* BestLot = nullptr;
+
+	UWorld* World = GetWorld();
+	if (!World) return nullptr;
+
+	for (TActorIterator<AParkingLotActor> It(World); It; ++It)
+	{
+		AParkingLotActor* Lot = *It;
+		if (!Lot) continue;
+
+		FVector2D MapPos = WorldToMap(Lot->GetActorLocation(), MapOrigin, MapSize);
+		float DistSq = static_cast<float>(FVector2D::DistSquared(LocalPos, MapPos));
+		if (DistSq < BestDistSq)
+		{
+			BestDistSq = DistSq;
+			BestLot = Lot;
+		}
+	}
+	return BestLot;
 }
 
 // ================================================================

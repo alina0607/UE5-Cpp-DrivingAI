@@ -70,6 +70,7 @@ void URoadPathFollowerComponent::ResetFollowingState()
 {
 	bIsFollowing = false;
 	bOnJunctionCurve = false;
+	bIsUTurnCurve = false;
 	bJustExitedJunctionCurve = false;
 	bIsChangingLane = false;
 	bParkingStraightening = false;
@@ -82,6 +83,9 @@ void URoadPathFollowerComponent::ResetFollowingState()
 	PathSegments.Empty();
 	CurrentSegmentIndex = 0;
 	ObstacleDistance = -1.0f;
+	ObstacleActor = nullptr;
+	OvertakeState = EOvertakeState::None;
+	OvertakePassedDistAccum = 0.0f;
 }
 
 // ============================================================================
@@ -175,22 +179,31 @@ void URoadPathFollowerComponent::NavigateToNode(int32 TargetNodeId)
 	AActor* Owner = GetOwner();
 	if (!Owner) return;
 
-	// 用車目前位置找最近 node 作為起點
-	// Snap car's current position to nearest graph node as start
-	const int32 FromNode = Sub->FindNearestGraphNode(Owner->GetActorLocation());
-	if (FromNode == INDEX_NONE)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("PathFollower: Cannot find nearest node for car position"));
-		OnPathComplete.Broadcast(false);
-		return;
-	}
-
 	// 記錄目的地資訊 / Store destination info
 	DestinationNodeId = TargetNodeId;
 	const TArray<FRoadGraphNode>& Nodes = Sub->GetGraphNodes();
 	if (TargetNodeId >= 0 && TargetNodeId < Nodes.Num())
 	{
 		DestinationWorldLocation = Nodes[TargetNodeId].WorldLocation;
+	}
+
+	// 如果正在行駛中 → 中途重導航（不掉頭）
+	// If currently driving → mid-drive reroute (no U-turn)
+	if (bIsFollowing && NavState == ENavState::Driving
+		&& CurrentSegmentIndex < PathSegments.Num())
+	{
+		RerouteToNode(TargetNodeId);
+		return;
+	}
+
+	// 靜止狀態 → 從最近 node 開始（原有邏輯）
+	// Idle/Parked → start from nearest node (original logic)
+	const int32 FromNode = Sub->FindNearestGraphNode(Owner->GetActorLocation());
+	if (FromNode == INDEX_NONE)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("PathFollower: Cannot find nearest node for car position"));
+		OnPathComplete.Broadcast(false);
+		return;
 	}
 
 	UE_LOG(LogTemp, Warning,
@@ -341,19 +354,256 @@ void URoadPathFollowerComponent::BuildPathSegments(const FRoadGraphPath& AStarPa
 		if (Dot > 0.985f)
 		{
 			PathSegments[i].TurnAtEnd = ETurnSignal::None;
+			PathSegments[i].bUTurnAtEnd = false;
 		}
 		else
 		{
 			// UE 左手座標系：+Y = 右，CrossZ > 0 = 右轉，< 0 = 左轉
 			// UE left-handed coords: +Y = right, CrossZ > 0 = right turn, < 0 = left
 			PathSegments[i].TurnAtEnd = (CrossZ > 0.0f) ? ETurnSignal::Right : ETurnSignal::Left;
+
+			// U 型掉頭偵測：Dot < -0.5 表示接近 180° 迴轉
+			// U-turn detection: Dot < -0.5 means nearly 180° reversal
+			PathSegments[i].bUTurnAtEnd = (Dot < -0.5f);
 		}
 
 		UE_LOG(LogTemp, Warning,
-			TEXT("  Seg[%d] TurnAtEnd=%s"),
+			TEXT("  Seg[%d] TurnAtEnd=%s%s"),
 			i,
 			(PathSegments[i].TurnAtEnd == ETurnSignal::Left) ? TEXT("LEFT") :
-			(PathSegments[i].TurnAtEnd == ETurnSignal::Right) ? TEXT("RIGHT") : TEXT("NONE"));
+			(PathSegments[i].TurnAtEnd == ETurnSignal::Right) ? TEXT("RIGHT") : TEXT("NONE"),
+			PathSegments[i].bUTurnAtEnd ? TEXT(" [U-TURN]") : TEXT(""));
+	}
+}
+
+// ============================================================================
+//  RerouteToNode — 中途重導航：保留當前段，從段終點 A* 到新目的地
+//  Mid-drive reroute: keep current segment, A* from segment end to new dest.
+// ============================================================================
+void URoadPathFollowerComponent::RerouteToNode(int32 TargetNodeId)
+{
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	URoadNetworkSubsystem* Sub = World->GetSubsystem<URoadNetworkSubsystem>();
+	if (!Sub) return;
+
+	const FPathSegmentInternal& CurSeg = PathSegments[CurrentSegmentIndex];
+	const int32 FromNodeId = CurSeg.EndNodeId;
+
+	if (FromNodeId == INDEX_NONE)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("PathFollower: RerouteToNode — current segment has no EndNodeId"));
+		return;
+	}
+
+	// 如果剛好目的地就是當前段終點 → 不用重算
+	// If destination is already the end of current segment → no reroute needed
+	if (FromNodeId == TargetNodeId)
+	{
+		PathSegments.RemoveAt(CurrentSegmentIndex + 1, PathSegments.Num() - CurrentSegmentIndex - 1);
+		return;
+	}
+
+	// 找當前段的起始 Node（車身後方的 node）
+	// Find current segment's start node (the node behind the car)
+	const TArray<FRoadGraphEdge>& Edges = Sub->GetGraphEdges();
+	int32 CurSegStartNode = INDEX_NONE;
+	for (const FRoadGraphEdge& E : Edges)
+	{
+		if (E.EdgeId == CurSeg.EdgeId)
+		{
+			CurSegStartNode = (CurSeg.Direction > 0.0f) ? E.StartNodeId : E.EndNodeId;
+			break;
+		}
+	}
+
+	FRoadGraphPath AStarPath = Sub->FindPathAStar(FromNodeId, TargetNodeId);
+	if (!AStarPath.bPathFound)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("PathFollower: RerouteToNode A* failed %d → %d"), FromNodeId, TargetNodeId);
+		return;
+	}
+
+	// ---- 迴轉偵測：A* 第一步是否走回頭路 ----
+	// ---- U-turn detection: does A* first step go backwards ----
+	// 如果 A* 路徑第二個 node == CurSegStartNode → 走回頭路 → junction curve 會飛出路面
+	// 解法：從 FromNode 找一個「前方」鄰居（不是 CurSegStartNode），先走一段再 A*
+	// If A* path[1] == CurSegStartNode → going backwards → junction curve will overshoot
+	// Fix: find a "forward" neighbor of FromNode (not CurSegStartNode), go there first, then A*
+	if (AStarPath.NodePath.Num() >= 2 && CurSegStartNode != INDEX_NONE
+		&& AStarPath.NodePath[1] == CurSegStartNode)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("PathFollower: RerouteToNode — U-turn detected, finding forward detour"));
+
+		// 從 FromNode 的鄰居中找一個不是 CurSegStartNode 的前方 node
+		// Find a neighbor of FromNode that's not CurSegStartNode
+		const TArray<FRoadGraphNeighbor> Neighbors = Sub->GetNeighborNodes(FromNodeId);
+		int32 ForwardNodeId = INDEX_NONE;
+		for (const FRoadGraphNeighbor& Nb : Neighbors)
+		{
+			if (Nb.NeighborNodeId != CurSegStartNode)
+			{
+				ForwardNodeId = Nb.NeighborNodeId;
+				break;
+			}
+		}
+
+		if (ForwardNodeId != INDEX_NONE)
+		{
+			// 從前方 node 重新 A* 到目的地
+			// Re-route from the forward node to destination
+			FRoadGraphPath ForwardPath = Sub->FindPathAStar(ForwardNodeId, TargetNodeId);
+			if (ForwardPath.bPathFound)
+			{
+				// 把 FromNodeId 插到路徑前面（FromNode → ForwardNode → ... → dest）
+				// Prepend FromNodeId to path (FromNode → ForwardNode → ... → dest)
+				ForwardPath.NodePath.Insert(FromNodeId, 0);
+				AStarPath = ForwardPath;
+
+				UE_LOG(LogTemp, Warning,
+					TEXT("PathFollower: RerouteToNode — detour via Node %d → %d"),
+					FromNodeId, ForwardNodeId);
+			}
+			// 如果前方路也找不到 → 用原始 A* 結果（容忍迴轉）
+			// If forward route fails → use original A* (tolerate U-turn)
+		}
+		// 如果只有一個鄰居（死路）→ 用原始 A* 結果
+		// If only one neighbor (dead end) → use original A*
+	}
+
+	// 清除當前段之後的所有段 / Clear all segments after current
+	PathSegments.RemoveAt(CurrentSegmentIndex + 1, PathSegments.Num() - CurrentSegmentIndex - 1);
+
+	// 用新 A* 路徑建段並接在後面 / Build new segments and append
+	AppendPathSegments(AStarPath);
+
+	// 取消超車狀態 / Cancel overtake
+	if (OvertakeState != EOvertakeState::None)
+	{
+		OvertakeState = EOvertakeState::None;
+	}
+
+	// ---- 重新計算 TurnAtEnd ----
+	const TArray<FRoadGraphNode>& GraphNodeList = Sub->GetGraphNodes();
+
+	TArray<int32> FullNodePath;
+	if (CurSegStartNode != INDEX_NONE)
+	{
+		FullNodePath.Add(CurSegStartNode);
+	}
+	for (int32 NodeId : AStarPath.NodePath)
+	{
+		FullNodePath.Add(NodeId);
+	}
+
+	for (int32 i = CurrentSegmentIndex; i + 1 < PathSegments.Num(); ++i)
+	{
+		const int32 LocalIdx = i - CurrentSegmentIndex;
+		if (LocalIdx + 2 >= FullNodePath.Num()) break;
+
+		const int32 IdA = FullNodePath[LocalIdx];
+		const int32 IdB = FullNodePath[LocalIdx + 1];
+		const int32 IdC = FullNodePath[LocalIdx + 2];
+
+		if (IdA >= GraphNodeList.Num() || IdB >= GraphNodeList.Num() || IdC >= GraphNodeList.Num())
+		{
+			PathSegments[i].TurnAtEnd = ETurnSignal::None;
+			PathSegments[i].bUTurnAtEnd = false;
+			continue;
+		}
+
+		const FVector PosA = GraphNodeList[IdA].WorldLocation;
+		const FVector PosB = GraphNodeList[IdB].WorldLocation;
+		const FVector PosC = GraphNodeList[IdC].WorldLocation;
+
+		const FVector DirAB = (PosB - PosA).GetSafeNormal2D();
+		const FVector DirBC = (PosC - PosB).GetSafeNormal2D();
+		const float Dot = FVector::DotProduct(DirAB, DirBC);
+		const float CrossZ = FVector::CrossProduct(DirAB, DirBC).Z;
+
+		if (Dot > 0.985f)
+		{
+			PathSegments[i].TurnAtEnd = ETurnSignal::None;
+			PathSegments[i].bUTurnAtEnd = false;
+		}
+		else
+		{
+			PathSegments[i].TurnAtEnd = (CrossZ > 0.0f) ? ETurnSignal::Right : ETurnSignal::Left;
+			PathSegments[i].bUTurnAtEnd = (Dot < -0.5f);
+		}
+	}
+
+	if (PathSegments.Num() > 0)
+	{
+		PathSegments.Last().TurnAtEnd = ETurnSignal::None;
+		PathSegments.Last().bUTurnAtEnd = false;
+	}
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("PathFollower: RerouteToNode — from EndNode %d to Node %d | %d total segs"),
+		FromNodeId, TargetNodeId, PathSegments.Num());
+}
+
+// ============================================================================
+//  AppendPathSegments — 用 A* 結果建段，接在 PathSegments 後面
+//  Build segments from A* result and append to PathSegments.
+// ============================================================================
+void URoadPathFollowerComponent::AppendPathSegments(const FRoadGraphPath& AStarPath)
+{
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	URoadNetworkSubsystem* Sub = World->GetSubsystem<URoadNetworkSubsystem>();
+	if (!Sub) return;
+
+	const TArray<FRoadGraphEdge>& Edges = Sub->GetGraphEdges();
+	const TArray<int32>& NodePath = AStarPath.NodePath;
+
+	for (int32 i = 0; i < NodePath.Num() - 1; ++i)
+	{
+		const int32 From = NodePath[i];
+		const int32 To = NodePath[i + 1];
+
+		for (const FRoadGraphEdge& E : Edges)
+		{
+			const bool bFwd = (E.StartNodeId == From && E.EndNodeId == To);
+			const bool bRev = (E.StartNodeId == To && E.EndNodeId == From);
+			if (!bFwd && !bRev) continue;
+			if (!E.InputSpline) break;
+
+			FPathSegmentInternal Seg;
+			Seg.Spline = E.InputSpline;
+			Seg.bTwoRoads = E.bTwoRoads;
+			Seg.TwoRoadsGapM = E.TwoRoadsGapM;
+			Seg.RoadType = E.RoadType;
+			Seg.DrivingRule = URoadRuleLibrary::GetDrivingRuleFromRoadType(E.RoadType);
+			Seg.RoadWidthMultiplier = E.RoadWidthMultiplier;
+			Seg.AdditionalWidthM = E.AdditionalWidthM;
+			Seg.GuardrailSideOffsetCm = E.GuardrailSideOffsetCm;
+			Seg.AutoLaneWidthCm = E.AutoLaneWidthCm;
+			Seg.AutoMedianCm = E.AutoMedianCm;
+			Seg.EdgeId = E.EdgeId;
+			Seg.EndNodeId = bFwd ? E.EndNodeId : E.StartNodeId;
+
+			if (bFwd)
+			{
+				Seg.StartDist = E.StartDistanceOnSpline;
+				Seg.EndDist = E.EndDistanceOnSpline;
+				Seg.Direction = 1.0f;
+			}
+			else
+			{
+				Seg.StartDist = E.EndDistanceOnSpline;
+				Seg.EndDist = E.StartDistanceOnSpline;
+				Seg.Direction = -1.0f;
+			}
+
+			PathSegments.Add(Seg);
+			break;
+		}
 	}
 }
 
@@ -582,6 +832,12 @@ float URoadPathFollowerComponent::ComputeDesiredSpeed() const
 		// Use CurrentTurnSignal (updated in Step 0 each tick) for slowdown decision
 		if (CurrentTurnSignal != ETurnSignal::None)
 		{
+			// U-turn 用 UTurnSpeedRatio 作為預減速目標，不是 JunctionMinSpeedRatio
+			// U-turn uses UTurnSpeedRatio for pre-deceleration, not JunctionMinSpeedRatio
+			const bool bUpcomingUTurn = PathSegments.IsValidIndex(CurrentSegmentIndex)
+				&& PathSegments[CurrentSegmentIndex].bUTurnAtEnd;
+			const float TargetSpeedRatio = bUpcomingUTurn ? UTurnSpeedRatio : JunctionMinSpeedRatio;
+
 			float Alpha;
 			if (DistToJunction <= JunctionBlendDistance)
 			{
@@ -598,16 +854,18 @@ float URoadPathFollowerComponent::ComputeDesiredSpeed() const
 				Alpha = FMath::SmoothStep(0.0f, 1.0f, Alpha);
 			}
 			const float JunctionSpeed = FMath::Lerp(
-				MaxSpeed, MaxSpeed * JunctionMinSpeedRatio, Alpha);
+				MaxSpeed, MaxSpeed * TargetSpeedRatio, Alpha);
 			Desired = FMath::Min(Desired, JunctionSpeed);
 		}
 	}
 
 	// 曲線全程維持最低速，出曲線後才由 FInterpTo 慢慢加速
 	// Hold min speed for entire curve. Post-curve FInterpTo ramps up naturally.
+	// U 型掉頭用更低速度 / U-turn uses even slower speed
 	if (bOnJunctionCurve)
 	{
-		Desired = FMath::Min(Desired, MaxSpeed * JunctionMinSpeedRatio);
+		const float CurveSpeedRatio = bIsUTurnCurve ? UTurnSpeedRatio : JunctionMinSpeedRatio;
+		Desired = FMath::Min(Desired, MaxSpeed * CurveSpeedRatio);
 	}
 
 	// ---- 障礙物減速 / Obstacle braking ----
@@ -629,6 +887,39 @@ float URoadPathFollowerComponent::ComputeDesiredSpeed() const
 }
 
 // ============================================================================
+//  GetRouteWorldPoints — 從目前位置到路徑終點取樣世界座標
+//  Sample world positions from current position to end of path.
+// ============================================================================
+void URoadPathFollowerComponent::GetRouteWorldPoints(TArray<FVector>& OutPoints, int32 SamplesPerSegment) const
+{
+	OutPoints.Empty();
+	if (!bIsFollowing || PathSegments.Num() == 0) return;
+
+	for (int32 SegIdx = CurrentSegmentIndex; SegIdx < PathSegments.Num(); ++SegIdx)
+	{
+		const FPathSegmentInternal& Seg = PathSegments[SegIdx];
+		if (!Seg.Spline) continue;
+
+		// 此段的取樣起點和終點
+		// Start/end for sampling this segment
+		const float SampleStart = (SegIdx == CurrentSegmentIndex) ? ReferenceDistance : Seg.StartDist;
+		const float SampleEnd = Seg.EndDist;
+		const float TotalDist = FMath::Abs(SampleEnd - SampleStart);
+		if (TotalDist < 1.0f) continue;
+
+		for (int32 s = 0; s <= SamplesPerSegment; ++s)
+		{
+			const float Alpha = static_cast<float>(s) / SamplesPerSegment;
+			const float Dist = SampleStart + Alpha * (SampleEnd - SampleStart);
+
+			FVector Pos, Dir, Right;
+			SampleSplineAtDist(Seg, Dist, CurrentLateralOffset, Pos, Dir, Right);
+			OutPoints.Add(Pos);
+		}
+	}
+}
+
+// ============================================================================
 //  TickComponent — 主迴圈
 //  Main update loop: speed control → advance reference → pursuit → interpolate.
 // ============================================================================
@@ -639,11 +930,18 @@ void URoadPathFollowerComponent::TickComponent(
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
 	// 第一次 Tick 時啟動（road graph 此時已建好）
-	// First Tick: road graph is ready, start now
+	// 需要同時檢查 bAutoStart — TrafficManager 會在 spawn 後設 bAutoStart=false
+	// 防止寫死的 StartNodeId/GoalNodeId 覆蓋 TrafficManager 指定的隨機目的地
+	// First Tick: road graph is ready, start now.
+	// Must also check bAutoStart — TrafficManager sets it to false after spawn
+	// to prevent hardcoded StartNodeId/GoalNodeId from overriding the random destination.
 	if (bPendingStart)
 	{
 		bPendingStart = false;
-		StartFollowing();
+		if (bAutoStart)
+		{
+			StartFollowing();
+		}
 	}
 
 	if (!bIsFollowing || PathSegments.Num() == 0) return;
@@ -744,6 +1042,12 @@ void URoadPathFollowerComponent::TickComponent(
 	UpdateObstacleDetection();
 
 	// ================================================================
+	//  0.8 超車邏輯（偵測到慢車 → 換道超車 → 超過後切回）
+	//      Overtaking logic (slow car → pass → return)
+	// ================================================================
+	UpdateOvertakeLogic();
+
+	// ================================================================
 	//  1. 速度控制：加速到 DesiredSpeed 或煞車
 	//     Speed control: accelerate toward desired or brake
 	// ================================================================
@@ -792,6 +1096,7 @@ void URoadPathFollowerComponent::TickComponent(
 		// ---- T >= 1.0：曲線結束，直接銜接新段的 Spline 邏輯（同一幀！）----
 		// ---- T >= 1.0: Curve done, fall through to new segment's spline logic (same frame!) ----
 		bOnJunctionCurve = false;
+		bIsUTurnCurve = false;
 		CurrentSegmentIndex++;
 
 		if (CurrentSegmentIndex >= PathSegments.Num())
@@ -947,17 +1252,43 @@ void URoadPathFollowerComponent::TickComponent(
 		// T0 = 車的實際朝向，確保曲線從車目前的行進方向開始
 		// T0 = car's ACTUAL forward, ensures curve starts from current heading
 		JCurveP0 = Owner->GetActorLocation();
-		JCurveP1 = NextPos;
 
-		// 切線強度 = 距離 × JunctionCurveTangentScale，控制曲線弧度
-		// Tangent magnitude = distance × TangentScale, controls curve roundness
-		const float TangentScale = (JCurveP1 - JCurveP0).Size() * JunctionCurveTangentScale;
-		JCurveT0 = Owner->GetActorForwardVector() * TangentScale;
-		JCurveT1 = NextDir.GetSafeNormal() * TangentScale;
+		// U 型掉頭：用 UTurnRadius 把終點偏移到旁邊，產生大 U 曲線
+		// U-turn: offset endpoint sideways by UTurnRadius to create a wide U-shape
+		bIsUTurnCurve = Seg.bUTurnAtEnd;
+		if (bIsUTurnCurve)
+		{
+			// 掉頭時終點偏移（往右或往左偏 UTurnRadius，確保 U 型）
+			// Offset next position laterally by UTurnRadius for wide U-shape
+			const FVector OwnerRight = Owner->GetActorRightVector();
+			// 根據轉彎方向決定偏移方向 / Offset direction based on turn signal
+			const float SideSign = (CurrentTurnSignal == ETurnSignal::Left) ? -1.0f : 1.0f;
+			JCurveP1 = NextPos;
 
-		// 近似曲線長度（比直線長一點）
-		// Approximate curve length (slightly longer than straight line)
-		JCurveLength = (JCurveP1 - JCurveP0).Size() * 1.2f;
+			const float Dist = (JCurveP1 - JCurveP0).Size();
+			const float UTurnTangentLen = FMath::Max(Dist, UTurnRadius) * UTurnTangentScale;
+			JCurveT0 = Owner->GetActorForwardVector() * UTurnTangentLen;
+			JCurveT1 = NextDir.GetSafeNormal() * UTurnTangentLen;
+
+			// U 型曲線更長（半圓形，約 π * R）
+			// U-turn curve is longer (semicircle ~ π * R)
+			JCurveLength = FMath::Max(Dist * 1.5f, UTurnRadius * PI * 0.8f);
+		}
+		else
+		{
+			JCurveP1 = NextPos;
+
+			// 切線強度 = 距離 × JunctionCurveTangentScale，控制曲線弧度
+			// Tangent magnitude = distance × TangentScale, controls curve roundness
+			const float TangentScale = (JCurveP1 - JCurveP0).Size() * JunctionCurveTangentScale;
+			JCurveT0 = Owner->GetActorForwardVector() * TangentScale;
+			JCurveT1 = NextDir.GetSafeNormal() * TangentScale;
+
+			// 近似曲線長度（比直線長一點）
+			// Approximate curve length (slightly longer than straight line)
+			JCurveLength = (JCurveP1 - JCurveP0).Size() * 1.2f;
+		}
+
 		JCurveProgress = 0.0f;
 		JCurveNextRefDist = NextSampleDist;
 
@@ -1103,6 +1434,7 @@ void URoadPathFollowerComponent::TickComponent(
 void URoadPathFollowerComponent::UpdateObstacleDetection()
 {
 	ObstacleDistance = -1.0f;
+	ObstacleActor = nullptr;
 
 	UWorld* World = GetWorld();
 	if (!World) return;
@@ -1110,7 +1442,9 @@ void URoadPathFollowerComponent::UpdateObstacleDetection()
 	AActor* Owner = GetOwner();
 	if (!Owner) return;
 
-	const FVector Start = Owner->GetActorLocation();
+	// 起點抬高 ObstacleTraceZOffset（避免打到地形、路面凸起）
+	// Raise start by ObstacleTraceZOffset to avoid hitting terrain/bumps
+	const FVector Start = Owner->GetActorLocation() + FVector(0.0f, 0.0f, ObstacleTraceZOffset);
 	const FVector Forward = Owner->GetActorForwardVector();
 	const FVector End = Start + Forward * ObstacleSlowdownDistance;
 
@@ -1129,6 +1463,20 @@ void URoadPathFollowerComponent::UpdateObstacleDetection()
 	if (bHit)
 	{
 		ObstacleDistance = Hit.Distance;
+		ObstacleActor = Hit.GetActor();
+
+		// Debug log：記錄哪台車被什麼物體擋到
+		// Debug log: which vehicle is blocked by what actor
+		if (bDebugObstacleTrace)
+		{
+			const FString OwnerName = Owner->GetName();
+			const FString BlockerName = ObstacleActor.IsValid() ? ObstacleActor->GetName() : TEXT("Unknown");
+			const FString BlockerClass = ObstacleActor.IsValid() ? ObstacleActor->GetClass()->GetName() : TEXT("?");
+			const FString HitComp = Hit.GetComponent() ? Hit.GetComponent()->GetName() : TEXT("?");
+			UE_LOG(LogTemp, Warning,
+				TEXT("[ObstacleTrace] %s blocked by %s (%s) comp=%s dist=%.0f cm"),
+				*OwnerName, *BlockerName, *BlockerClass, *HitComp, ObstacleDistance);
+		}
 	}
 }
 
@@ -1160,4 +1508,183 @@ float URoadPathFollowerComponent::ComputeObstacleSpeedLimit() const
 	const float Alpha = (ObstacleDistance - ObstacleStopDistance)
 		/ (ObstacleSlowdownDistance - ObstacleStopDistance);
 	return MaxSpeed * Alpha;
+}
+
+// ============================================================================
+//  IsPassingLaneClear — 超車道安全偵測
+//  Check if passing lane is clear using SphereTrace.
+// ============================================================================
+bool URoadPathFollowerComponent::IsPassingLaneClear(int32 PassingLaneIndex) const
+{
+	UWorld* World = GetWorld();
+	if (!World) return false;
+
+	AActor* Owner = GetOwner();
+	if (!Owner) return false;
+
+	if (CurrentSegmentIndex >= PathSegments.Num()) return false;
+
+	// 計算超車道偏移量 / Compute passing lane offset
+	const float PassingOffset = ComputeTargetLaneOffset(PassingLaneIndex);
+	const float OffsetDelta = PassingOffset - CurrentLateralOffset;
+
+	// SphereTrace 起點 = 車位 + 偏移方向（模擬在超車道的位置���
+	// Start = car pos + offset direction (simulate being in passing lane)
+	FVector RefPos, RefDir, RefRight;
+	const FPathSegmentInternal& Seg = PathSegments[CurrentSegmentIndex];
+	SampleSplineAtDist(Seg, ReferenceDistance, PassingOffset, RefPos, RefDir, RefRight);
+
+	const FVector Forward = Owner->GetActorForwardVector();
+	const FVector End = RefPos + Forward * OvertakeLateralCheckDistance;
+
+	FHitResult Hit;
+	FCollisionQueryParams Params;
+	Params.AddIgnoredActor(Owner);
+
+	const bool bHit = World->SweepSingleByChannel(
+		Hit,
+		RefPos, End,
+		FQuat::Identity,
+		ECC_ObstacleDetect,
+		FCollisionShape::MakeSphere(ObstacleTraceRadius),
+		Params);
+
+	return !bHit;
+}
+
+// ============================================================================
+//  UpdateOvertakeLogic — 超車狀態機
+//  Overtake state machine: None → Passing → Returning → None
+// ============================================================================
+void URoadPathFollowerComponent::UpdateOvertakeLogic()
+{
+	if (CurrentSegmentIndex >= PathSegments.Num()) return;
+
+	const FPathSegmentInternal& Seg = PathSegments[CurrentSegmentIndex];
+	const float DistToJunction = GetDistanceToNextJunction();
+
+	switch (OvertakeState)
+	{
+	case EOvertakeState::None:
+	{
+		// ① 前方有障礙物且是車輛（有 PathFollowerComponent）
+		// ① Obstacle ahead and it's a vehicle (has PathFollowerComponent)
+		if (!ObstacleActor.IsValid()) break;
+
+		URoadPathFollowerComponent* FrontPF =
+			ObstacleActor->FindComponentByClass<URoadPathFollowerComponent>();
+		if (!FrontPF) break; // 不是車（紅燈碰撞體等）→ 不超車 / Not a vehicle → don't overtake
+
+		// ② 前車速度比我慢 / Front vehicle is slower
+		if (FrontPF->GetCurrentSpeed() >= MaxSpeed * OvertakeSpeedThreshold) break;
+
+		// ③ 當前路段允許超車 / Current road allows overtaking
+		if (!Seg.DrivingRule.bAllowOvertaking) break;
+
+		// ④ 車道數不足則不超車 / Not enough lanes for overtaking
+		if (Seg.DrivingRule.ForwardLaneCount < OvertakeMinLaneCount) break;
+
+		// ⑤ 不在路口曲線 && 離路口夠遠 / Not on junction curve && far from junction
+		if (bOnJunctionCurve) break;
+		if (DistToJunction < AutoLaneChangeDistance) break;
+
+		// ⑥ 已在換道中 → 不重複觸發 / Already changing lane → don't trigger again
+		if (bIsChangingLane) break;
+
+		// 決定超車道 / Determine passing lane
+		int32 PassingLane;
+		if (Seg.DrivingRule.bPreferLeftLaneForPassing)
+		{
+			// 左車道（靠中心）= lane index 更小 / Left lane (closer to center) = lower index
+			PassingLane = FMath::Max(0, CurrentLaneIndex - 1);
+		}
+		else
+		{
+			PassingLane = FMath::Min(CurrentLaneIndex + 1, Seg.DrivingRule.ForwardLaneCount - 1);
+		}
+
+		// 已在超車道 → 無法再超 / Already in passing lane
+		if (PassingLane == CurrentLaneIndex) break;
+
+		// ⑦ 超車道安全 / Passing lane is clear
+		if (!IsPassingLaneClear(PassingLane)) break;
+
+		// 觸發超車 / Initiate overtake
+		PreOvertakeLaneIndex = CurrentLaneIndex;
+		OvertakePassedDistAccum = 0.0f;
+		RequestLaneChange(PassingLane);
+		OvertakeState = EOvertakeState::Passing;
+
+		// 亮左方向燈 / Left turn signal
+		CurrentTurnSignal = ETurnSignal::Left;
+
+		UE_LOG(LogTemp, Warning,
+			TEXT("PathFollower: OVERTAKE START — Lane %d → %d | FrontSpeed=%.0f MyMax=%.0f"),
+			PreOvertakeLaneIndex, PassingLane, FrontPF->GetCurrentSpeed(), MaxSpeed);
+		break;
+	}
+
+	case EOvertakeState::Passing:
+	{
+		// 路口附近 → 強制取消超車，切回原車道
+		// Near junction → force cancel, return to original lane
+		if (DistToJunction < AutoLaneChangeDistance)
+		{
+			RequestLaneChange(PreOvertakeLaneIndex);
+			OvertakeState = EOvertakeState::Returning;
+			CurrentTurnSignal = ETurnSignal::Right;
+			UE_LOG(LogTemp, Warning,
+				TEXT("PathFollower: OVERTAKE CANCEL (near junction) — returning to Lane %d"),
+				PreOvertakeLaneIndex);
+			break;
+		}
+
+		// 檢查是否已超過前車 / Check if passed the front vehicle
+		// 前方 SphereTrace 不再偵測到原障礙物 → 已超過
+		// Front SphereTrace no longer detects original obstacle → passed
+		bool bPassed = !ObstacleActor.IsValid() || (ObstacleDistance < 0.0f);
+
+		// 也可能偵測到不同的車 → 也算超過了原車
+		// May detect a different vehicle → also counts as passed original
+		if (ObstacleActor.IsValid() && ObstacleActor->FindComponentByClass<URoadPathFollowerComponent>())
+		{
+			// 如果偵測到的是不同車，也算超過了
+			// 但如果是同一台，還沒超過
+		}
+
+		if (bPassed)
+		{
+			// 累計安全距離 / Accumulate safe distance
+			OvertakePassedDistAccum += CurrentSpeed * GetWorld()->GetDeltaSeconds();
+
+			if (OvertakePassedDistAccum >= OvertakeSafeDistance)
+			{
+				// 切回原車道 / Return to original lane
+				RequestLaneChange(PreOvertakeLaneIndex);
+				OvertakeState = EOvertakeState::Returning;
+				CurrentTurnSignal = ETurnSignal::Right;
+
+				UE_LOG(LogTemp, Warning,
+					TEXT("PathFollower: OVERTAKE PASSED — returning to Lane %d after %.0f cm"),
+					PreOvertakeLaneIndex, OvertakePassedDistAccum);
+			}
+		}
+		break;
+	}
+
+	case EOvertakeState::Returning:
+	{
+		// 換道完成 → 超車結束 / Lane change complete → overtake done
+		if (!bIsChangingLane)
+		{
+			OvertakeState = EOvertakeState::None;
+			// 方向燈交給 Step 0 的 TurnAtEnd 邏輯接管 / Turn signal handled by Step 0
+			CurrentTurnSignal = ETurnSignal::None;
+
+			UE_LOG(LogTemp, Warning,
+				TEXT("PathFollower: OVERTAKE COMPLETE — back in Lane %d"), CurrentLaneIndex);
+		}
+		break;
+	}
+	}
 }

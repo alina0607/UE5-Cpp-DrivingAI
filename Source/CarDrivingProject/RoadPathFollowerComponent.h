@@ -80,9 +80,24 @@ struct FPathSegmentInternal
 	/// Turn direction at end of this segment (precomputed from graph node world locations)
 	ETurnSignal TurnAtEnd = ETurnSignal::None;
 
+	/// 此段結束是否為 U 型掉頭（Dot < -0.5）
+	/// Whether this segment ends with a U-turn (Dot < -0.5)
+	bool bUTurnAtEnd = false;
+
 	/// 該段 spline 的長度（cm，用於剩餘距離計算）
 	/// Segment travel length in cm (for remaining distance calculation)
 	float GetTravelLength() const { return FMath::Abs(EndDist - StartDist); }
+};
+
+/// <summary>
+/// 超車狀態 / Overtaking state
+/// </summary>
+UENUM()
+enum class EOvertakeState : uint8
+{
+	None       UMETA(DisplayName = "None"),       // 正常行駛 / Normal driving
+	Passing    UMETA(DisplayName = "Passing"),     // 在超車道超車中 / In passing lane, overtaking
+	Returning  UMETA(DisplayName = "Returning"),   // 切回原車道中 / Returning to original lane
 };
 
 /// <summary>
@@ -236,6 +251,25 @@ public:
 	float JunctionMinSpeedRatio = 0.25f;
 
 	// ================================================================
+	//  掉頭 / U-Turn
+	// ================================================================
+
+	/// U 型掉頭曲線的寬度（cm）— 越大 U 型越寬越自然
+	/// U-turn curve width (cm) — larger = wider, smoother U-shape
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|U-Turn", meta = (ClampMin = "500"))
+	float UTurnRadius = 5000.0f;
+
+	/// U 型掉頭時的速度比例（相對 MaxSpeed）— 與 JunctionMinSpeedRatio 類似
+	/// U-turn speed ratio (relative to MaxSpeed) — similar to JunctionMinSpeedRatio
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|U-Turn", meta = (ClampMin = "0.05", ClampMax = "1"))
+	float UTurnSpeedRatio = 0.2f;
+
+	/// U 型掉頭曲線的切線強度（與 JunctionCurveTangentScale 類似）
+	/// U-turn curve tangent scale (similar to JunctionCurveTangentScale)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|U-Turn", meta = (ClampMin = "0.3", ClampMax = "5.0"))
+	float UTurnTangentScale = 1.0f;
+
+	// ================================================================
 	//  車道 / Lane Control
 	// ================================================================
 
@@ -282,6 +316,39 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Obstacle", meta = (ClampMin = "10"))
 	float ObstacleTraceRadius = 120.0f;
 
+	/// SphereTrace 起點 Z 軸抬高量（cm）— 避免打到地形
+	/// SphereTrace start Z offset (cm) — raise to avoid hitting terrain
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Obstacle")
+	float ObstacleTraceZOffset = 50.0f;
+
+	/// 開啟障礙物偵測 debug log（Log 哪台車被什麼物體擋到）
+	/// Enable obstacle detection debug logging (which vehicle blocked by what)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Obstacle")
+	bool bDebugObstacleTrace = false;
+
+	// ================================================================
+	//  超車 / Overtaking
+	// ================================================================
+
+	/// 超車後安全距離：超過前車後再走多遠才切回（cm）
+	/// Safe distance after passing before returning to original lane (cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Overtaking", meta = (ClampMin = "500"))
+	float OvertakeSafeDistance = 1500.0f;
+
+	/// 前車速度低於我的 MaxSpeed × 此值才觸發超車
+	/// Trigger overtake only when front car speed < MaxSpeed × this threshold
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Overtaking", meta = (ClampMin = "0.3", ClampMax = "1.0"))
+	float OvertakeSpeedThreshold = 0.8f;
+
+	/// 超車所需最低同向車道數（預設 2 = 至少雙車道才超車）
+	/// Minimum forward lane count required to attempt overtaking
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Overtaking", meta = (ClampMin = "2"))
+	int32 OvertakeMinLaneCount = 2;
+
+	/// 超車道安全偵測距離（cm）/ Safety check distance for passing lane (cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Overtaking", meta = (ClampMin = "500"))
+	float OvertakeLateralCheckDistance = 2000.0f;
+
 	// ---- 車道偏移微調 / Lane Offset Adjustments ----
 
 	/// bTwoRoads=true 中間偏移微調 / Two Roads median adjust (cm)
@@ -327,6 +394,10 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path|Navigation")
 	FVector GetDestinationLocation() const { return DestinationWorldLocation; }
 
+	/// 取得目的地 Node ID / Get destination graph node ID
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path|Navigation")
+	int32 GetDestinationNodeId() const { return DestinationNodeId; }
+
 	/// <summary>
 	/// 請求切換到指定車道（平滑插值過渡）
 	/// Request smooth lane change to target lane index.
@@ -345,6 +416,18 @@ public:
 	/// 取得目前方向燈狀態 / Get current turn signal state
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path")
 	ETurnSignal GetTurnSignal() const { return CurrentTurnSignal; }
+
+	/// 取得超車狀態 / Get overtaking state
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path")
+	EOvertakeState GetOvertakeState() const { return OvertakeState; }
+
+	/// 取得前方障礙物距離（-1 = 無）/ Get obstacle distance ahead (-1 = none)
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path")
+	float GetObstacleDistance() const { return ObstacleDistance; }
+
+	/// 取得目前路線的世界座標點序列（從車目前位置到終點，用於地圖繪製）
+	/// Get current route world positions (from current pos to end, for map rendering)
+	void GetRouteWorldPoints(TArray<FVector>& OutPoints, int32 SamplesPerSegment = 10) const;
 
 	/// 路徑完成或失敗時廣播 / Broadcast on path complete/fail
 	UPROPERTY(BlueprintAssignable, Category = "Road Path")
@@ -431,6 +514,10 @@ private:
 	/// 是否正在走路口曲線 / Whether car is following a junction curve
 	bool bOnJunctionCurve = false;
 
+	/// 是否正在走 U 型掉頭曲線（使用 UTurn 參數而非 Junction 參數）
+	/// Whether following a U-turn curve (uses UTurn params instead of Junction params)
+	bool bIsUTurnCurve = false;
+
 	/// 剛離開路口曲線（同一幀用高 interp speed 消除銜接停頓）
 	/// Just exited junction curve (use high interp speed same frame for seamless transition)
 	bool bJustExitedJunctionCurve = false;
@@ -484,6 +571,11 @@ private:
 	/// 前方障礙物距離（cm，-1 = 無）/ Distance to obstacle ahead (-1 = none)
 	float ObstacleDistance = -1.0f;
 
+	/// 前方障礙物 Actor（用於超車判斷是車還是紅燈）
+	/// Front obstacle actor (for overtaking: distinguish vehicle vs traffic light)
+	UPROPERTY()
+	TWeakObjectPtr<AActor> ObstacleActor;
+
 	/// SphereTrace 偵測前方障礙物（統一：前車、紅燈碰撞體、任何障礙物）
 	/// SphereTrace forward obstacle detection (unified: vehicles, red light blockers, any obstacle)
 	void UpdateObstacleDetection();
@@ -494,4 +586,32 @@ private:
 	/// 到下一個路口的距離（用於減速判斷）
 	/// Distance to next junction (for slowdown calculation)
 	float GetDistanceToNextJunction() const;
+
+	// ---- 超車 / Overtaking ----
+
+	/// 超車狀態 / Overtaking state machine
+	EOvertakeState OvertakeState = EOvertakeState::None;
+
+	/// 超車前的車道索引（超車完要切回）/ Lane index before overtake (return target)
+	int32 PreOvertakeLaneIndex = 0;
+
+	/// 超車後的安全距離計數器（cm）/ Distance counter after passing (cm)
+	float OvertakePassedDistAccum = 0.0f;
+
+	/// ���車邏輯更新（Tick 中呼叫）/ Overtake logic update (called in Tick)
+	void UpdateOvertakeLogic();
+
+	/// 超車道安全偵測：目標車道方向是否有障礙
+	/// Check if passing lane is clear (SphereTrace in target lane direction)
+	bool IsPassingLaneClear(int32 PassingLaneIndex) const;
+
+	// ---- 中途重導航 / Mid-drive re-routing ----
+
+	/// 中途重導航：保留當前段，A* 從段終點到新目的地
+	/// Mid-drive re-route: keep current segment, A* from segment end to new destination
+	void RerouteToNode(int32 TargetNodeId);
+
+	/// 用新 A* 路徑建段並接在當前段之後
+	/// Build path segments from A* result and append after current segment
+	void AppendPathSegments(const FRoadGraphPath& AStarPath);
 };

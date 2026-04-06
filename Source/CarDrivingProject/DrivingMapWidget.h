@@ -6,6 +6,8 @@
 #include "DrivingMapWidget.generated.h"
 
 class ACameraActor;
+class AParkingLotActor;
+class ARoadsideParkingActor;
 class URoadNetworkSubsystem;
 class URoadPathFollowerComponent;
 class USpringArmComponent;
@@ -109,6 +111,31 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Colors")
 	FLinearColor DestinationColor = FLinearColor(1.0f, 0.2f, 0.2f, 1.0f);
+
+	/// 停車場在地圖上的標示顏色 / Parking lot marker color on map
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Colors")
+	FLinearColor ParkingLotColor = FLinearColor(0.2f, 0.9f, 0.9f, 1.0f);
+
+	/// 路邊停車範圍在地圖上的標示顏色 / Roadside parking zone color on map
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Colors")
+	FLinearColor RoadsideParkingColor = FLinearColor(0.3f, 0.8f, 0.3f, 0.8f);
+
+	// ================================================================
+	//  右側資訊面板 / Right Info Panel
+	// ================================================================
+
+	/// 資訊面板字體大小倍率 / Info panel font size multiplier
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Info Panel", meta = (ClampMin = "0.5", ClampMax = "4.0"))
+	float InfoPanelFontScale = 1.5f;
+
+	/// 資訊面板背景半透明度 / Info panel background opacity
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Info Panel", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float InfoPanelBackgroundAlpha = 0.6f;
+
+	/// 地圖背景額外邊距倍率（越大背景越大，路線越不會超出）
+	/// Map background extra margin multiplier (larger = more margin, route stays inside)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Minimap", meta = (ClampMin = "0.1", ClampMax = "1.0"))
+	float MapBoundsMarginRatio = 0.25f;
 
 	// ================================================================
 	//  攝影機 / Camera Settings
@@ -220,6 +247,10 @@ private:
 		const FVector2D& MapSize, float Radius) const;
 
 	int32 FindNodeNearMapPos(const FVector2D& LocalPos, const FVector2D& MapOrigin,
+		const FVector2D& MapSize, float Radius) const;
+
+	/// 點擊停車場偵測 — 回傳最近的停車場 Actor / Find parking lot near click
+	AActor* FindParkingLotNearMapPos(const FVector2D& LocalPos, const FVector2D& MapOrigin,
 		const FVector2D& MapSize, float Radius) const;
 
 	// ---- 攝影機 ----
