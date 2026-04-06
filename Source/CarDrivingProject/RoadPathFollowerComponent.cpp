@@ -2,6 +2,7 @@
 #include "RoadNetworkSubsystem.h"
 #include "RoadRuleLibrary.h"
 #include "RoadWorldSettings.h"
+#include "CollisionChannels.h"
 #include "Components/SplineComponent.h"
 #include "Engine/World.h"
 
@@ -69,6 +70,7 @@ void URoadPathFollowerComponent::ResetFollowingState()
 {
 	bIsFollowing = false;
 	bOnJunctionCurve = false;
+	bJustExitedJunctionCurve = false;
 	bIsChangingLane = false;
 	bParkingStraightening = false;
 	JCurveProgress = 0.0f;
@@ -79,6 +81,7 @@ void URoadPathFollowerComponent::ResetFollowingState()
 	NavState = ENavState::Idle;
 	PathSegments.Empty();
 	CurrentSegmentIndex = 0;
+	ObstacleDistance = -1.0f;
 }
 
 // ============================================================================
@@ -132,6 +135,7 @@ void URoadPathFollowerComponent::StartNavigationInternal(int32 FromNodeId, int32
 	CurrentLateralOffset = ComputeTargetLaneOffset(CurrentLaneIndex);
 	bIsChangingLane = false;
 	bOnJunctionCurve = false;
+	bJustExitedJunctionCurve = false;
 	JCurveProgress = 0.0f;
 	CurrentTurnSignal = ETurnSignal::None;
 	NavState = ENavState::Driving;
@@ -274,6 +278,8 @@ void URoadPathFollowerComponent::BuildPathSegments(const FRoadGraphPath& AStarPa
 			Seg.GuardrailSideOffsetCm = E.GuardrailSideOffsetCm;
 			Seg.AutoLaneWidthCm = E.AutoLaneWidthCm;
 			Seg.AutoMedianCm = E.AutoMedianCm;
+			Seg.EdgeId = E.EdgeId;
+			Seg.EndNodeId = bFwd ? E.EndNodeId : E.StartNodeId;
 
 			if (bFwd)
 			{
@@ -604,6 +610,12 @@ float URoadPathFollowerComponent::ComputeDesiredSpeed() const
 		Desired = FMath::Min(Desired, MaxSpeed * JunctionMinSpeedRatio);
 	}
 
+	// ---- 障礙物減速 / Obstacle braking ----
+	{
+		const float ObstacleLimit = ComputeObstacleSpeedLimit();
+		Desired = FMath::Min(Desired, ObstacleLimit);
+	}
+
 	// ---- 終點煞車 / End-of-path braking ----
 	const float RemainDist = GetRemainingDistance();
 	if (RemainDist < BrakeDistance && BrakeDeceleration > 0.0f)
@@ -726,6 +738,12 @@ void URoadPathFollowerComponent::TickComponent(
 	}
 
 	// ================================================================
+	//  0.7 障礙物偵測（統一：前車、紅燈碰撞體、任何障礙物）
+	//      Obstacle detection (unified: vehicles, red light blockers, any obstacle)
+	// ================================================================
+	UpdateObstacleDetection();
+
+	// ================================================================
 	//  1. 速度控制：加速到 DesiredSpeed 或煞車
 	//     Speed control: accelerate toward desired or brake
 	// ================================================================
@@ -733,13 +751,14 @@ void URoadPathFollowerComponent::TickComponent(
 
 	if (CurrentSpeed < DesiredSpeed)
 	{
-		// 加速：平滑漸進 / Accelerate smoothly
-		CurrentSpeed = FMath::FInterpTo(CurrentSpeed, DesiredSpeed, DeltaTime, 0.5f);
+		// 加速：用 Acceleration 參數，不超過 DesiredSpeed
+		// Accelerate using Acceleration param, capped at DesiredSpeed
+		CurrentSpeed = FMath::Min(CurrentSpeed + Acceleration * DeltaTime, DesiredSpeed);
 	}
 	else
 	{
-		// 減速：用實際煞車減速度，確保能準時到達目標速
-		// Brake with real deceleration so car reaches target speed in time
+		// 減速：用 BrakeDeceleration，不低於 DesiredSpeed
+		// Brake with BrakeDeceleration, floored at DesiredSpeed
 		CurrentSpeed = FMath::Max(CurrentSpeed - BrakeDeceleration * DeltaTime, DesiredSpeed);
 	}
 
@@ -755,77 +774,60 @@ void URoadPathFollowerComponent::TickComponent(
 		JCurveProgress += CurrentSpeed * DeltaTime;
 		const float T = FMath::Clamp(JCurveProgress / FMath::Max(JCurveLength, 1.0f), 0.0f, 1.0f);
 
-		// 直接用 Hermite 曲線位置（車已在最低速，VInterpTo lag 可忽略）
-		// Direct Hermite position (car already at min speed, VInterpTo lag negligible)
-		const FVector CurvePos = FMath::CubicInterp(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T);
-
-		// 直接用切線方向旋轉（Hermite 切線天生平滑，不需 RInterpTo）
-		// T=0 切線 = 車當前朝向，T=1 = 下一段方向 → 入出都連續
-		// Direct tangent rotation (Hermite tangent is inherently smooth, no RInterpTo needed)
-		// T=0 tangent = car's current heading, T=1 = next segment direction → continuous
-		const FVector CurveTangent = FMath::CubicInterpDerivative(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T);
-		FRotator FinalRot = Owner->GetActorRotation();
-		if (CurveTangent.SizeSquared() > 1.0f)
+		if (T < 1.0f)
 		{
-			FinalRot = CurveTangent.Rotation();
-		}
-
-		Owner->SetActorLocationAndRotation(CurvePos, FinalRot);
-
-		UE_LOG(LogTemp, Verbose,
-			TEXT("JUNCTION_CURVE: T=%.2f Progress=%.0f/%.0f Speed=%.0f"),
-			T, JCurveProgress, JCurveLength, CurrentSpeed);
-
-		if (T >= 1.0f)
-		{
-			// 曲線走完 → 進入新段
-			// Curve complete → enter new segment
-			bOnJunctionCurve = false;
-			// 曲線 P1 ≈ spline 取樣位置，VInterpTo 自然銜接
-			// Curve P1 ≈ spline sample position, VInterpTo handles transition naturally
-			CurrentSegmentIndex++;
-
-			if (CurrentSegmentIndex >= PathSegments.Num())
+			// 曲線進行中 — 直接定位，不經 VInterpTo
+			// Curve in progress — direct positioning, no VInterpTo
+			const FVector CurvePos = FMath::CubicInterp(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T);
+			const FVector CurveTangent = FMath::CubicInterpDerivative(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T);
+			FRotator FinalRot = Owner->GetActorRotation();
+			if (CurveTangent.SizeSquared() > 1.0f)
 			{
-				bIsFollowing = false;
-				CurrentSpeed = 0.0f;
-				NavState = ENavState::Parked;
-				CurrentTurnSignal = ETurnSignal::None;
-				UE_LOG(LogTemp, Warning, TEXT("PathFollower: Path completed (curve end) — NavState=Parked"));
-				OnPathComplete.Broadcast(true);
-				return;
+				FinalRot = CurveTangent.Rotation();
 			}
-
-			Seg = PathSegments[CurrentSegmentIndex];
-			ReferenceDistance = JCurveNextRefDist;
-
-			// 重置方向燈（新段會重新判斷）
-			// Reset turn signal (new segment will re-evaluate)
-			CurrentTurnSignal = ETurnSignal::None;
-
-			// 更新車道和橫向偏移到新段的正確值
-			// Update lane index and lateral offset to new segment's correct value
-			TargetLaneIndex = JCurveNextLaneIndex;
-			CurrentLaneIndex = JCurveNextLaneIndex;
-			bIsChangingLane = false;
-			CurrentLateralOffset = ComputeTargetLaneOffset(TargetLaneIndex);
-
-			UE_LOG(LogTemp, Warning,
-				TEXT("JUNCTION_CURVE_END: Entered Seg[%d] Type=%d RefDist=%.0f"),
-				CurrentSegmentIndex, Seg.RoadType, ReferenceDistance);
+			Owner->SetActorLocationAndRotation(CurvePos, FinalRot);
+			return; // 還在曲線上 → 跳過正常 spline 邏輯 / Still on curve → skip normal spline
 		}
 
-		// 每秒一次狀態 log
-		static int32 CurveFrameCounter = 0;
-		if (++CurveFrameCounter % 60 == 0)
+		// ---- T >= 1.0：曲線結束，直接銜接新段的 Spline 邏輯（同一幀！）----
+		// ---- T >= 1.0: Curve done, fall through to new segment's spline logic (same frame!) ----
+		bOnJunctionCurve = false;
+		CurrentSegmentIndex++;
+
+		if (CurrentSegmentIndex >= PathSegments.Num())
 		{
-			UE_LOG(LogTemp, Log,
-				TEXT("TICK(curve): Seg[%d/%d] Spd=%.0f Yaw=%.1f T=%.2f"),
-				CurrentSegmentIndex, PathSegments.Num(), CurrentSpeed,
-				Owner->GetActorRotation().Yaw, T);
+			bIsFollowing = false;
+			CurrentSpeed = 0.0f;
+			NavState = ENavState::Parked;
+			CurrentTurnSignal = ETurnSignal::None;
+			UE_LOG(LogTemp, Warning, TEXT("PathFollower: Path completed (curve end) — NavState=Parked"));
+			OnPathComplete.Broadcast(true);
+			return;
 		}
 
-		return; // 在曲線上時跳過正常 spline 邏輯
+		Seg = PathSegments[CurrentSegmentIndex];
+		ReferenceDistance = JCurveNextRefDist;
+
+		// 重置方向燈（新段會重新判斷）/ Reset turn signal
+		CurrentTurnSignal = ETurnSignal::None;
+
+		// 更新車道和橫向偏移到新段的正確值
+		// Update lane and lateral offset for new segment
+		TargetLaneIndex = JCurveNextLaneIndex;
+		CurrentLaneIndex = JCurveNextLaneIndex;
+		bIsChangingLane = false;
+		CurrentLateralOffset = ComputeTargetLaneOffset(TargetLaneIndex);
+
+		// 標記剛出曲線，讓 Step 6 用高 interp speed 消除銜接停頓
+		// Flag just-exited so Step 6 uses high interp speed for seamless transition
+		bJustExitedJunctionCurve = true;
+
+		UE_LOG(LogTemp, Warning,
+			TEXT("JUNCTION_CURVE_END: Entered Seg[%d] Type=%d RefDist=%.0f"),
+			CurrentSegmentIndex, Seg.RoadType, ReferenceDistance);
+
+		// 不 return — 直接 fall through 到下面的 Step 3~6
+		// DON'T return — fall through to Step 3~6 below
 	}
 
 	// ================================================================
@@ -883,11 +885,17 @@ void URoadPathFollowerComponent::TickComponent(
 	// 需要更大的弧線空間。用 CurrentLateralOffset 按比例增加。
 	// Dynamic blend for multi-lane turns: outer lanes are closer to the corner,
 	// need a bigger arc. Scale up by CurrentLateralOffset.
+	// 左轉用完整 BlendDistance，右轉弧度小用 × RightTurnBlendRatio
+	// Left turn uses full BlendDistance, right turn uses × RightTurnBlendRatio (smaller arc)
 	float EffectiveBlendDist = JunctionBlendDistance;
+	if (CurrentTurnSignal == ETurnSignal::Right)
+	{
+		EffectiveBlendDist *= RightTurnBlendRatio;
+	}
 	if (CurrentTurnSignal != ETurnSignal::None)
 	{
-		// 每 100cm 的車道偏移，額外增加 25% 的 BlendDistance
-		// For every 100cm of lane offset, add 25% more BlendDistance
+		// 每 100cm 的車道偏移，額外增加 BlendDistance（多車道動態調整）
+		// Per 100cm lane offset, boost BlendDistance (multi-lane dynamic adjustment)
 		const float OffsetBoost = (CurrentLateralOffset / 100.0f) * OffsetBoostRate;
 		EffectiveBlendDist *= (1.0f + FMath::Max(OffsetBoost, 0.0f));
 	}
@@ -1063,47 +1071,93 @@ void URoadPathFollowerComponent::TickComponent(
 	}
 
 	// ================================================================
-	//  6. 正常行駛 — 位置追蹤 + 旋轉跟隨移動方向
-	//     Normal driving — position tracking + rotation follows velocity
+	//  6. 正常行駛 — 直接定位到 Spline 位置 + 旋轉跟隨切線
+	//     Normal driving — snap to spline position + rotation follows tangent
 	// ================================================================
-	const FVector CurrentPos = Owner->GetActorLocation();
 	const FRotator CurrentRot = Owner->GetActorRotation();
 
-	// 接近路口時逐漸提高插值速度，讓車追上 spline 位置
-	// 進入 Hermite 曲線時 VInterpTo 延遲幾乎為零 → 銜接自然
-	// Ramp up interp speed approaching junction so VInterpTo lag → ~0
-	// → seamless transition when Hermite curve starts
-	float EffectiveInterpSpeed = PositionInterpSpeed;
-	if (bNextSegExists && DistToEnd < EffectiveBlendDist * 2.0f)
-	{
-		const float Ratio = 1.0f - (DistToEnd / (EffectiveBlendDist * 2.0f));
-		EffectiveInterpSpeed = FMath::Lerp(PositionInterpSpeed, 50.0f,
-			FMath::Clamp(Ratio, 0.0f, 1.0f));
-	}
+	// 位置：直接用 Spline 取樣位置（不做 VInterpTo）
+	// 車的位移完全由 ReferenceDistance 驅動（Step 3），每幀等速 → 零抖動
+	// Position: directly use spline sample (no VInterpTo)
+	// Movement driven entirely by ReferenceDistance (Step 3), constant per frame → zero jitter
+	const FVector FinalPos = RefPos;
 
-	const FVector FinalPos = FMath::VInterpTo(CurrentPos, RefPos, DeltaTime, EffectiveInterpSpeed);
-
-	const FVector Velocity = FinalPos - CurrentPos;
+	// 旋轉：用 Spline 切線方向，天生平滑穩定
+	// Rotation: use spline tangent direction, inherently smooth and stable
 	FRotator FinalRot = CurrentRot;
-	if (Velocity.SizeSquared() > 1.0f)
+	if (CurrentSpeed > 1.0f && RefDir.SizeSquared() > 0.1f)
 	{
-		// 全程用 velocity 朝向 — 停車時自然轉向路肩，接近停止時自然回正
-		// Always use velocity heading — naturally steers toward shoulder, straightens near stop
+		const FRotator TargetRot = RefDir.Rotation();
 		FinalRot = FMath::RInterpTo(
-			CurrentRot, Velocity.Rotation(), DeltaTime, RotationInterpSpeed);
+			CurrentRot, TargetRot, DeltaTime, RotationInterpSpeed);
 	}
 
 	Owner->SetActorLocationAndRotation(FinalPos, FinalRot);
 
-	// 每秒一次狀態 log
-	static int32 FrameCounter = 0;
-	if (++FrameCounter % 60 == 0)
+}
+
+// ============================================================================
+//  UpdateObstacleDetection — SphereTrace 偵測前方障礙物
+//  SphereTrace forward obstacle detection (unified: vehicles, red light blockers, any obstacle)
+// ============================================================================
+void URoadPathFollowerComponent::UpdateObstacleDetection()
+{
+	ObstacleDistance = -1.0f;
+
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	AActor* Owner = GetOwner();
+	if (!Owner) return;
+
+	const FVector Start = Owner->GetActorLocation();
+	const FVector Forward = Owner->GetActorForwardVector();
+	const FVector End = Start + Forward * ObstacleSlowdownDistance;
+
+	FHitResult Hit;
+	FCollisionQueryParams Params;
+	Params.AddIgnoredActor(Owner);
+
+	const bool bHit = World->SweepSingleByChannel(
+		Hit,
+		Start, End,
+		FQuat::Identity,
+		ECC_ObstacleDetect,
+		FCollisionShape::MakeSphere(ObstacleTraceRadius),
+		Params);
+
+	if (bHit)
 	{
-		UE_LOG(LogTemp, Log,
-			TEXT("TICK: Seg[%d/%d] Spd=%.0f/%.0f Yaw=%.1f Lane=%d Dist=%.0f→%.0f"),
-			CurrentSegmentIndex, PathSegments.Num(),
-			CurrentSpeed, ComputeDesiredSpeed(),
-			Owner->GetActorRotation().Yaw, CurrentLaneIndex,
-			ReferenceDistance, Seg.EndDist);
+		ObstacleDistance = Hit.Distance;
 	}
+}
+
+// ============================================================================
+//  ComputeObstacleSpeedLimit — 障礙物兩段式限速（N 減速，M 停車）
+//  Two-stage obstacle speed limit (N slowdown, M full stop)
+// ============================================================================
+float URoadPathFollowerComponent::ComputeObstacleSpeedLimit() const
+{
+	if (ObstacleDistance < 0.0f)
+	{
+		// 沒偵測到障礙物 / No obstacle detected
+		return MaxSpeed;
+	}
+
+	if (ObstacleDistance <= ObstacleStopDistance)
+	{
+		// 太近 → 完全停車 / Too close → full stop
+		return 0.0f;
+	}
+
+	if (ObstacleDistance >= ObstacleSlowdownDistance)
+	{
+		// 夠遠 → 不限速 / Far enough → no limit
+		return MaxSpeed;
+	}
+
+	// N~M 之間線性減速 / Linear deceleration between N and M
+	const float Alpha = (ObstacleDistance - ObstacleStopDistance)
+		/ (ObstacleSlowdownDistance - ObstacleStopDistance);
+	return MaxSpeed * Alpha;
 }

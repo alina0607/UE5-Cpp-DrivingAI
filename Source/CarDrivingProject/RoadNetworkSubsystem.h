@@ -106,6 +106,12 @@ public:
 		return GraphNodes;
 	}
 
+	/// <summary>
+	/// 用 EdgeId 查找對應的 Graph Edge / Find a graph edge by its EdgeId
+	/// @return 指標，找不到回傳 nullptr / Pointer to edge, or nullptr if not found
+	/// </summary>
+	const FRoadGraphEdge* GetGraphEdgeById(int32 EdgeId) const;
+
 private:
 
 	/// <summary>

@@ -70,6 +70,12 @@ struct FPathSegmentInternal
 	float AutoLaneWidthCm = 0.0f;
 	float AutoMedianCm = 0.0f;
 
+	/// 此段對應的 Graph Edge ID（用於紅綠燈查詢）/ Edge ID for this segment (for traffic light queries)
+	int32 EdgeId = INDEX_NONE;
+
+	/// 此段終點的 Graph Node ID / End node ID of this segment
+	int32 EndNodeId = INDEX_NONE;
+
 	/// 此段結束時（路口處）的轉彎方向，BuildPathSegments 時用 Node 世界座標預計算
 	/// Turn direction at end of this segment (precomputed from graph node world locations)
 	ETurnSignal TurnAtEnd = ETurnSignal::None;
@@ -200,10 +206,17 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Smoothing", meta = (ClampMin = "5.0", ClampMax = "180.0"))
 	float MaxTurnRateDegPerSec = 40.0f;
 
-	/// 路口過渡混合距離（cm）— 越大轉彎越圓滑
-	/// Junction blend distance (cm) — larger = smoother turns
+	/// 路口過渡混合距離（cm）— 左轉用這個值，越大轉彎越圓滑
+	/// Junction blend distance (cm) — used for LEFT turns, larger = smoother
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Smoothing", meta = (ClampMin = "10"))
 	float JunctionBlendDistance = 1500.0f;
+
+	/// 右轉混合距離比例 — 右轉弧度小，用較短的 BlendDistance
+	/// 實際右轉 BlendDistance = JunctionBlendDistance × 此比例
+	/// Right turn blend ratio — right turns have smaller arcs, use shorter blend
+	/// Actual right turn BlendDistance = JunctionBlendDistance × this ratio
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Smoothing", meta = (ClampMin = "0.1", ClampMax = "1.0"))
+	float RightTurnBlendRatio = 0.4f;
 
 	/// 路口曲線切線強度 — 控制轉彎弧度
 	/// 0.5=較直 0.7=圓弧 0.9=僵硬（兩直線接合感）1.2+=S型過衝
@@ -252,6 +265,22 @@ public:
 	/// Straighten creep distance (cm) — how far to creep forward while aligning
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Parking", meta = (ClampMin = "50"))
 	float ParkingStraightenDistance = 500.0f;
+
+	// ================================================================
+	//  障礙物偵測 / Obstacle Detection
+	// ================================================================
+
+	/// 開始減速的偵測距離（cm）/ Distance to start slowing down (cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Obstacle", meta = (ClampMin = "500"))
+	float ObstacleSlowdownDistance = 3000.0f;
+
+	/// 完全停車的距離（cm）/ Distance to fully stop (cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Obstacle", meta = (ClampMin = "50"))
+	float ObstacleStopDistance = 300.0f;
+
+	/// SphereTrace 偵測半徑（cm）/ SphereTrace radius (cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Obstacle", meta = (ClampMin = "10"))
+	float ObstacleTraceRadius = 120.0f;
 
 	// ---- 車道偏移微調 / Lane Offset Adjustments ----
 
@@ -399,9 +428,12 @@ private:
 	// 用 Hermite 曲線穿過路口，取代 blend+offset patch
 	// Hermite curve through junction, replacing blend+offset patches
 
-	/// 是否正在走路口曲線
-	/// Whether car is following a junction curve
+	/// 是否正在走路口曲線 / Whether car is following a junction curve
 	bool bOnJunctionCurve = false;
+
+	/// 剛離開路口曲線（同一幀用高 interp speed 消除銜接停頓）
+	/// Just exited junction curve (use high interp speed same frame for seamless transition)
+	bool bJustExitedJunctionCurve = false;
 
 	FVector JCurveP0 = FVector::ZeroVector;  // 起點 / start pos
 	FVector JCurveT0 = FVector::ZeroVector;  // 起點切線 / start tangent
@@ -446,6 +478,18 @@ private:
 	/// 重置所有跟隨狀態（用於重導航）
 	/// Reset all following state (for re-routing)
 	void ResetFollowingState();
+
+	// ---- 障礙物偵測 / Obstacle Detection ----
+
+	/// 前方障礙物距離（cm，-1 = 無）/ Distance to obstacle ahead (-1 = none)
+	float ObstacleDistance = -1.0f;
+
+	/// SphereTrace 偵測前方障礙物（統一：前車、紅燈碰撞體、任何障礙物）
+	/// SphereTrace forward obstacle detection (unified: vehicles, red light blockers, any obstacle)
+	void UpdateObstacleDetection();
+
+	/// 根據障礙物距離計算限速 / Compute speed limit from obstacle distance
+	float ComputeObstacleSpeedLimit() const;
 
 	/// 到下一個路口的距離（用於減速判斷）
 	/// Distance to next junction (for slowdown calculation)

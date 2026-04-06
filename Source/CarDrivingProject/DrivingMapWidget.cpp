@@ -9,6 +9,7 @@
 #include "Engine/Texture2D.h"
 #include "EngineUtils.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
+#include "Components/SplineComponent.h"
 #include "Rendering/DrawElements.h"
 
 // ================================================================
@@ -123,7 +124,51 @@ int32 UDrivingMapWidget::NativePaint(
 	// ---- 1. 背景 ----
 	DrawBackground(OutDrawElements, AllottedGeometry, MapOrigin, MapSize, LayerId);
 
-	// ---- 2. 車輛箭頭 ----
+	// ---- 2. 道路 Spline 曲線 / Road spline curves ----
+	{
+		FPaintContext EdgeCtx(AllottedGeometry, MyCullingRect, OutDrawElements, LayerId + 1,
+			InWidgetStyle, bParentEnabled);
+
+		if (UWorld* World = GetWorld())
+		{
+			if (URoadNetworkSubsystem* RS = World->GetSubsystem<URoadNetworkSubsystem>())
+			{
+				const FLinearColor EdgeColor(0.3f, 0.6f, 1.0f, 0.6f);
+				// 每條 Edge 沿 Spline 取樣多個點畫曲線
+				// Sample multiple points along each edge's spline to draw curves
+				constexpr int32 SplineSampleCount = 20;
+
+				for (const FRoadGraphEdge& Edge : RS->GetGraphEdges())
+				{
+					if (!Edge.InputSpline) continue;
+
+					const float StartDist = Edge.StartDistanceOnSpline;
+					const float EndDist   = Edge.EndDistanceOnSpline;
+					const float TotalDist = EndDist - StartDist;
+					if (FMath::Abs(TotalDist) < 1.0f) continue;
+
+					FVector2D PrevMapPt = FVector2D::ZeroVector;
+					for (int32 s = 0; s <= SplineSampleCount; ++s)
+					{
+						const float Alpha = static_cast<float>(s) / SplineSampleCount;
+						const float Dist  = StartDist + Alpha * TotalDist;
+						const FVector WorldPt = Edge.InputSpline->GetLocationAtDistanceAlongSpline(
+							Dist, ESplineCoordinateSpace::World);
+						const FVector2D MapPt = WorldToMap(WorldPt, MapOrigin, MapSize);
+
+						if (s > 0)
+						{
+							UWidgetBlueprintLibrary::DrawLine(
+								EdgeCtx, PrevMapPt, MapPt, EdgeColor, true, 1.0f);
+						}
+						PrevMapPt = MapPt;
+					}
+				}
+			}
+		}
+	}
+
+	// ---- 3. 車輛箭頭 ----
 	FPaintContext Context(AllottedGeometry, MyCullingRect, OutDrawElements, LayerId + 1,
 		InWidgetStyle, bParentEnabled);
 

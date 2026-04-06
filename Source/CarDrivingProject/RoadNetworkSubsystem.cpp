@@ -1241,3 +1241,19 @@ void URoadNetworkSubsystem::DrawDebugGraph()
         }
     }
 }
+
+// ============================================================================
+//  GetGraphEdgeById — 用 EdgeId 查找 Graph Edge
+//  Look up a graph edge by its EdgeId
+// ============================================================================
+const FRoadGraphEdge* URoadNetworkSubsystem::GetGraphEdgeById(int32 EdgeId) const
+{
+    for (const FRoadGraphEdge& Edge : GraphEdges)
+    {
+        if (Edge.EdgeId == EdgeId)
+        {
+            return &Edge;
+        }
+    }
+    return nullptr;
+}
