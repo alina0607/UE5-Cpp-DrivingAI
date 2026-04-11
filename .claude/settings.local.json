@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la *.uproject)",
+      "Bash(\"/c/Program Files/Epic Games/UE_5.7/Engine/Build/BatchFiles/Build.bat\" CarDrivingProjectEditor Win64 Development -Project=\"C:/Users/Reape/OneDrive/Documents/Unreal Projects/CarDrivingProject/CarDrivingProject.uproject\" -WaitMutex -FromMsBuild)",
+      "Bash(./Build.bat CarDrivingProjectEditor Win64 Development -Project=\"C:/Users/Reape/OneDrive/Documents/Unreal Projects/CarDrivingProject/CarDrivingProject.uproject\" -WaitMutex -FromMsBuild)",
+      "Bash(cmd.exe //c '\"C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\\\\Engine\\\\Build\\\\BatchFiles\\\\Build.bat\" CarDrivingProjectEditor Win64 Development -Project=\"C:\\\\Users\\\\Reape\\\\OneDrive\\\\Documents\\\\Unreal Projects\\\\CarDrivingProject\\\\CarDrivingProject.uproject\" -WaitMutex')",
+      "Bash(cp \"/c/Program Files/Epic Games/UE_5.7/Engine/Build/BatchFiles/Build.bat\" /tmp/UEBuild.bat)",
+      "Read(//tmp/**)",
+      "Bash(cmd.exe //c \"C:\\\\\\\\Users\\\\\\\\Reape\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\UEBuild.bat CarDrivingProjectEditor Win64 Development -Project=C:\\\\\\\\Users\\\\\\\\Reape\\\\\\\\OneDrive\\\\\\\\Documents\\\\\\\\Unreal Projects\\\\\\\\CarDrivingProject\\\\\\\\CarDrivingProject.uproject -WaitMutex\")",
+      "Bash(powershell.exe -Command \"& 'C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\\\\Engine\\\\Build\\\\BatchFiles\\\\Build.bat' CarDrivingProjectEditor Win64 Development -Project='C:\\\\Users\\\\Reape\\\\OneDrive\\\\Documents\\\\Unreal Projects\\\\CarDrivingProject\\\\CarDrivingProject.uproject' -WaitMutex\")",
+      "Bash(powershell.exe -Command \"& 'C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\\\\Engine\\\\Build\\\\BatchFiles\\\\Build.bat' -LiveCoding CarDrivingProjectEditor Win64 Development -Project='C:\\\\Users\\\\Reape\\\\OneDrive\\\\Documents\\\\Unreal Projects\\\\CarDrivingProject\\\\CarDrivingProject.uproject' -LiveCodingModules='C:\\\\Users\\\\Reape\\\\AppData\\\\Local\\\\Temp\\\\lc-modules.txt' -LiveCodingManifest='C:\\\\Users\\\\Reape\\\\AppData\\\\Local\\\\Temp\\\\lc-manifest.json' -WaitMutex 2>&1\")"
+    ]
+  }
+}

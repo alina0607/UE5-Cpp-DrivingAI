@@ -56,6 +56,7 @@ void AParkingLotActor::CollectSpotArrows()
 	SpotCount = SpotArrows.Num();
 	SpotOccupied.SetNumZeroed(SpotCount);
 	SpotVehicles.SetNum(SpotCount);
+	SpotEdgeIds.Init(INDEX_NONE, SpotCount);  // 預設 INDEX_NONE，由 BindParkingActorsToEdges 填入
 
 	UE_LOG(LogTemp, Warning, TEXT("ParkingLot '%s': Found %d ArrowComponents as parking spots"), *ParkingLotName, SpotCount);
 	for (int32 i = 0; i < SpotArrows.Num(); ++i)
@@ -119,6 +120,35 @@ bool AParkingLotActor::IsSpotOccupied(int32 SpotIndex) const
 {
 	if (!SpotOccupied.IsValidIndex(SpotIndex)) return true;
 	return SpotOccupied[SpotIndex];
+}
+
+int32 AParkingLotActor::GetSpotEdgeId(int32 SpotIndex) const
+{
+	if (!SpotEdgeIds.IsValidIndex(SpotIndex)) return INDEX_NONE;
+	return SpotEdgeIds[SpotIndex];
+}
+
+void AParkingLotActor::AssignSpotEdgeId(int32 SpotIndex, int32 EdgeId)
+{
+	if (!SpotEdgeIds.IsValidIndex(SpotIndex)) return;
+	SpotEdgeIds[SpotIndex] = EdgeId;
+}
+
+// [PARK-NAV] 一次設定整個停車場的綁定 Edge + 投影點
+// [PARK-NAV] Set bound edge + projection point for the whole lot
+void AParkingLotActor::AssignBoundEdge(int32 EdgeId, const FVector& ProjectionPoint)
+{
+	BoundEdgeId = EdgeId;
+	BoundProjectionPoint = ProjectionPoint;
+	// 同步寫到所有 SpotEdgeIds，讓舊 API 也能用 / Mirror to all spot slots for legacy API
+	for (int32 i = 0; i < SpotEdgeIds.Num(); ++i)
+	{
+		SpotEdgeIds[i] = EdgeId;
+	}
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("[PARK-NAV] '%s' AssignBoundEdge EdgeId=%d ProjPt=(%.0f,%.0f,%.0f)"),
+		*ParkingLotName, EdgeId, ProjectionPoint.X, ProjectionPoint.Y, ProjectionPoint.Z);
 }
 
 // ================================================================

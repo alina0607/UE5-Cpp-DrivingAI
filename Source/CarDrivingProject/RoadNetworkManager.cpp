@@ -28,8 +28,6 @@ void ARoadNetworkManager::BuildRoadCache()
     TArray<AActor*> FoundRoadActors;
     UGameplayStatics::GetAllActorsOfClass(GetWorld(), RoadActorClass, FoundRoadActors);
 
-    UE_LOG(LogTemp, Warning, TEXT("BuildRoadCache: Found %d road actors"), FoundRoadActors.Num());
-
 	// Extract runtime road data from each Blueprint road actor.
     for (AActor* RoadActor : FoundRoadActors)
     {
@@ -48,7 +46,6 @@ void ARoadNetworkManager::BuildRoadCache()
         {
             AllRoads.Add(RoadData);
         }
-		UE_LOG(LogTemp, Warning, TEXT("BuildRoadCache: Cached %d roads"), AllRoads.Num());
 
     }
 }

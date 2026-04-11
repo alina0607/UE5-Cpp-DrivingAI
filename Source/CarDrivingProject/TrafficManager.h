@@ -5,6 +5,8 @@
 #include "TrafficManager.generated.h"
 
 class ADrivingVehiclePawn;
+class AParkingLotActor;
+class ARoadsideParkingActor;
 
 /// 車輛生成配置 — 每種車的 BP 類別、數量、速度範圍
 /// Vehicle spawn config — BP class, count, and speed range per type
@@ -30,11 +32,10 @@ struct FVehicleSpawnConfig
 	float MaxSpeed = 2000.0f;
 };
 
-/// 交通管理器 — 放在關卡裡，Editor 裡設定車輛配置
-/// 自動生成多台 AI 車輛，各自隨機導航，到達後重新導航
+/// 交通管理器 — 車輛從停車場/路邊停車位置出發，目的地也是停車場或路邊停車
 ///
-/// Traffic manager — place in level, configure vehicle types in Editor.
-/// Spawns multiple AI vehicles with random destinations, loops on arrival.
+/// Traffic manager — vehicles spawn from parking lots/roadside zones,
+/// destinations are also parking lots or roadside zones.
 UCLASS()
 class CARDRIVINGPROJECT_API ATrafficManager : public AActor
 {
@@ -77,19 +78,28 @@ private:
 	UPROPERTY()
 	TArray<ADrivingVehiclePawn*> SpawnedVehicles;
 
+	/// 場景中所有停車場（BeginPlay 收集）/ All parking lots in level (collected at BeginPlay)
+	UPROPERTY()
+	TArray<AParkingLotActor*> AllParkingLots;
+
+	/// 場景中所有路邊停車（BeginPlay 收集）/ All roadside parking in level (collected at BeginPlay)
+	UPROPERTY()
+	TArray<ARoadsideParkingActor*> AllRoadsideParking;
+
+	/// 收集場景中所有停車場和路邊停車 / Collect all parking actors from level
+	void CollectParkingActors();
+
 	/// 生成所有車輛 / Spawn all vehicles
 	void SpawnAllVehicles();
 
-	/// 為指定車輛分配隨機目的地 / Assign random destination to a vehicle
+	/// 為指定車輛分配隨機目的地（停車場或路邊停車）
+	/// Assign random parking destination to a vehicle
 	void AssignRandomDestination(ADrivingVehiclePawn* Vehicle);
 
 	/// OnPathComplete 回呼：到達後延遲重新導航
 	/// OnPathComplete callback: re-navigate after delay
 	UFUNCTION()
 	void OnVehiclePathComplete(bool bSuccess);
-
-	/// 選一個隨機 Graph Node（排除指定 Node）/ Pick random graph node (exclude given node)
-	int32 PickRandomGoalNode(int32 ExcludeNodeId) const;
 
 	/// 已排程重導航的車輛（避免重複排程）
 	/// Vehicles with pending renavigate timers (avoid duplicates)

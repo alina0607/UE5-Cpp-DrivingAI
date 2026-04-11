@@ -134,42 +134,36 @@ bool URoadBPReflectionLibrary::ExtractRoadCoreData(AActor* RoadActor, FRoadRunti
     }
 
     // Read "Two Roads Gap, M" as a double property.
-    // 兩條平行路面之間的間距（公尺）
     if (FDoubleProperty* DoubleProp = FindFProperty<FDoubleProperty>(ActorClass, TEXT("Two Roads Gap, M")))
     {
         OutData.TwoRoadsGapM = DoubleProp->GetPropertyValue_InContainer(RoadActor);
     }
 
     // Read "Road Width Multiplier" as a double property.
-    // 路面寬度乘數（預設 1.0）
     if (FDoubleProperty* DoubleProp = FindFProperty<FDoubleProperty>(ActorClass, TEXT("Road Width Multiplier")))
     {
         OutData.RoadWidthMultiplier = DoubleProp->GetPropertyValue_InContainer(RoadActor);
     }
 
     // Read "Additional Width, m" as a double property.
-    // 額外路面寬度（公尺）
     if (FDoubleProperty* DoubleProp = FindFProperty<FDoubleProperty>(ActorClass, TEXT("Additional Width, m")))
     {
         OutData.AdditionalWidthM = DoubleProp->GetPropertyValue_InContainer(RoadActor);
     }
 
-    // 從 "Road Settings" struct 讀取 GuardrailSideOffset 和 CatsEyesPositions
     // Read GuardrailSideOffset and CatsEyesPositions from "Road Settings" struct
     if (FStructProperty* StructProp = FindFProperty<FStructProperty>(ActorClass, TEXT("Road Settings")))
     {
         UScriptStruct* InnerStruct = StructProp->Struct;
         const void* StructData = StructProp->ContainerPtrToValuePtr<void>(RoadActor);
 
-        // BP struct 欄位名稱帶有 GUID 後綴，無法用 FindFProperty 直接找
-        // 改用遍歷找名稱開頭匹配的欄位
         // BP struct field names have GUID suffixes, so we iterate and match by prefix
         for (TFieldIterator<FProperty> It(InnerStruct); It; ++It)
         {
             FProperty* InnerProp = *It;
             const FString FieldName = InnerProp->GetName();
 
-            // ---- GuardrailSideOffset（路面半寬）----
+            //GuardrailSideOffset
             if (FieldName.StartsWith(TEXT("GuardrailSideOffset")))
             {
                 if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(InnerProp))
@@ -178,19 +172,15 @@ bool URoadBPReflectionLibrary::ExtractRoadCoreData(AActor* RoadActor, FRoadRunti
                 }
             }
 
-            // ---- CatsEyesPositions（車道分界標記位置）----
-            // 從陣列中的正值計算車道寬度和中間偏移
             // Calculate lane width and median from positive marker positions
             if (FieldName.StartsWith(TEXT("CatsEyesPositions")))
             {
                 if (FArrayProperty* ArrayProp = CastField<FArrayProperty>(InnerProp))
                 {
-                    // 取得陣列 helper 來讀取元素
                     // Get array helper to read elements
                     FScriptArrayHelper ArrayHelper(ArrayProp, ArrayProp->ContainerPtrToValuePtr<void>(StructData));
                     const int32 ArrayNum = ArrayHelper.Num();
 
-                    // 收集所有 >= 0 的值（右側 = 正向車道的標記位置）
                     // Collect all non-negative values (right side = forward lane markers)
                     TArray<float> RightMarkers;
                     for (int32 Idx = 0; Idx < ArrayNum; ++Idx)
@@ -211,17 +201,14 @@ bool URoadBPReflectionLibrary::ExtractRoadCoreData(AActor* RoadActor, FRoadRunti
                         }
                     }
 
-                    // 排序：0, 400, 785 ...
                     // Sort ascending: 0, 400, 785 ...
                     RightMarkers.Sort();
 
                     if (RightMarkers.Num() >= 2)
                     {
-                        // 中間偏移 = 第一個標記位置（0 = 無中間帶）
                         // Median = first marker position (0 = no median)
                         OutData.AutoMedianCm = RightMarkers[0];
 
-                        // 車道寬度 = 相鄰標記間距的平均值
                         // Lane width = average gap between consecutive markers
                         float TotalGap = 0.0f;
                         const int32 GapCount = RightMarkers.Num() - 1;
@@ -231,15 +218,6 @@ bool URoadBPReflectionLibrary::ExtractRoadCoreData(AActor* RoadActor, FRoadRunti
                         }
                         OutData.AutoLaneWidthCm = TotalGap / static_cast<float>(GapCount);
 
-                        UE_LOG(LogTemp, Log,
-                            TEXT("  CatsEyes → AutoMedianCm=%.0f AutoLaneWidthCm=%.0f (%d markers on right)"),
-                            OutData.AutoMedianCm, OutData.AutoLaneWidthCm, RightMarkers.Num());
-                    }
-                    else
-                    {
-                        UE_LOG(LogTemp, Warning,
-                            TEXT("  CatsEyes: only %d right-side markers, cannot compute lane width"),
-                            RightMarkers.Num());
                     }
                 }
             }

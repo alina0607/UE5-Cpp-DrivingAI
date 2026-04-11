@@ -13,6 +13,9 @@
 
 #include "Components/SplineComponent.h"
 #include "Algo/Reverse.h"
+#include "EngineUtils.h"
+#include "ParkingLotActor.h"
+#include "RoadsideParkingActor.h"
 
 /// <summary>
 /// Initialization happens when the world creates this subsystem.
@@ -20,7 +23,6 @@
 void URoadNetworkSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
-    UE_LOG(LogTemp, Warning, TEXT("RoadNetworkSubsystem: Initialize"));
 
     // Register a callback when the world begins play.
     if (UWorld* World = GetWorld())
@@ -39,7 +41,6 @@ void URoadNetworkSubsystem::Deinitialize()
         World->OnWorldBeginPlay.RemoveAll(this);
     }
     AllRoads.Empty();
-    UE_LOG(LogTemp, Warning, TEXT("RoadNetworkSubsystem: Deinitialize"));
     Super::Deinitialize();
 }
 
@@ -58,7 +59,6 @@ const ARoadWorldSettings* URoadNetworkSubsystem::GetRoadWorldSettings() const
 }
 
 void URoadNetworkSubsystem::HandleWorldBeginPlay() {
-    UE_LOG(LogTemp, Warning, TEXT("RoadNetworkSubsystem: World BeginPlay"));
 
     BuildRoadCache();
 }
@@ -94,8 +94,6 @@ void URoadNetworkSubsystem::BuildRoadCache()
     TArray<AActor*> FoundRoadActors;
     UGameplayStatics::GetAllActorsOfClass(World, RoadSettings->RoadActorClass, FoundRoadActors);
 
-    UE_LOG(LogTemp, Warning, TEXT("BuildRoadCache: Found %d road actors"), FoundRoadActors.Num());
-
     // Extract runtime road data from each Blueprint road actor.
     for (AActor* RoadActor : FoundRoadActors)
     {
@@ -106,9 +104,6 @@ void URoadNetworkSubsystem::BuildRoadCache()
 
         if (!RoadActor->GetActorLabel().Contains(TEXT("BP_DriveRoad")))
         {
-            UE_LOG(LogTemp, Warning, TEXT("BuildRoadCache: Skipping non-road actor %s | Class=%s"),
-                *RoadActor->GetActorLabel(),
-                *RoadActor->GetClass()->GetName());
             continue;
         }
 
@@ -128,6 +123,7 @@ void URoadNetworkSubsystem::BuildRoadCache()
     BuildNodeCandidates();
     BuildGraphEdges();
     BuildGraphNodes();
+    BindParkingActorsToEdges();
     DrawDebugGraph();
 
 }
@@ -167,23 +163,6 @@ void URoadNetworkSubsystem::BuildEdgeCandidates()
 
         EdgeCandidates.Add(Candidate);
     }
-
-    // 印出每條邊的詳細資訊（含 TwoRoads 狀態）以便驗證
-    // Log each edge candidate's details including TwoRoads status
-    for (int32 i = 0; i < EdgeCandidates.Num(); ++i)
-    {
-        const FRoadEdgeCandidate& EC = EdgeCandidates[i];
-        UE_LOG(LogTemp, Warning,
-            TEXT("  Edge[%d] %s | RoadType=%d | TwoRoads=%s | Gap=%.1fm | Length=%.1fm"),
-            i,
-            EC.RoadActor ? *EC.RoadActor->GetActorLabel() : TEXT("NULL"),
-            EC.RoadType,
-            EC.bTwoRoads ? TEXT("true") : TEXT("false"),
-            EC.TwoRoadsGapM,
-            EC.LengthMeters);
-    }
-
-    UE_LOG(LogTemp, Warning, TEXT("BuildEdgeCandidates: Built %d edge candidates"), EdgeCandidates.Num());
 }
 
 /// <summary>
@@ -282,9 +261,6 @@ void URoadNetworkSubsystem::DetectMidSplineJunctions()
         Grid.FindOrAdd(CellKey).Add(SampleIdx);
     }
 
-    UE_LOG(LogTemp, Log,
-        TEXT("DetectMidSplineJunctions: %d samples in %d grid cells (CellSize=%.0f)"),
-        AllSamples.Num(), Grid.Num(), CellSize);
 
     // ---- Step B.2：Iterate cells, compare only neighbor cell points ----
     // For each occupied cell, check itself + 26 neighbors (3×3×3 cube).
@@ -630,10 +606,6 @@ void URoadNetworkSubsystem::BuildGraphEdges()
             GraphEdges.Add(NewEdge);
         }
     }
-
-    UE_LOG(LogTemp, Warning,
-        TEXT("BuildGraphEdges: Built %d graph edges (from %d edge candidates, %d junctions)"),
-        GraphEdges.Num(), EdgeCandidates.Num(), JunctionCandidates.Num());
 }
 
 /// <summary>
@@ -667,11 +639,234 @@ void URoadNetworkSubsystem::BuildGraphNodes()
             GraphNodes[Edge.EndNodeId].ConnectedEdgeIds.Add(Edge.EdgeId);
         }
     }
-
-    UE_LOG(LogTemp, Warning,
-        TEXT("BuildGraphNodes: Built %d nodes"),
-        GraphNodes.Num());
 }
+
+// ============================================================================
+//  BindParkingActorsToEdges
+//  掃描場景所有停車場 / 路邊停車，把每個 Spot 對應到正確的 Graph EdgeId
+//  Scan all parking actors, assign correct Graph EdgeId per spot
+// ============================================================================
+void URoadNetworkSubsystem::BindParkingActorsToEdges()
+{
+#if WITH_EDITOR
+    // GetActorLabel 只在編輯器/PIE 有意義；packaged build 會回傳 internal name
+    // GetActorLabel only meaningful in editor/PIE; packaged builds return internal name
+#endif
+
+    UWorld* World = GetWorld();
+    if (!World) return;
+
+    auto AssignSpotsForActor = [this](AActor* ParkingActor,
+        const FString& TargetLabel,
+        TArray<FVector>& SpotPositions,
+        TArray<FVector>& SpotForwards,
+        TFunctionRef<void(int32 SpotIndex, int32 EdgeId)> Assign)
+    {
+        if (!ParkingActor) return;
+
+        // ---- Step 1: 收集所有 GetActorLabel().Contains(TargetLabel) 的 RoadActor 對應的 Edges ----
+        // ---- Collect all GraphEdges whose RoadActor matches the label ----
+        TArray<int32> CandidateEdgeIds;
+        CandidateEdgeIds.Reserve(8);
+        for (const FRoadGraphEdge& E : GraphEdges)
+        {
+            if (!E.RoadActor || !E.InputSpline) continue;
+#if WITH_EDITOR
+            if (E.RoadActor->GetActorLabel().Contains(TargetLabel))
+#else
+            if (E.RoadActor->GetName().Contains(TargetLabel))
+#endif
+            {
+                CandidateEdgeIds.Add(E.EdgeId);
+            }
+        }
+
+        if (CandidateEdgeIds.Num() == 0)
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("[BIND-PARK] '%s': No edges matched RoadActor label '%s'"),
+                *ParkingActor->GetName(), *TargetLabel);
+            return;
+        }
+
+        UE_LOG(LogTemp, Log,
+            TEXT("[BIND-PARK] '%s': %d candidate edges matched label '%s'"),
+            *ParkingActor->GetName(), CandidateEdgeIds.Num(), *TargetLabel);
+
+        // ---- Step 2: 每個 Spot 找最佳 Edge ----
+        // ---- For each spot, find best edge from candidates ----
+        for (int32 SpotIdx = 0; SpotIdx < SpotPositions.Num(); ++SpotIdx)
+        {
+            const FVector SpotPos = SpotPositions[SpotIdx];
+            const FVector SpotFwd2D = SpotForwards[SpotIdx].GetSafeNormal2D();
+
+            float BestDist = TNumericLimits<float>::Max();
+            int32 BestEdgeId = INDEX_NONE;
+            float BestDot = -2.0f;
+
+            for (int32 EdgeId : CandidateEdgeIds)
+            {
+                const FRoadGraphEdge& E = GraphEdges[EdgeId];
+                if (!E.InputSpline) continue;
+
+                // 把 spot 投影到此 edge 的 spline 上，但只取 [StartDist, EndDist] 範圍內
+                // Project spot to spline, clamp to [StartDist, EndDist] of this edge
+                const float Key = E.InputSpline->FindInputKeyClosestToWorldLocation(SpotPos);
+                float ProjDist = E.InputSpline->GetDistanceAlongSplineAtSplineInputKey(Key);
+                const float Lo = FMath::Min(E.StartDistanceOnSpline, E.EndDistanceOnSpline);
+                const float Hi = FMath::Max(E.StartDistanceOnSpline, E.EndDistanceOnSpline);
+                ProjDist = FMath::Clamp(ProjDist, Lo, Hi);
+
+                const FVector ClosestPt = E.InputSpline->GetLocationAtDistanceAlongSpline(
+                    ProjDist, ESplineCoordinateSpace::World);
+                const FVector SplineDir = E.InputSpline->GetDirectionAtDistanceAlongSpline(
+                    ProjDist, ESplineCoordinateSpace::World).GetSafeNormal2D();
+
+                // Edge 是無向的（同一條路段同時代表正反兩向行駛），所以接受 |dot| ≥ 0.866
+                // 真正的行駛方向由 NavigateTo* 在執行時決定（看 dot 正負選 StartNode 或 EndNode）
+                // Edge is undirected (one segment represents both travel directions),
+                // so accept |dot| ≥ 0.866. The actual travel direction is decided
+                // at NavigateTo* time based on dot sign (StartNode vs EndNode as goal).
+                const float Dot = FVector::DotProduct(SpotFwd2D, SplineDir);
+                if (FMath::Abs(Dot) < 0.866f) continue;
+
+                const float Dist = FVector::Dist(SpotPos, ClosestPt);
+                if (Dist < BestDist)
+                {
+                    BestDist = Dist;
+                    BestEdgeId = EdgeId;
+                    BestDot = Dot;
+                }
+            }
+
+            if (BestEdgeId != INDEX_NONE)
+            {
+                Assign(SpotIdx, BestEdgeId);
+                UE_LOG(LogTemp, Log,
+                    TEXT("[BIND-PARK] '%s' Spot[%d] → Edge=%d (dist=%.0f dot=%.2f)"),
+                    *ParkingActor->GetName(), SpotIdx, BestEdgeId, BestDist, BestDot);
+            }
+            else
+            {
+                UE_LOG(LogTemp, Warning,
+                    TEXT("[BIND-PARK] '%s' Spot[%d] → NO matching edge (no candidate within 30°)"),
+                    *ParkingActor->GetName(), SpotIdx);
+            }
+        }
+    };
+
+    // ---- [PARK-NAV] ParkingLot Actors：用 Arrow[0] 當唯一錨點，挑候選 edges 裡最近的那段 sub-edge ----
+    // ---- [PARK-NAV] For each ParkingLot: use Arrow[0] as the single anchor, pick nearest candidate sub-edge ----
+    for (TActorIterator<AParkingLotActor> It(World); It; ++It)
+    {
+        AParkingLotActor* Lot = *It;
+        if (!Lot || Lot->SpotCount <= 0) continue;
+
+        const FString& TargetLabel = Lot->TargetRoadActorLabel;
+        const FVector AnchorPos = Lot->GetAnchorArrowPosition();
+
+        UE_LOG(LogTemp, Warning,
+            TEXT("[PARK-NAV] '%s' begin binding — AnchorPos=(%.0f,%.0f,%.0f) TargetLabel='%s'"),
+            *Lot->ParkingLotName, AnchorPos.X, AnchorPos.Y, AnchorPos.Z, *TargetLabel);
+
+        // Step 1: 收集所有 ActorLabel 符合的候選 edges
+        // Step 1: collect candidate edges by actor label
+        TArray<int32> CandidateEdgeIds;
+        CandidateEdgeIds.Reserve(8);
+        for (const FRoadGraphEdge& E : GraphEdges)
+        {
+            if (!E.RoadActor || !E.InputSpline) continue;
+#if WITH_EDITOR
+            const bool bMatch = E.RoadActor->GetActorLabel().Contains(TargetLabel);
+#else
+            const bool bMatch = E.RoadActor->GetName().Contains(TargetLabel);
+#endif
+            if (bMatch) CandidateEdgeIds.Add(E.EdgeId);
+        }
+
+        if (CandidateEdgeIds.Num() == 0)
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[PARK-NAV] '%s' NO candidate edges matched label '%s' — parking lot unreachable"),
+                *Lot->ParkingLotName, *TargetLabel);
+            continue;
+        }
+
+        UE_LOG(LogTemp, Warning,
+            TEXT("[PARK-NAV] '%s' %d candidate edges for label '%s'"),
+            *Lot->ParkingLotName, CandidateEdgeIds.Num(), *TargetLabel);
+
+        // Step 2: 把 Arrow[0] 投影到每段候選 sub-edge 的 [Lo,Hi] 範圍內，挑最近者
+        //         不做方向 dot 過濾（Edge 無向，方向由 NavigateToParkingLot 執行期決定）
+        // Step 2: project Anchor onto each sub-edge clamped to its [Lo,Hi]; pick smallest dist.
+        //         No direction filter — edge is undirected; direction picked at Navigate time.
+        int32 BestEdgeId = INDEX_NONE;
+        float BestDist = TNumericLimits<float>::Max();
+        FVector BestProjPt = FVector::ZeroVector;
+
+        for (int32 EdgeId : CandidateEdgeIds)
+        {
+            const FRoadGraphEdge& E = GraphEdges[EdgeId];
+            if (!E.InputSpline) continue;
+
+            const float Key = E.InputSpline->FindInputKeyClosestToWorldLocation(AnchorPos);
+            float ProjDist = E.InputSpline->GetDistanceAlongSplineAtSplineInputKey(Key);
+            const float Lo = FMath::Min(E.StartDistanceOnSpline, E.EndDistanceOnSpline);
+            const float Hi = FMath::Max(E.StartDistanceOnSpline, E.EndDistanceOnSpline);
+            ProjDist = FMath::Clamp(ProjDist, Lo, Hi);
+
+            const FVector ClosestPt = E.InputSpline->GetLocationAtDistanceAlongSpline(
+                ProjDist, ESplineCoordinateSpace::World);
+            const float Dist = FVector::Dist(AnchorPos, ClosestPt);
+
+            UE_LOG(LogTemp, Log,
+                TEXT("[PARK-NAV]   cand Edge=%d range[%.0f..%.0f] clampProj=%.0f pt=(%.0f,%.0f,%.0f) dist=%.0f"),
+                EdgeId, Lo, Hi, ProjDist, ClosestPt.X, ClosestPt.Y, ClosestPt.Z, Dist);
+
+            if (Dist < BestDist)
+            {
+                BestDist = Dist;
+                BestEdgeId = EdgeId;
+                BestProjPt = ClosestPt;
+            }
+        }
+
+        if (BestEdgeId == INDEX_NONE)
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[PARK-NAV] '%s' failed to pick best edge from %d candidates"),
+                *Lot->ParkingLotName, CandidateEdgeIds.Num());
+            continue;
+        }
+
+        Lot->AssignBoundEdge(BestEdgeId, BestProjPt);
+
+        UE_LOG(LogTemp, Warning,
+            TEXT("[PARK-NAV] '%s' BOUND → Edge=%d dist=%.0fcm projPt=(%.0f,%.0f,%.0f)"),
+            *Lot->ParkingLotName, BestEdgeId, BestDist,
+            BestProjPt.X, BestProjPt.Y, BestProjPt.Z);
+    }
+
+    // ---- RoadsideParking Actors ----
+    for (TActorIterator<ARoadsideParkingActor> It(World); It; ++It)
+    {
+        ARoadsideParkingActor* RS = *It;
+        if (!RS) continue;
+
+        const int32 N = RS->GetSpotCount();
+        TArray<FVector> Positions, Forwards;
+        Positions.Reserve(N); Forwards.Reserve(N);
+        for (int32 i = 0; i < N; ++i)
+        {
+            Positions.Add(RS->GetSpotWorldPosition(i));
+            Forwards.Add(RS->GetSpotWorldForward(i));
+        }
+
+        AssignSpotsForActor(RS, RS->TargetRoadActorLabel, Positions, Forwards,
+            [RS](int32 SpotIndex, int32 EdgeId) { RS->AssignSpotEdgeId(SpotIndex, EdgeId); });
+    }
+}
+
 
 /// <summary>
 /// Returns all neighbors of the specified node by traversing its connected edges.
@@ -1169,13 +1364,6 @@ void URoadNetworkSubsystem::DrawDebugGraph()
 
         const FRoadGraphPath TestPath = FindPathAStar(TestStartNode, TestGoalNode);
 
-        UE_LOG(LogTemp, Warning,
-            TEXT("Test AStar | Start=%d | Goal=%d | Found=%s | Cost=%.2f | Path=%s"),
-            TestStartNode, TestGoalNode,
-            TestPath.bPathFound ? TEXT("true") : TEXT("false"),
-            TestPath.TotalCost,
-            *FString::JoinBy(TestPath.NodePath, TEXT(" "),
-                [](int32 N) { return FString::Printf(TEXT("%d"), N); }));
 
         if (TestPath.bPathFound)
         {

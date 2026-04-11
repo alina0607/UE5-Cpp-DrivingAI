@@ -6,6 +6,8 @@
 #include "RoadRuleTypes.h"
 #include "RoadPathFollowerComponent.generated.h"
 
+class AParkingLotActor;
+class ARoadsideParkingActor;
 class URoadNetworkSubsystem;
 class USplineComponent;
 
@@ -101,6 +103,17 @@ enum class EOvertakeState : uint8
 };
 
 /// <summary>
+/// 目的地類型 / Destination type
+/// </summary>
+UENUM(BlueprintType)
+enum class EDestinationType : uint8
+{
+	None           UMETA(DisplayName = "None"),
+	ParkingLot     UMETA(DisplayName = "Parking Lot"),
+	RoadsideParking UMETA(DisplayName = "Roadside Parking"),
+};
+
+/// <summary>
 /// 路徑完成事件 / Path completion event delegate
 /// </summary>
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnPathEvent, bool, bSuccess);
@@ -133,17 +146,17 @@ public:
 	//  導航 / Navigation
 	// ================================================================
 
-	/// A* 起始 Node ID（寫死測試用）/ Start node for A* test
+	/// A* 起始 Node ID（舊版測試用，不再使用）/ Legacy test node IDs, no longer used
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Navigation")
 	int32 StartNodeId = 9;
 
-	/// A* 目標 Node ID（寫死測試用）/ Goal node for A* test
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Navigation")
 	int32 GoalNodeId = 2;
 
-	/// 是否在 BeginPlay 時自動開始 / Auto-start on BeginPlay
+	/// 是否在 BeginPlay 時自動開始（預設 false，由 TrafficManager 控制）
+	/// Auto-start on BeginPlay (default false, controlled by TrafficManager)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Navigation")
-	bool bAutoStart = true;
+	bool bAutoStart = false;
 
 	/// 路徑完成時的停車模式 / Parking mode when path ends
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Navigation")
@@ -233,6 +246,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Smoothing", meta = (ClampMin = "0.1", ClampMax = "1.0"))
 	float RightTurnBlendRatio = 0.4f;
 
+
 	/// 路口曲線切線強度 — 控制轉彎弧度
 	/// 0.5=較直 0.7=圓弧 0.9=僵硬（兩直線接合感）1.2+=S型過衝
 	/// Junction curve tangent scale — controls turn arc roundness
@@ -295,10 +309,48 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Parking", meta = (ClampMin = "0"))
 	float ParkingPullOverDistance = 8000.0f;
 
-	/// 停車回正前移距離（cm）— 停到路肩後慢慢前移多遠來轉正車頭
-	/// Straighten creep distance (cm) — how far to creep forward while aligning
+	/// 停車曲線速度比例（相對 MaxSpeed）— 停車入庫/路邊停車時的速度
+	/// Parking curve speed ratio (vs MaxSpeed) — speed when entering parking spot
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Parking", meta = (ClampMin = "0.05", ClampMax = "0.5"))
+	float ParkingCurveSpeedRatio = 0.15f;
+
+	/// 停車曲線切線強度 — 控制入庫弧度（越大越圓滑）
+	/// Parking curve tangent scale — controls entry arc roundness
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Parking", meta = (ClampMin = "0.3", ClampMax = "3.0"))
+	float ParkingCurveTangentScale = 1.0f;
+
+	// ---- 出發曲線 / Departure Curve ----
+
+	/// 出發曲線切線強度 — 控制出庫弧度（越大越圓滑、越繞）
+	/// Departure curve tangent scale — controls exit arc roundness
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Parking", meta = (ClampMin = "0.1", ClampMax = "3.0"))
+	float DepartureCurveTangentScale = 1.0f;
+
+	/// 出發曲線起點切線強度倍率（相對 DistToRoad）
+	/// 越大車頭方向保持越久，越小越快轉向道路
+	/// Departure curve start-tangent strength ratio (× DistToRoad).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Parking", meta = (ClampMin = "0.1", ClampMax = "3.0"))
+	float DepartureCurveStartTangentScale = 1.0f;
+
+	/// 出發曲線長度倍率（相對車→匯入點距離）
+	/// Departure curve length multiplier (× distance to merge point)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Parking", meta = (ClampMin = "1.0", ClampMax = "3.0"))
+	float DepartureCurveLengthMultiplier = 1.3f;
+
+	/// 出發曲線最小長度（cm）
+	/// Departure curve minimum length (cm)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Parking", meta = (ClampMin = "50"))
-	float ParkingStraightenDistance = 500.0f;
+	float DepartureCurveMinLength = 200.0f;
+
+	/// 距離道路多遠才觸發出發曲線（cm），小於此距離直接正常跟隨 spline
+	/// Trigger distance for departure curve (cm); below this, just follow spline directly
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Parking", meta = (ClampMin = "10"))
+	float DepartureCurveTriggerDistance = 200.0f;
+
+	/// 出發曲線速度比例（相對 MaxSpeed）— 出庫時的速度
+	/// Departure curve speed ratio (vs MaxSpeed) — speed while exiting
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Parking", meta = (ClampMin = "0.05", ClampMax = "1.0"))
+	float DepartureCurveSpeedRatio = 0.25f;
 
 	// ================================================================
 	//  障礙物偵測 / Obstacle Detection
@@ -381,10 +433,24 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Road Path|Navigation")
 	void NavigateToLocation(const FVector& Destination);
 
-	/// 導航到指定 Graph Node ID（從車目前位置出發）
-	/// Navigate to a specific graph node (start from car's current position)
+	/// 導航到指定 Graph Node ID（從車目前位置出發）— 內部用，外部請用 NavigateToParkingLot / NavigateToRoadside
+	/// Navigate to a specific graph node — internal use, prefer NavigateToParkingLot/NavigateToRoadside
 	UFUNCTION(BlueprintCallable, Category = "Road Path|Navigation")
 	void NavigateToNode(int32 TargetNodeId);
+
+	/// 導航到停車場並停入指定車格（SpotIndex=-1 自動找空位）
+	/// Navigate to parking lot and park in specified spot (-1 = auto-find)
+	UFUNCTION(BlueprintCallable, Category = "Road Path|Navigation")
+	void NavigateToParkingLot(AParkingLotActor* ParkingLot, int32 SpotIndex = -1);
+
+	/// 導航到路邊停車位置（SpotIndex = 佔用哪個停車格，-1 = 不佔用）
+	/// Navigate to roadside parking position (SpotIndex = which spot to occupy, -1 = none)
+	UFUNCTION(BlueprintCallable, Category = "Road Path|Navigation")
+	void NavigateToRoadside(ARoadsideParkingActor* RoadsideActor, const FVector& Position, bool bLeftSide, int32 SpotIndex = -1);
+
+	/// 取得目的地類型 / Get destination type
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path|Navigation")
+	EDestinationType GetDestinationType() const { return DestinationType; }
 
 	/// 取得目前導航狀態 / Get current navigation state
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path|Navigation")
@@ -393,6 +459,14 @@ public:
 	/// 取得目的地世界座標 / Get destination world location
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path|Navigation")
 	FVector GetDestinationLocation() const { return DestinationWorldLocation; }
+
+	/// 取得目的地名稱（停車場名 / 路邊停車名）/ Get destination name
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path|Navigation")
+	FString GetDestinationName() const;
+
+	/// 取得目標停車格索引 / Get target spot index
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path|Navigation")
+	int32 GetTargetSpotIndex() const;
 
 	/// 取得目的地 Node ID / Get destination graph node ID
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path|Navigation")
@@ -435,6 +509,32 @@ public:
 
 private:
 	void BuildPathSegments(const FRoadGraphPath& AStarPath);
+
+	/// <summary>
+	/// 用實際 spline 切線判斷從 InSeg 出口轉到 OutSeg 入口的轉彎類型。
+	/// Compute turn type from actual spline tangents at junction between InSeg end and OutSeg start.
+	/// 直行：dot > JunctionStraightDot ; U-turn: dot < JunctionUTurnDot ; 否則看 CrossZ 分左右。
+	/// </summary>
+	void ComputeTurnAtJunction(
+		const FPathSegmentInternal& InSeg,
+		const FPathSegmentInternal& OutSeg,
+		ETurnSignal& OutTurn,
+		bool& bOutUTurn,
+		float* OutDot = nullptr,
+		float* OutCrossZ = nullptr) const;
+
+public:
+	/// 路口轉彎判定：dot > 此值 → 直行（不打方向燈、不減速）
+	/// Junction turn detection: dot > this → straight (no signal, no slowdown)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Smoothing", meta = (ClampMin = "0.5", ClampMax = "1.0"))
+	float JunctionStraightDot = 0.866f;
+
+	/// 路口轉彎判定：dot < 此值 → U-turn
+	/// Junction turn detection: dot < this → U-turn
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Smoothing", meta = (ClampMin = "-1.0", ClampMax = "-0.5"))
+	float JunctionUTurnDot = -0.866f;
+
+private:
 
 	/// <summary>
 	/// 計算指定段+距離處的世界位置（含橫向偏移）
@@ -545,18 +645,50 @@ private:
 	/// 目的地世界座標 / Destination world location
 	FVector DestinationWorldLocation = FVector::ZeroVector;
 
+	/// 目的地類型 / Destination type
+	EDestinationType DestinationType = EDestinationType::None;
+
+	/// 目標停車場 / Target parking lot
+	UPROPERTY()
+	TWeakObjectPtr<AParkingLotActor> TargetParkingLot;
+	int32 TargetParkingSpotIndex = INDEX_NONE;
+
+	/// 目標路邊停車 / Target roadside parking
+	UPROPERTY()
+	TWeakObjectPtr<ARoadsideParkingActor> TargetRoadsideParking;
+	int32 TargetRoadsideSpotIndex = INDEX_NONE;
+	FVector TargetRoadsidePosition = FVector::ZeroVector;
+	bool bTargetRoadsideLeftSide = false;
+
 	/// 停車時的目標橫向偏移（cm）— Step 0.5 計算，Step 4 使用
 	/// Parking target lateral offset (cm) — computed in Step 0.5, used in Step 4
 	float ParkingTargetOffset = 0.0f;
 
-	/// 停車回正中 / Whether car is in straightening phase
-	bool bParkingStraightening = false;
+	/// 是否正在走停車曲線（Hermite curve from road to spot）
+	/// Whether car is following a parking Hermite curve
+	bool bOnParkingCurve = false;
 
-	/// 回正剩餘前移距離（cm）/ Remaining creep distance for straightening
-	float ParkingStraightenRemain = 0.0f;
+	FVector ParkCurveP0 = FVector::ZeroVector;  // 起點 / start pos
+	FVector ParkCurveT0 = FVector::ZeroVector;  // 起點切線 / start tangent
+	FVector ParkCurveP1 = FVector::ZeroVector;  // 終點（停車格位置）/ end pos (spot location)
+	FVector ParkCurveT1 = FVector::ZeroVector;  // 終點切線（Arrow 前方）/ end tangent (arrow forward)
+	float ParkCurveLength = 0.0f;               // 曲線近似長度
+	float ParkCurveProgress = 0.0f;             // 目前走了多遠
 
-	/// 回正目標 Yaw / Target yaw for straightening (road direction)
-	float ParkingStraightenYaw = 0.0f;
+	/// 是否正在走出發曲線（從停車格自然匯入道路）
+	/// Whether car is following a departure curve (from parking spot to road)
+	bool bOnDepartureCurve = false;
+
+	FVector DepCurveP0 = FVector::ZeroVector;
+	FVector DepCurveT0 = FVector::ZeroVector;
+	FVector DepCurveP1 = FVector::ZeroVector;
+	FVector DepCurveT1 = FVector::ZeroVector;
+	float DepCurveLength = 0.0f;
+	float DepCurveProgress = 0.0f;
+
+	/// 路邊停車的 Arrow 前方方向（用於最終對齊）
+	/// Roadside spot Arrow forward (for final alignment at path end)
+	FVector RoadsideSpotForward = FVector::ZeroVector;
 
 	/// 內部共用的導航啟動邏輯（A* + BuildPath + 初始化）
 	/// Internal shared navigation start logic (A* + BuildPath + init)
@@ -614,4 +746,61 @@ private:
 	/// 用新 A* 路徑建段並接在當前段之後
 	/// Build path segments from A* result and append after current segment
 	void AppendPathSegments(const FRoadGraphPath& AStarPath);
+
+	/// 截斷路徑到目標世界位置：找到匹配 EdgeId 的段，將 EndDist 設為目標投影距離，移除之後的段
+	/// Truncate path at target world position: find segment matching EdgeId, set EndDist to projected dist, remove later segments
+	void TruncatePathToWorldPosition(const FVector& TargetPos, int32 TargetEdgeId);
+
+	/// 將綁定 Edge 作為路徑最後一段附加，EndDist 截斷到給定的 spline 絕對距離（投影點）
+	/// 並重算原本最後一段的 TurnAtEnd，因為它現在接續到這條 bound edge
+	/// Append the bound edge as the final path segment, with EndDist truncated to the given
+	/// absolute spline distance (the projection point), and recompute the previously-last
+	/// segment's TurnAtEnd so it connects cleanly into the bound edge.
+	void AppendBoundEdgeFinalSegment(const struct FRoadGraphEdge& BoundEdge, bool bForward, float ProjDistAbs);
+
+	/// 釋放上一個目的地佔用的停車格（停車場 / 路邊），並清空 Target* 狀態
+	/// 在開始新的導航前呼叫，避免洩漏佔位
+	/// Release any parking spot held by the previous destination (lot or roadside) and clear
+	/// Target* state. Call before starting a new navigation to avoid leaking occupancy.
+	void ReleasePreviousDestinationSpot();
+
+	/// 找一個位於車輛前方的最近 graph node 作為 A* 起始點。
+	/// 在前方錐外（後方）的 node 不會被選；若完全找不到 → fallback 到最近的任何 node。
+	/// Find nearest graph node that lies in front of the car (forward cone) for use as A* start.
+	/// Falls back to the absolute nearest node if no forward node is found.
+	int32 FindForwardStartNode(const FVector& CarPos, const FVector& CarFwd) const;
+
+	/// <summary>
+	/// 找車最近的 edge 並投影 — 用於「從邊上最近的點」起始導航。
+	/// Find the road edge nearest to the car and compute its projection. Used to start
+	/// navigation from the nearest point ON an edge (not the nearest graph node).
+	///
+	/// 回傳成功時 OutEdge、OutProjDistAbs（絕對 spline 距離）、OutForward（車朝向
+	/// 是否與 spline 正向同向）、OutExitNodeId（車行進方向會到達的 edge 終點 node）
+	/// 均被設定。
+	///
+	/// On success, sets OutEdge (non-null), OutProjDistAbs (absolute spline distance of
+	/// the car projection on the edge), OutForward (whether the car heading aligns with
+	/// the edge's spline direction), and OutExitNodeId (the graph node the car would
+	/// reach by driving forward along the edge from the projection).
+	/// </summary>
+	bool FindStartBoundEdge(
+		const FVector& CarPos,
+		const FVector& CarFwd,
+		const struct FRoadGraphEdge*& OutEdge,
+		float& OutProjDistAbs,
+		bool& OutForward,
+		int32& OutExitNodeId) const;
+
+	/// <summary>
+	/// 把 BoundEdge 從投影點到 ExitNode 這一段當作「第一段」插在 PathSegments 最前面。
+	/// 作用與 AppendBoundEdgeFinalSegment 對稱 — 出發時從邊上最近的投影點開始行駛。
+	///
+	/// Prepend a partial segment (from ProjDistAbs to the forward end of BoundEdge) at
+	/// the front of PathSegments. Symmetric to AppendBoundEdgeFinalSegment — used so the
+	/// car starts driving from the projection point on the bound edge rather than from
+	/// the far end node.
+	/// </summary>
+	void PrependStartBoundEdgeSegment(
+		const struct FRoadGraphEdge& BoundEdge, bool bForward, float ProjDistAbs);
 };

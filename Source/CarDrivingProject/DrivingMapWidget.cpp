@@ -225,18 +225,11 @@ int32 UDrivingMapWidget::NativePaint(
 			}
 
 			// 終點標記 / Destination marker
-			if (SelectedDestinationNodeId != INDEX_NONE && CachedNodes.Num() > 0)
+			if (!SelectedDestinationWorldPos.IsNearlyZero())
 			{
-				for (const FMapNodeCache& NC : CachedNodes)
-				{
-					if (NC.NodeId == SelectedDestinationNodeId)
-					{
-						FVector2D DestMapPos = WorldToMap(NC.WorldLocation, MapOrigin, MapSize);
-						DrawCircle(Context, DestMapPos, bIsFullscreen ? 8.0f : 5.0f,
-							DestinationColor, 2.5f);
-						break;
-					}
-				}
+				FVector2D DestMapPos = WorldToMap(SelectedDestinationWorldPos, MapOrigin, MapSize);
+				DrawCircle(Context, DestMapPos, bIsFullscreen ? 8.0f : 5.0f,
+					DestinationColor, 2.5f);
 			}
 		}
 	}
@@ -260,6 +253,14 @@ int32 UDrivingMapWidget::NativePaint(
 		UWorld* ParkWorld = GetWorld();
 		if (ParkWorld)
 		{
+			// 停車場字體 / Parking lot font
+			FSlateFontInfo LotFont = FAppStyle::GetFontStyle("NormalFont");
+			LotFont.Size = ParkingLotFontSize;
+
+			// 路邊停車字體 / Roadside font
+			FSlateFontInfo RSFont = FAppStyle::GetFontStyle("NormalFont");
+			RSFont.Size = RoadsideParkingFontSize;
+
 			// 停車場 / Parking lots
 			for (TActorIterator<AParkingLotActor> It(ParkWorld); It; ++It)
 			{
@@ -268,9 +269,19 @@ int32 UDrivingMapWidget::NativePaint(
 
 				FVector2D LotMapPos = WorldToMap(Lot->GetActorLocation(), MapOrigin, MapSize);
 				DrawCircle(Context, LotMapPos, 6.0f, ParkingLotColor, 2.0f);
-				UWidgetBlueprintLibrary::DrawText(Context,
-					FString::Printf(TEXT("P %s"), *Lot->ParkingLotName),
-					FVector2D(LotMapPos.X + 8.0f, LotMapPos.Y - 6.0f), ParkingLotColor);
+
+				// 用自訂字體大小和顏色畫名稱 / Draw name with custom font size & color
+				if (bShowParkingNames)
+				{
+					FSlateDrawElement::MakeText(OutDrawElements, LayerId + 2,
+						AllottedGeometry.ToPaintGeometry(
+							FVector2f(200.0f, 20.0f),
+							FSlateLayoutTransform(FVector2f(
+								static_cast<float>(LotMapPos.X + ParkingLotNameOffset.X),
+								static_cast<float>(LotMapPos.Y + ParkingLotNameOffset.Y)))),
+						FString::Printf(TEXT("P %s"), *Lot->ParkingLotName),
+						LotFont, ESlateDrawEffect::None, ParkingLotTextColor);
+				}
 
 				for (int32 s = 0; s < Lot->SpotCount; ++s)
 				{
@@ -283,25 +294,33 @@ int32 UDrivingMapWidget::NativePaint(
 				}
 			}
 
-			// 路邊停車範圍 / Roadside parking zones
+			// 路邊停車格 — 畫圓點（與停車場一致）/ Roadside spots — draw dots (like parking lots)
 			for (TActorIterator<ARoadsideParkingActor> It(ParkWorld); It; ++It)
 			{
 				ARoadsideParkingActor* RSP = *It;
 				if (!RSP) continue;
 
-				for (int32 z = 0; z < RSP->GetZoneCount(); ++z)
+				// 畫每個停車格圓點 / Draw each spot as a dot
+				for (int32 s = 0; s < RSP->GetSpotCount(); ++s)
 				{
-					FVector2D ZoneStart = WorldToMap(RSP->GetZoneWorldStart(z), MapOrigin, MapSize);
-					FVector2D ZoneEnd = WorldToMap(RSP->GetZoneWorldEnd(z), MapOrigin, MapSize);
-					UWidgetBlueprintLibrary::DrawLine(Context, ZoneStart, ZoneEnd,
-						RoadsideParkingColor, true, 3.0f);
+					FVector2D SpotPos = WorldToMap(RSP->GetSpotWorldPosition(s), MapOrigin, MapSize);
+					const bool bOcc = RSP->IsSpotOccupied(s);
+					const float Rad = bOcc ? 2.5f : 3.5f;
+					FLinearColor SpotColor = bOcc
+						? FLinearColor(0.5f, 0.5f, 0.5f, 0.5f) : RoadsideParkingColor;
+					DrawCircle(Context, SpotPos, Rad, SpotColor, 1.5f);
 				}
 
-				if (RSP->GetZoneCount() > 0)
+				if (bShowParkingNames && RSP->GetSpotCount() > 0)
 				{
-					FVector2D NamePos = WorldToMap(RSP->GetZoneWorldStart(0), MapOrigin, MapSize);
-					UWidgetBlueprintLibrary::DrawText(Context, RSP->ZoneName,
-						FVector2D(NamePos.X + 5.0f, NamePos.Y - 12.0f), RoadsideParkingColor);
+					FVector2D NamePos = WorldToMap(RSP->GetSpotWorldPosition(0), MapOrigin, MapSize);
+					FSlateDrawElement::MakeText(OutDrawElements, LayerId + 2,
+						AllottedGeometry.ToPaintGeometry(
+							FVector2f(200.0f, 20.0f),
+							FSlateLayoutTransform(FVector2f(
+								static_cast<float>(NamePos.X + RoadsideParkingNameOffset.X),
+								static_cast<float>(NamePos.Y + RoadsideParkingNameOffset.Y)))),
+						RSP->ZoneName, RSFont, ESlateDrawEffect::None, RoadsideParkingTextColor);
 				}
 			}
 		}
@@ -318,7 +337,7 @@ int32 UDrivingMapWidget::NativePaint(
 	{
 		FVector2D HintPos(MapOrigin.X, MapOrigin.Y - 18.0);
 		FString Hint = SelectedVehiclePtr.IsValid()
-			? TEXT("[LMB] Click node = set destination  |  [Space] Unfollow  |  [M] Close")
+			? TEXT("[LMB] Click parking = set destination  |  [Space] Unfollow  |  [M] Close")
 			: TEXT("[LMB] Click vehicle = follow  |  [M] Close");
 		UWidgetBlueprintLibrary::DrawText(Context, Hint, HintPos,
 			FLinearColor(0.6f, 0.65f, 0.7f, 0.8f));
@@ -421,15 +440,43 @@ int32 UDrivingMapWidget::NativePaint(
 			DrawPanelLine(FString::Printf(TEXT("Overtake: %s"), *OvtStr), OvtColor);
 
 			// 目的地 / Destination
-			FString DestStr = (SelectedDestinationNodeId != INDEX_NONE)
-				? FString::Printf(TEXT("Dest: Node %d"), SelectedDestinationNodeId)
-				: TEXT("Dest: None");
-			DrawPanelLine(DestStr, (SelectedDestinationNodeId != INDEX_NONE) ? InfoColor : DimColor);
+			{
+				FString DestStr;
+				FLinearColor DestColor = DimColor;
+				const FString DestName = PF->GetDestinationName();
+				const int32 SpotIdx = PF->GetTargetSpotIndex();
+
+				switch (PF->GetDestinationType())
+				{
+				case EDestinationType::ParkingLot:
+					DestStr = TEXT("Dest: Parking Lot");
+					DestColor = ParkingLotColor;
+					break;
+				case EDestinationType::RoadsideParking:
+					DestStr = TEXT("Dest: Roadside");
+					DestColor = RoadsideParkingColor;
+					break;
+				default:
+					DestStr = TEXT("Dest: None");
+					break;
+				}
+				DrawPanelLine(DestStr, DestColor);
+
+				// 目的地名稱 + 停車格 / Destination name + spot index
+				if (!DestName.IsEmpty())
+				{
+					DrawPanelLine(FString::Printf(TEXT("  Name: %s"), *DestName), DestColor);
+					if (SpotIdx != INDEX_NONE)
+					{
+						DrawPanelLine(FString::Printf(TEXT("  Spot: #%d"), SpotIdx), DestColor);
+					}
+				}
+			}
 
 			TextY += LineH * 0.8f;
 			DrawPanelLine(TEXT("--- Controls ---"), TitleColor);
 			TextY += LineH * 0.3f;
-			DrawPanelLine(TEXT("Click node = Set dest"), DimColor);
+			DrawPanelLine(TEXT("Click parking = Set dest"), DimColor);
 			DrawPanelLine(TEXT("[Space] = Unfollow"), DimColor);
 			DrawPanelLine(TEXT("[Scroll] = Zoom"), DimColor);
 			DrawPanelLine(TEXT("[M] = Close map"), DimColor);
@@ -466,44 +513,59 @@ FReply UDrivingMapWidget::NativeOnMouseButtonDown(
 			return FReply::Handled();
 		}
 
-		// 已選車 → 點停車場或節點設目的地
-		// Selected vehicle → click parking lot or node to set destination
+		// 已選車 → 點停車場或路邊停車設目的地
+		// Selected vehicle → click parking lot or roadside zone to set destination
 		if (SelectedVehiclePtr.IsValid())
 		{
 			URoadPathFollowerComponent* PF =
 				SelectedVehiclePtr->FindComponentByClass<URoadPathFollowerComponent>();
 
+			UE_LOG(LogTemp, Warning, TEXT("[MAP-CLICK] Vehicle selected, PF=%s, NavState=%d"),
+				PF ? TEXT("valid") : TEXT("null"),
+				PF ? (int32)PF->GetNavState() : -1);
+
 			// 優先偵測停車場 / Parking lot has priority
-			AActor* ClickedLot = FindParkingLotNearMapPos(LocalPos, MapOrigin, MapSize, 22.0f);
-			if (ClickedLot && PF)
+			AParkingLotActor* ClickedLot = FindParkingLotNearMapPos(LocalPos, MapOrigin, MapSize, 22.0f);
+			if (ClickedLot)
 			{
-				// 找停車場最近的 Graph Node 作為導航目的地
-				// Find nearest graph node to parking lot as navigation destination
-				if (UWorld* World = GetWorld())
+				UE_LOG(LogTemp, Warning, TEXT("[MAP-CLICK] Clicked ParkingLot '%s' at (%.0f,%.0f,%.0f) NearestEdge=%d"),
+					*ClickedLot->ParkingLotName,
+					ClickedLot->GetActorLocation().X, ClickedLot->GetActorLocation().Y, ClickedLot->GetActorLocation().Z,
+					ClickedLot->NearestEdgeId);
+
+				if (PF)
 				{
-					if (URoadNetworkSubsystem* RS = World->GetSubsystem<URoadNetworkSubsystem>())
-					{
-						int32 NearestNode = RS->FindNearestGraphNode(ClickedLot->GetActorLocation());
-						if (NearestNode != INDEX_NONE)
-						{
-							PF->NavigateToNode(NearestNode);
-							SelectedDestinationNodeId = NearestNode;
-							UE_LOG(LogTemp, Log, TEXT("MapWidget: Navigate to ParkingLot '%s' → Node %d"),
-								*Cast<AParkingLotActor>(ClickedLot)->ParkingLotName, NearestNode);
-						}
-					}
+					PF->NavigateToParkingLot(ClickedLot);
+					SelectedDestinationActor = ClickedLot;
+					SelectedDestinationWorldPos = ClickedLot->GetActorLocation();
 				}
 				return FReply::Handled();
 			}
 
-			// 點節點 / Click node
-			int32 ClickedNodeId = FindNodeNearMapPos(LocalPos, MapOrigin, MapSize, 18.0f);
-			if (ClickedNodeId != INDEX_NONE && PF)
+			// 路邊停車偵測 / Roadside spot click
+			int32 ClickedSpotIdx = INDEX_NONE;
+			ARoadsideParkingActor* ClickedRS = FindRoadsideSpotNearMapPos(
+				LocalPos, MapOrigin, MapSize, 22.0f, ClickedSpotIdx);
+			if (ClickedRS)
 			{
-				PF->NavigateToNode(ClickedNodeId);
-				SelectedDestinationNodeId = ClickedNodeId;
+				const FVector SpotWorldPos = ClickedRS->GetSpotWorldPosition(ClickedSpotIdx);
+				UE_LOG(LogTemp, Warning, TEXT("[MAP-CLICK] Clicked Roadside '%s' spot=%d NearestEdge=%d bIsLeftSide=%s worldPos=(%.0f,%.0f,%.0f)"),
+					*ClickedRS->ZoneName, ClickedSpotIdx, ClickedRS->NearestEdgeId,
+					ClickedRS->bIsLeftSide ? TEXT("true") : TEXT("false"),
+					SpotWorldPos.X, SpotWorldPos.Y, SpotWorldPos.Z);
+
+				if (PF)
+				{
+					PF->NavigateToRoadside(ClickedRS, SpotWorldPos, ClickedRS->bIsLeftSide, ClickedSpotIdx);
+					SelectedDestinationActor = ClickedRS;
+					SelectedDestinationWorldPos = SpotWorldPos;
+				}
 				return FReply::Handled();
 			}
+
+			// 沒點到任何停車設施 / Didn't hit any parking facility
+			UE_LOG(LogTemp, Warning, TEXT("[MAP-CLICK] No parking lot or roadside zone at click pos (%.0f,%.0f)"),
+				LocalPos.X, LocalPos.Y);
 		}
 
 		// 點到地圖空白處不做任何事（不取消選取、不關地圖）
@@ -558,20 +620,16 @@ void UDrivingMapWidget::SelectVehicle(AActor* Vehicle)
 	SelectedVehiclePtr = Vehicle;
 	bFreeCameraMode = false;
 
-	// 記錄目的地節點 / Record destination node
+	// 記錄目的地 / Record destination
 	URoadPathFollowerComponent* PF = Vehicle->FindComponentByClass<URoadPathFollowerComponent>();
 	if (PF)
 	{
-		FVector DestLoc = PF->GetDestinationLocation();
-		if (!DestLoc.IsNearlyZero())
+		SelectedDestinationWorldPos = PF->GetDestinationLocation();
+		// 目的地 actor 無法從 PF 直接取得，僅記錄位置
+		// Destination actor can't be retrieved from PF directly, just record position
+		if (!SelectedDestinationWorldPos.IsNearlyZero())
 		{
-			if (UWorld* World = GetWorld())
-			{
-				if (URoadNetworkSubsystem* RS = World->GetSubsystem<URoadNetworkSubsystem>())
-				{
-					SelectedDestinationNodeId = RS->FindNearestGraphNode(DestLoc);
-				}
-			}
+			SelectedDestinationActor = nullptr; // 已有位置就足夠畫標記 / Position is enough for marker
 		}
 	}
 
@@ -618,7 +676,8 @@ void UDrivingMapWidget::DeselectVehicle()
 	}
 
 	SelectedVehiclePtr = nullptr;
-	SelectedDestinationNodeId = INDEX_NONE;
+	SelectedDestinationActor = nullptr;
+	SelectedDestinationWorldPos = FVector::ZeroVector;
 	bFreeCameraMode = true;
 
 	// 切回自由相機 / Switch back to free camera
@@ -666,25 +725,40 @@ void UDrivingMapWidget::BuildNodeCache()
 	const TArray<FRoadGraphNode>& GraphNodes = RoadSub->GetGraphNodes();
 	if (GraphNodes.Num() == 0) return;
 
-	CachedNodes.Reset();
-	for (const FRoadGraphNode& Node : GraphNodes)
-	{
-		FMapNodeCache& Cache = CachedNodes.AddDefaulted_GetRef();
-		Cache.NodeId = Node.NodeId;
-		Cache.WorldLocation = Node.WorldLocation;
-	}
-
-	// 用節點算世界邊界（永遠算，確保車輛箭頭位置正確）
+	// 用 graph nodes 計算世界邊界（確保車輛箭頭、停車標示位置正確）
+	// Compute world bounds from graph nodes (for map coordinate transform)
 	{
 		FVector2D Min(TNumericLimits<double>::Max(), TNumericLimits<double>::Max());
 		FVector2D Max(TNumericLimits<double>::Lowest(), TNumericLimits<double>::Lowest());
-		for (const FMapNodeCache& Node : CachedNodes)
+		for (const FRoadGraphNode& Node : GraphNodes)
 		{
 			Min.X = FMath::Min(Min.X, Node.WorldLocation.X);
 			Min.Y = FMath::Min(Min.Y, Node.WorldLocation.Y);
 			Max.X = FMath::Max(Max.X, Node.WorldLocation.X);
 			Max.Y = FMath::Max(Max.Y, Node.WorldLocation.Y);
 		}
+
+		// 也把停車場和路邊停車位置納入 bounds 計算
+		// Also include parking actors in bounds calculation
+		for (TActorIterator<AParkingLotActor> It(World); It; ++It)
+		{
+			if (!*It) continue;
+			const FVector& Loc = (*It)->GetActorLocation();
+			Min.X = FMath::Min(Min.X, Loc.X);
+			Min.Y = FMath::Min(Min.Y, Loc.Y);
+			Max.X = FMath::Max(Max.X, Loc.X);
+			Max.Y = FMath::Max(Max.Y, Loc.Y);
+		}
+		for (TActorIterator<ARoadsideParkingActor> It(World); It; ++It)
+		{
+			if (!*It) continue;
+			const FVector& Loc = (*It)->GetActorLocation();
+			Min.X = FMath::Min(Min.X, Loc.X);
+			Min.Y = FMath::Min(Min.Y, Loc.Y);
+			Max.X = FMath::Max(Max.X, Loc.X);
+			Max.Y = FMath::Max(Max.Y, Loc.Y);
+		}
+
 		FVector2D Range = Max - Min;
 		FVector2D Margin = Range * static_cast<double>(MapBoundsMarginRatio);
 		WorldBoundsMin = Min - Margin;
@@ -891,32 +965,12 @@ AActor* UDrivingMapWidget::FindVehicleNearMapPos(
 	return BestActor;
 }
 
-int32 UDrivingMapWidget::FindNodeNearMapPos(
+AParkingLotActor* UDrivingMapWidget::FindParkingLotNearMapPos(
 	const FVector2D& LocalPos, const FVector2D& MapOrigin,
 	const FVector2D& MapSize, float Radius) const
 {
 	float BestDistSq = Radius * Radius;
-	int32 BestNodeId = INDEX_NONE;
-
-	for (const FMapNodeCache& Node : CachedNodes)
-	{
-		FVector2D MapPos = WorldToMap(Node.WorldLocation, MapOrigin, MapSize);
-		float DistSq = static_cast<float>(FVector2D::DistSquared(LocalPos, MapPos));
-		if (DistSq < BestDistSq)
-		{
-			BestDistSq = DistSq;
-			BestNodeId = Node.NodeId;
-		}
-	}
-	return BestNodeId;
-}
-
-AActor* UDrivingMapWidget::FindParkingLotNearMapPos(
-	const FVector2D& LocalPos, const FVector2D& MapOrigin,
-	const FVector2D& MapSize, float Radius) const
-{
-	float BestDistSq = Radius * Radius;
-	AActor* BestLot = nullptr;
+	AParkingLotActor* BestLot = nullptr;
 
 	UWorld* World = GetWorld();
 	if (!World) return nullptr;
@@ -935,6 +989,39 @@ AActor* UDrivingMapWidget::FindParkingLotNearMapPos(
 		}
 	}
 	return BestLot;
+}
+
+ARoadsideParkingActor* UDrivingMapWidget::FindRoadsideSpotNearMapPos(
+	const FVector2D& LocalPos, const FVector2D& MapOrigin,
+	const FVector2D& MapSize, float Radius, int32& OutSpotIndex) const
+{
+	UWorld* World = GetWorld();
+	if (!World) return nullptr;
+
+	float BestDistSq = Radius * Radius;
+	ARoadsideParkingActor* BestActor = nullptr;
+	int32 BestSpot = INDEX_NONE;
+
+	for (TActorIterator<ARoadsideParkingActor> It(World); It; ++It)
+	{
+		ARoadsideParkingActor* RSP = *It;
+		if (!RSP) continue;
+
+		for (int32 s = 0; s < RSP->GetSpotCount(); ++s)
+		{
+			FVector2D SpotMapPos = WorldToMap(RSP->GetSpotWorldPosition(s), MapOrigin, MapSize);
+			float DistSq = static_cast<float>(FVector2D::DistSquared(LocalPos, SpotMapPos));
+			if (DistSq < BestDistSq)
+			{
+				BestDistSq = DistSq;
+				BestActor = RSP;
+				BestSpot = s;
+			}
+		}
+	}
+
+	OutSpotIndex = BestSpot;
+	return BestActor;
 }
 
 // ================================================================
