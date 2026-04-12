@@ -2270,6 +2270,64 @@ void URoadPathFollowerComponent::TickComponent(
 		bIsUTurnCurve = Seg.bUTurnAtEnd;
 		if (bIsUTurnCurve)
 		{
+			// P0 = 車實際位置（不變）
+			// P1 = Seg EndDist 取樣（不變）
+			FVector JunctionPosP1, JunctionDirP1, JunctionRightP1;
+			SampleSplineAtDist(Seg, Seg.EndDist, NextSegLaneOffset,
+				JunctionPosP1, JunctionDirP1, JunctionRightP1);
+			JCurveP1 = JunctionPosP1;
+
+
+			FVector JunctionPosP0, JunctionDirP0, JunctionRightP0;
+			SampleSplineAtDist(Seg, Seg.EndDist, CurrentLateralOffset,
+				JunctionPosP0, JunctionDirP0, JunctionRightP0);
+
+			const float LaneDist = FVector::Dist2D(JCurveP0, JCurveP1);
+			const float HalfDist = LaneDist * 0.5f;
+
+			// ── 核心修正：R 不依賴 HalfDist，直接用 UTurnRadius ──
+			// 當 P0≈P1 時，HalfDist≈0，幾何靠 UTurnRadius 完全主導
+			UTurnArcRadius = UTurnRadius; // 不做 max(HalfDist, UTurnRadius)
+
+			const FVector OwnerFwd2D = FVector(
+				Owner->GetActorForwardVector().X,
+				Owner->GetActorForwardVector().Y, 0.0f).GetSafeNormal();
+
+			// SideSign：左轉掉頭往左推，右轉掉頭往右推
+			const float SideSign = (CurrentTurnSignal == ETurnSignal::Left) ? -1.0f : 1.0f;
+
+			// 側向方向 = 車朝向旋轉 90°
+			const FVector SideDir = FVector(-OwnerFwd2D.Y, OwnerFwd2D.X, 0.0f) * SideSign;
+
+			// 圓心 = P0 往側邊推 UTurnRadius
+			// 這樣弧從 P0 出發，繞出去 UTurnRadius 的距離，再回到 P1（≈P0）
+			UTurnCenter = FVector(
+				JCurveP0.X + SideDir.X * UTurnRadius,
+				JCurveP0.Y + SideDir.Y * UTurnRadius,
+				0.0f);
+
+			// U 軸 = Center→P0
+			const FVector CToP0 = FVector(
+				JCurveP0.X - UTurnCenter.X,
+				JCurveP0.Y - UTurnCenter.Y, 0.0f);
+			UTurnAxisU = CToP0.SizeSquared() > 1.0f
+				? CToP0.GetSafeNormal()
+				: -SideDir;
+
+			// V 軸 = U 旋轉 90° 朝車前方
+			const FVector CandidateV = FVector(-UTurnAxisU.Y, UTurnAxisU.X, 0.0f);
+			UTurnAxisV = (FVector::DotProduct(CandidateV, OwnerFwd2D) >= 0.0f)
+				? CandidateV : -CandidateV;
+
+			UTurnArcZ0 = JCurveP0.Z;
+			UTurnArcZ1 = JCurveP1.Z;
+
+			// 弧長 = π × R（標準半圓周長）× 速度感調整
+			JCurveLength = PI * UTurnArcRadius * UTurnTangentScale;
+		}
+		/*
+		if (bIsUTurnCurve)
+		{
 			// U 型掉頭：P0 和 P1 都在同一個 junction node（Seg.EndDist），
 			// 只差橫向偏移（當前車道 vs 下一段車道）。
 			// 半圓弧從 P0 繞到 P1，半徑 R = max(|P0-P1|/2, UTurnRadius)。
@@ -2361,7 +2419,7 @@ void URoadPathFollowerComponent::TickComponent(
 				ArcAtT0.X, ArcAtT0.Y, ArcAtT1.X, ArcAtT1.Y,
 				CurrentSegmentIndex, Seg.EndDist,
 				Seg.Spline ? *Seg.Spline->GetOwner()->GetName() : TEXT("null"));
-		}
+		}*/
 		else
 		{
 			JCurveP1 = NextPos;
