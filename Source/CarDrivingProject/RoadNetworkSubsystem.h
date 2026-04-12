@@ -189,10 +189,10 @@ private:
 	void BuildGraphNodes();
 
 	/// <summary>
-	/// 掃描場景所有 ParkingLotActor / RoadsideParkingActor，
+	/// 掃描場景所有 ParkingLotActor，
 	/// 用 TargetRoadActorLabel 配對 RoadActor，再用 Arrow 前方方向選最佳 Edge，
 	/// 把每個 Spot 對應的 EdgeId 寫回停車場 Actor。
-	/// Scan all ParkingLotActor / RoadsideParkingActor, match by TargetRoadActorLabel,
+	/// Scan all ParkingLotActor, match by TargetRoadActorLabel,
 	/// pick best edge using Arrow forward direction, assign EdgeId per spot.
 	/// </summary>
 	void BindParkingActorsToEdges();

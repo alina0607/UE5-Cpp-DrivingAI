@@ -4,7 +4,6 @@
 #include "RoadNetworkSubsystem.h"
 #include "RoadTypes.h"
 #include "ParkingLotActor.h"
-#include "RoadsideParkingActor.h"
 #include "Components/SplineComponent.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -30,8 +29,8 @@ void ATrafficManager::BeginPlay()
 }
 
 // ============================================================================
-//  CollectParkingActors — 收集場景中所有停車場和路邊停車
-//  Collect all parking lot and roadside parking actors from the level.
+//  CollectParkingActors — 收集場景中所有停車場
+//  Collect all parking lot actors from the level.
 // ============================================================================
 void ATrafficManager::CollectParkingActors()
 {
@@ -39,26 +38,20 @@ void ATrafficManager::CollectParkingActors()
 	if (!World) return;
 
 	AllParkingLots.Empty();
-	AllRoadsideParking.Empty();
 
 	for (TActorIterator<AParkingLotActor> It(World); It; ++It)
 	{
 		AllParkingLots.Add(*It);
 	}
 
-	for (TActorIterator<ARoadsideParkingActor> It(World); It; ++It)
-	{
-		AllRoadsideParking.Add(*It);
-	}
-
 	UE_LOG(LogTemp, Warning,
-		TEXT("TrafficManager: Found %d ParkingLots, %d RoadsideParking"),
-		AllParkingLots.Num(), AllRoadsideParking.Num());
+		TEXT("TrafficManager: Found %d ParkingLots"),
+		AllParkingLots.Num());
 }
 
 // ============================================================================
-//  SpawnAllVehicles — 從停車場/路邊停車位置生成車輛
-//  Spawn vehicles from parking lots and roadside parking zones.
+//  SpawnAllVehicles — 從停車場位置生成車輛
+//  Spawn vehicles from parking lots.
 // ============================================================================
 void ATrafficManager::SpawnAllVehicles()
 {
@@ -74,17 +67,11 @@ void ATrafficManager::SpawnAllVehicles()
 		if (Lot) TotalParkingSpots += Lot->SpotCount;
 	}
 
-	int32 TotalRoadsideSpots = 0;
-	for (ARoadsideParkingActor* RS : AllRoadsideParking)
-	{
-		if (RS) TotalRoadsideSpots += RS->GetSpotCount();
-	}
-
-	const int32 TotalSpawnPoints = TotalParkingSpots + TotalRoadsideSpots;
+	const int32 TotalSpawnPoints = TotalParkingSpots;
 	if (TotalSpawnPoints == 0)
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("TrafficManager: No parking lots or roadside zones — cannot spawn vehicles"));
+			TEXT("TrafficManager: No parking lots — cannot spawn vehicles"));
 		return;
 	}
 
@@ -110,21 +97,6 @@ void ATrafficManager::SpawnAllVehicles()
 			FSpawnPoint SP;
 			SP.Position = Lot->GetSpotWorldPosition(i) + FVector(0, 0, 30.0f);
 			SP.Rotation = Lot->GetSpotWorldForward(i).Rotation();
-			SpawnPoints.Add(SP);
-		}
-	}
-
-	// 路邊停車格位置 / Roadside spot positions
-	for (ARoadsideParkingActor* RS : AllRoadsideParking)
-	{
-		if (!RS) continue;
-		for (int32 i = 0; i < RS->GetSpotCount(); ++i)
-		{
-			FSpawnPoint SP;
-			SP.Position = RS->GetSpotWorldPosition(i) + FVector(0, 0, 30.0f);
-			// 用 Arrow 的前方方向作為朝向
-			// Use Arrow's forward direction as facing direction
-			SP.Rotation = RS->GetSpotWorldForward(i).Rotation();
 			SpawnPoints.Add(SP);
 		}
 	}
@@ -215,8 +187,8 @@ void ATrafficManager::SpawnAllVehicles()
 }
 
 // ============================================================================
-//  AssignRandomDestination — 隨機選停車場或路邊停車作為目的地
-//  Randomly pick a parking lot or roadside zone as destination.
+//  AssignRandomDestination — 隨機選停車場作為目的地
+//  Randomly pick a parking lot as destination.
 // ============================================================================
 void ATrafficManager::AssignRandomDestination(ADrivingVehiclePawn* Vehicle)
 {
@@ -226,82 +198,40 @@ void ATrafficManager::AssignRandomDestination(ADrivingVehiclePawn* Vehicle)
 	if (!PF) return;
 
 	const int32 TotalLots = AllParkingLots.Num();
-	const int32 TotalRoadside = AllRoadsideParking.Num();
-	const int32 TotalOptions = TotalLots + TotalRoadside;
 
-	if (TotalOptions == 0)
+	if (TotalLots == 0)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[TRAFFIC] No parking destinations available"));
 		return;
 	}
 
-	UE_LOG(LogTemp, Warning, TEXT("[TRAFFIC] AssignRandomDestination — %d lots, %d roadside, vehicle at (%.0f,%.0f,%.0f)"),
-		TotalLots, TotalRoadside, Vehicle->GetActorLocation().X, Vehicle->GetActorLocation().Y, Vehicle->GetActorLocation().Z);
+	UE_LOG(LogTemp, Warning, TEXT("[TRAFFIC] AssignRandomDestination — %d lots, vehicle at (%.0f,%.0f,%.0f)"),
+		TotalLots, Vehicle->GetActorLocation().X, Vehicle->GetActorLocation().Y, Vehicle->GetActorLocation().Z);
 
-	// 隨機選一個目的地（停車場或路邊停車）
-	// Random destination (parking lot or roadside)
-	const int32 RandIdx = FMath::RandRange(0, TotalOptions - 1);
-
-	if (RandIdx < TotalLots)
+	// 隨機選一個停車場 / Pick random parking lot
+	const int32 RandIdx = FMath::RandRange(0, TotalLots - 1);
+	AParkingLotActor* Lot = AllParkingLots[RandIdx];
+	if (Lot)
 	{
-		// 停車場目的地 / Parking lot destination
-		AParkingLotActor* Lot = AllParkingLots[RandIdx];
-		if (Lot)
+		const int32 AvailableSpot = Lot->FindAvailableSpot();
+		if (AvailableSpot != INDEX_NONE)
 		{
-			const int32 AvailableSpot = Lot->FindAvailableSpot();
-			if (AvailableSpot != INDEX_NONE)
-			{
-				UE_LOG(LogTemp, Warning,
-					TEXT("TrafficManager: Vehicle → ParkingLot '%s' spot=%d"),
-					*Lot->ParkingLotName, AvailableSpot);
-				PF->NavigateToParkingLot(Lot, AvailableSpot);
-				return;
-			}
-		}
-	}
-
-	// 路邊停車目的地（或停車場滿了的 fallback）
-	// Roadside destination (or fallback if lot was full)
-	if (TotalRoadside > 0)
-	{
-		const int32 RSIdx = FMath::RandRange(0, TotalRoadside - 1);
-		ARoadsideParkingActor* RS = AllRoadsideParking[RSIdx];
-		if (RS)
-		{
-			const int32 SpotIdx = RS->FindAvailableSpot();
-			if (SpotIdx != INDEX_NONE)
-			{
-				const FVector SpotPos = RS->GetSpotWorldPosition(SpotIdx);
-				UE_LOG(LogTemp, Warning,
-					TEXT("[TRAFFIC] Vehicle → Roadside '%s' spot=%d pos=(%.0f,%.0f,%.0f)"),
-					*RS->ZoneName, SpotIdx, SpotPos.X, SpotPos.Y, SpotPos.Z);
-				PF->NavigateToRoadside(RS, SpotPos, RS->bIsLeftSide, SpotIdx);
-				return;
-			}
-		}
-	}
-
-	// 再試停車場 / Retry parking lots
-	for (AParkingLotActor* Lot : AllParkingLots)
-	{
-		if (!Lot) continue;
-		const int32 Spot = Lot->FindAvailableSpot();
-		if (Spot != INDEX_NONE)
-		{
-			PF->NavigateToParkingLot(Lot, Spot);
+			UE_LOG(LogTemp, Warning,
+				TEXT("TrafficManager: Vehicle → ParkingLot '%s' spot=%d"),
+				*Lot->ParkingLotName, AvailableSpot);
+			PF->NavigateToParkingLot(Lot, AvailableSpot);
 			return;
 		}
 	}
 
-	// 再試路邊停車 / Retry roadside
-	for (ARoadsideParkingActor* RS : AllRoadsideParking)
+	// 再試其它停車場 / Retry other parking lots
+	for (AParkingLotActor* OtherLot : AllParkingLots)
 	{
-		if (!RS) continue;
-		const int32 SpotIdx = RS->FindAvailableSpot();
-		if (SpotIdx != INDEX_NONE)
+		if (!OtherLot) continue;
+		const int32 Spot = OtherLot->FindAvailableSpot();
+		if (Spot != INDEX_NONE)
 		{
-			const FVector Pos = RS->GetSpotWorldPosition(SpotIdx);
-			PF->NavigateToRoadside(RS, Pos, RS->bIsLeftSide, SpotIdx);
+			PF->NavigateToParkingLot(OtherLot, Spot);
 			return;
 		}
 	}

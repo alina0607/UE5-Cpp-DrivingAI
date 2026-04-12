@@ -15,7 +15,6 @@
 #include "Algo/Reverse.h"
 #include "EngineUtils.h"
 #include "ParkingLotActor.h"
-#include "RoadsideParkingActor.h"
 
 /// <summary>
 /// Initialization happens when the world creates this subsystem.
@@ -847,24 +846,6 @@ void URoadNetworkSubsystem::BindParkingActorsToEdges()
             BestProjPt.X, BestProjPt.Y, BestProjPt.Z);
     }
 
-    // ---- RoadsideParking Actors ----
-    for (TActorIterator<ARoadsideParkingActor> It(World); It; ++It)
-    {
-        ARoadsideParkingActor* RS = *It;
-        if (!RS) continue;
-
-        const int32 N = RS->GetSpotCount();
-        TArray<FVector> Positions, Forwards;
-        Positions.Reserve(N); Forwards.Reserve(N);
-        for (int32 i = 0; i < N; ++i)
-        {
-            Positions.Add(RS->GetSpotWorldPosition(i));
-            Forwards.Add(RS->GetSpotWorldForward(i));
-        }
-
-        AssignSpotsForActor(RS, RS->TargetRoadActorLabel, Positions, Forwards,
-            [RS](int32 SpotIndex, int32 EdgeId) { RS->AssignSpotEdgeId(SpotIndex, EdgeId); });
-    }
 }
 
 

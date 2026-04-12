@@ -6,7 +6,6 @@
 
 class ADrivingVehiclePawn;
 class AParkingLotActor;
-class ARoadsideParkingActor;
 
 /// 車輛生成配置 — 每種車的 BP 類別、數量、速度範圍
 /// Vehicle spawn config — BP class, count, and speed range per type
@@ -32,10 +31,10 @@ struct FVehicleSpawnConfig
 	float MaxSpeed = 2000.0f;
 };
 
-/// 交通管理器 — 車輛從停車場/路邊停車位置出發，目的地也是停車場或路邊停車
+/// 交通管理器 — 車輛從停車場出發，目的地也是停車場
 ///
-/// Traffic manager — vehicles spawn from parking lots/roadside zones,
-/// destinations are also parking lots or roadside zones.
+/// Traffic manager — vehicles spawn from parking lots,
+/// destinations are also parking lots.
 UCLASS()
 class CARDRIVINGPROJECT_API ATrafficManager : public AActor
 {
@@ -82,17 +81,13 @@ private:
 	UPROPERTY()
 	TArray<AParkingLotActor*> AllParkingLots;
 
-	/// 場景中所有路邊停車（BeginPlay 收集）/ All roadside parking in level (collected at BeginPlay)
-	UPROPERTY()
-	TArray<ARoadsideParkingActor*> AllRoadsideParking;
-
-	/// 收集場景中所有停車場和路邊停車 / Collect all parking actors from level
+	/// 收集場景中所有停車場 / Collect all parking actors from level
 	void CollectParkingActors();
 
 	/// 生成所有車輛 / Spawn all vehicles
 	void SpawnAllVehicles();
 
-	/// 為指定車輛分配隨機目的地（停車場或路邊停車）
+	/// 為指定車輛分配隨機目的地（停車場）
 	/// Assign random parking destination to a vehicle
 	void AssignRandomDestination(ADrivingVehiclePawn* Vehicle);
 

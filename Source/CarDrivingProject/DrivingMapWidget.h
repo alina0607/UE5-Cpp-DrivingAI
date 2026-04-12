@@ -7,7 +7,6 @@
 
 class ACameraActor;
 class AParkingLotActor;
-class ARoadsideParkingActor;
 class URoadNetworkSubsystem;
 class URoadPathFollowerComponent;
 class USpringArmComponent;
@@ -109,10 +108,6 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Colors")
 	FLinearColor ParkingLotColor = FLinearColor(0.2f, 0.9f, 0.9f, 1.0f);
 
-	/// 路邊停車範圍在地圖上的標示顏色 / Roadside parking zone color on map
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Colors")
-	FLinearColor RoadsideParkingColor = FLinearColor(0.3f, 0.8f, 0.3f, 0.8f);
-
 	/// 停車場名稱字體大小 / Parking lot name font size
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text", meta = (ClampMin = "6", ClampMax = "30"))
 	int32 ParkingLotFontSize = 12;
@@ -121,25 +116,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text")
 	FLinearColor ParkingLotTextColor = FLinearColor(0.2f, 0.9f, 0.9f, 1.0f);
 
-	/// 路邊停車名稱字體大小 / Roadside parking name font size
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text", meta = (ClampMin = "6", ClampMax = "30"))
-	int32 RoadsideParkingFontSize = 11;
-
-	/// 路邊停車名稱文字顏色 / Roadside parking name text color
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text")
-	FLinearColor RoadsideParkingTextColor = FLinearColor(0.3f, 0.8f, 0.3f, 1.0f);
-
-	/// 是否在地圖上顯示停車場/路邊停車名稱 / Show parking names on map?
+	/// 是否在地圖上顯示停車場名稱 / Show parking names on map?
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text")
 	bool bShowParkingNames = true;
 
 	/// 停車場名稱文字偏移（相對於標記點，像素）/ Parking lot name text offset from marker (px)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text")
 	FVector2D ParkingLotNameOffset = FVector2D(8.0, -6.0);
-
-	/// 路邊停車名稱文字偏移 / Roadside parking name text offset (px)
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text")
-	FVector2D RoadsideParkingNameOffset = FVector2D(5.0, -14.0);
 
 	// ================================================================
 	//  右側資訊面板 / Right Info Panel
@@ -226,7 +209,7 @@ private:
 	UPROPERTY()
 	TWeakObjectPtr<AActor> SelectedVehiclePtr;
 
-	/// 目的地 Actor（停車場或路邊停車）/ Destination actor (parking lot or roadside)
+	/// 目的地 Actor（停車場）/ Destination actor (parking lot)
 	UPROPERTY()
 	TWeakObjectPtr<AActor> SelectedDestinationActor;
 
@@ -275,11 +258,6 @@ private:
 	/// 點擊停車場偵測 — 回傳最近的停車場 Actor / Find parking lot near click
 	AParkingLotActor* FindParkingLotNearMapPos(const FVector2D& LocalPos, const FVector2D& MapOrigin,
 		const FVector2D& MapSize, float Radius) const;
-
-	/// 點擊路邊停車偵測 — 回傳最近的 Actor + 停車格 index
-	/// Find roadside spot near click, returns actor and spot index
-	ARoadsideParkingActor* FindRoadsideSpotNearMapPos(const FVector2D& LocalPos, const FVector2D& MapOrigin,
-		const FVector2D& MapSize, float Radius, int32& OutSpotIndex) const;
 
 	// ---- 攝影機 ----
 

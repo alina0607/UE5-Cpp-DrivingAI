@@ -7,7 +7,6 @@
 #include "RoadPathFollowerComponent.generated.h"
 
 class AParkingLotActor;
-class ARoadsideParkingActor;
 class URoadNetworkSubsystem;
 class USplineComponent;
 
@@ -110,7 +109,6 @@ enum class EDestinationType : uint8
 {
 	None           UMETA(DisplayName = "None"),
 	ParkingLot     UMETA(DisplayName = "Parking Lot"),
-	RoadsideParking UMETA(DisplayName = "Roadside Parking"),
 };
 
 /// <summary>
@@ -270,8 +268,8 @@ public:
 
 	/// U 型掉頭曲線的寬度（cm）— 越大 U 型越寬越自然
 	/// U-turn curve width (cm) — larger = wider, smoother U-shape
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|U-Turn", meta = (ClampMin = "500"))
-	float UTurnRadius = 5000.0f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|U-Turn", meta = (ClampMin = "10"))
+	float UTurnRadius = 100.0f;
 
 	/// U 型掉頭時的速度比例（相對 MaxSpeed）— 與 JunctionMinSpeedRatio 類似
 	/// U-turn speed ratio (relative to MaxSpeed) — similar to JunctionMinSpeedRatio
@@ -319,12 +317,23 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Parking", meta = (ClampMin = "0.3", ClampMax = "3.0"))
 	float ParkingCurveTangentScale = 1.0f;
 
+	/// 停車場進出用的等腰三角形底邊長度 n（cm）
+	/// 直角點=Arrow 在邊上的投影點，高=投影點→Arrow 位置，
+	/// 進入用斜邊 1：從 (ProjPt - n 沿邊) → AnchorPos，
+	/// 離開用斜邊 2：從 AnchorPos → (ProjPt + n 沿邊)
+	/// Isosceles-triangle base length n (cm) used for parking lot entry/exit curves.
+	/// Right-angle vertex = arrow projection on edge; height = projection → arrow pos.
+	/// Entry hypotenuse1 runs from (ProjPt - n along edge) → AnchorPos.
+	/// Exit  hypotenuse2 runs from AnchorPos → (ProjPt + n along edge).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Parking", meta = (ClampMin = "50"))
+	float ParkingTriangleBaseLength = 1000.0f;
+
 	// ---- 出發曲線 / Departure Curve ----
 
 	/// 出發曲線切線強度 — 控制出庫弧度（越大越圓滑、越繞）
 	/// Departure curve tangent scale — controls exit arc roundness
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Parking", meta = (ClampMin = "0.1", ClampMax = "3.0"))
-	float DepartureCurveTangentScale = 1.0f;
+	float DepartureCurveTangentScale = 3.0f;
 
 	/// 出發曲線起點切線強度倍率（相對 DistToRoad）
 	/// 越大車頭方向保持越久，越小越快轉向道路
@@ -433,8 +442,8 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Road Path|Navigation")
 	void NavigateToLocation(const FVector& Destination);
 
-	/// 導航到指定 Graph Node ID（從車目前位置出發）— 內部用，外部請用 NavigateToParkingLot / NavigateToRoadside
-	/// Navigate to a specific graph node — internal use, prefer NavigateToParkingLot/NavigateToRoadside
+	/// 導航到指定 Graph Node ID（從車目前位置出發）— 內部用，外部請用 NavigateToParkingLot
+	/// Navigate to a specific graph node — internal use, prefer NavigateToParkingLot
 	UFUNCTION(BlueprintCallable, Category = "Road Path|Navigation")
 	void NavigateToNode(int32 TargetNodeId);
 
@@ -442,11 +451,6 @@ public:
 	/// Navigate to parking lot and park in specified spot (-1 = auto-find)
 	UFUNCTION(BlueprintCallable, Category = "Road Path|Navigation")
 	void NavigateToParkingLot(AParkingLotActor* ParkingLot, int32 SpotIndex = -1);
-
-	/// 導航到路邊停車位置（SpotIndex = 佔用哪個停車格，-1 = 不佔用）
-	/// Navigate to roadside parking position (SpotIndex = which spot to occupy, -1 = none)
-	UFUNCTION(BlueprintCallable, Category = "Road Path|Navigation")
-	void NavigateToRoadside(ARoadsideParkingActor* RoadsideActor, const FVector& Position, bool bLeftSide, int32 SpotIndex = -1);
 
 	/// 取得目的地類型 / Get destination type
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path|Navigation")
@@ -618,6 +622,15 @@ private:
 	/// Whether following a U-turn curve (uses UTurn params instead of Junction params)
 	bool bIsUTurnCurve = false;
 
+	// U-turn 半圓弧參數（bIsUTurnCurve=true 時使用，替代 Hermite）
+	// Semicircle arc params (used instead of Hermite when bIsUTurnCurve=true)
+	FVector UTurnCenter = FVector::ZeroVector;   // 半圓圓心
+	float  UTurnArcRadius = 0.0f;                // 半圓半徑
+	FVector UTurnAxisU = FVector::ZeroVector;     // 圓心→P0 方向（0° 軸）
+	FVector UTurnAxisV = FVector::ZeroVector;     // 掃掠方向（90° 軸，≈車前方）
+	float  UTurnArcZ0 = 0.0f;                    // 起始 Z 高度
+	float  UTurnArcZ1 = 0.0f;                    // 結束 Z 高度
+
 	/// 剛離開路口曲線（同一幀用高 interp speed 消除銜接停頓）
 	/// Just exited junction curve (use high interp speed same frame for seamless transition)
 	bool bJustExitedJunctionCurve = false;
@@ -653,13 +666,6 @@ private:
 	TWeakObjectPtr<AParkingLotActor> TargetParkingLot;
 	int32 TargetParkingSpotIndex = INDEX_NONE;
 
-	/// 目標路邊停車 / Target roadside parking
-	UPROPERTY()
-	TWeakObjectPtr<ARoadsideParkingActor> TargetRoadsideParking;
-	int32 TargetRoadsideSpotIndex = INDEX_NONE;
-	FVector TargetRoadsidePosition = FVector::ZeroVector;
-	bool bTargetRoadsideLeftSide = false;
-
 	/// 停車時的目標橫向偏移（cm）— Step 0.5 計算，Step 4 使用
 	/// Parking target lateral offset (cm) — computed in Step 0.5, used in Step 4
 	float ParkingTargetOffset = 0.0f;
@@ -685,10 +691,6 @@ private:
 	FVector DepCurveT1 = FVector::ZeroVector;
 	float DepCurveLength = 0.0f;
 	float DepCurveProgress = 0.0f;
-
-	/// 路邊停車的 Arrow 前方方向（用於最終對齊）
-	/// Roadside spot Arrow forward (for final alignment at path end)
-	FVector RoadsideSpotForward = FVector::ZeroVector;
 
 	/// 內部共用的導航啟動邏輯（A* + BuildPath + 初始化）
 	/// Internal shared navigation start logic (A* + BuildPath + init)
@@ -758,9 +760,9 @@ private:
 	/// segment's TurnAtEnd so it connects cleanly into the bound edge.
 	void AppendBoundEdgeFinalSegment(const struct FRoadGraphEdge& BoundEdge, bool bForward, float ProjDistAbs);
 
-	/// 釋放上一個目的地佔用的停車格（停車場 / 路邊），並清空 Target* 狀態
+	/// 釋放上一個目的地佔用的停車格，並清空 Target* 狀態
 	/// 在開始新的導航前呼叫，避免洩漏佔位
-	/// Release any parking spot held by the previous destination (lot or roadside) and clear
+	/// Release any parking spot held by the previous destination and clear
 	/// Target* state. Call before starting a new navigation to avoid leaking occupancy.
 	void ReleasePreviousDestinationSpot();
 
@@ -802,5 +804,6 @@ private:
 	/// the far end node.
 	/// </summary>
 	void PrependStartBoundEdgeSegment(
-		const struct FRoadGraphEdge& BoundEdge, bool bForward, float ProjDistAbs);
+		const struct FRoadGraphEdge& BoundEdge, bool bForward, float ProjDistAbs,
+		bool bTriangleExitOffset = false);
 };

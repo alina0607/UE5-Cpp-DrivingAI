@@ -4,7 +4,6 @@
 #include "RoadWorldSettings.h"
 #include "CollisionChannels.h"
 #include "ParkingLotActor.h"
-#include "RoadsideParkingActor.h"
 #include "Components/SplineComponent.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -80,7 +79,6 @@ void URoadPathFollowerComponent::ResetFollowingState()
 	ParkCurveProgress = 0.0f;
 	bOnDepartureCurve = false;
 	DepCurveProgress = 0.0f;
-	RoadsideSpotForward = FVector::ZeroVector;
 	JCurveProgress = 0.0f;
 	ParkingTargetOffset = 0.0f;
 	CurrentSpeed = 0.0f;
@@ -119,23 +117,10 @@ void URoadPathFollowerComponent::ReleasePreviousDestinationSpot()
 			*TargetParkingLot->ParkingLotName, TargetParkingSpotIndex);
 		TargetParkingLot->ReleaseSpot(TargetParkingSpotIndex);
 	}
-	else if (DestinationType == EDestinationType::RoadsideParking
-		&& TargetRoadsideParking.IsValid()
-		&& TargetRoadsideSpotIndex != INDEX_NONE)
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[NAV-RS] Release previous Roadside '%s' spot=%d"),
-			*TargetRoadsideParking->ZoneName, TargetRoadsideSpotIndex);
-		TargetRoadsideParking->ReleaseSpot(TargetRoadsideSpotIndex);
-	}
 
 	DestinationType = EDestinationType::None;
 	TargetParkingLot = nullptr;
 	TargetParkingSpotIndex = INDEX_NONE;
-	TargetRoadsideParking = nullptr;
-	TargetRoadsideSpotIndex = INDEX_NONE;
-	TargetRoadsidePosition = FVector::ZeroVector;
-	bTargetRoadsideLeftSide = false;
 }
 
 // ============================================================================
@@ -279,7 +264,7 @@ bool URoadPathFollowerComponent::FindStartBoundEdge(
 //  Prepend a partial BoundEdge segment to the front of PathSegments.
 // ============================================================================
 void URoadPathFollowerComponent::PrependStartBoundEdgeSegment(
-	const FRoadGraphEdge& BoundEdge, bool bForward, float ProjDistAbs)
+	const FRoadGraphEdge& BoundEdge, bool bForward, float ProjDistAbs, bool bTriangleExitOffset)
 {
 	if (!BoundEdge.InputSpline)
 	{
@@ -315,6 +300,18 @@ void URoadPathFollowerComponent::PrependStartBoundEdgeSegment(
 		Seg.EndDist = BoundEdge.StartDistanceOnSpline;
 		Seg.Direction = -1.0f;
 		Seg.EndNodeId = BoundEdge.StartNodeId;
+	}
+
+	// 如果是從停車場出發（偏移 n 後從斜邊 2 尾端接回道路），
+	// 把 StartDist 往前推 ParkingTriangleBaseLength，讓 spline 跟隨從 ProjPt+n 開始。
+	// If we're exiting from a parking lot (bTriangleExitOffset), shift StartDist forward by n so the
+	// spline segment begins at (ProjPt + n along edge) — the far end of exit hypotenuse 2.
+	if (bTriangleExitOffset)
+	{
+		const float BoundMinDist = FMath::Min(BoundEdge.StartDistanceOnSpline, BoundEdge.EndDistanceOnSpline);
+		const float BoundMaxDist = FMath::Max(BoundEdge.StartDistanceOnSpline, BoundEdge.EndDistanceOnSpline);
+		const float Shifted = Seg.StartDist + Seg.Direction * ParkingTriangleBaseLength;
+		Seg.StartDist = FMath::Clamp(Shifted, BoundMinDist, BoundMaxDist);
 	}
 
 	// 如果 A* 建出的第一段第一個 edge 等於 BoundEdge（可能方向相同或反向），
@@ -432,9 +429,33 @@ void URoadPathFollowerComponent::StartNavigationInternal(int32 FromNodeId, int32
 
 	// ---- 把 start bound edge 的部分段插到最前面 ----
 	// ---- Prepend the partial start bound edge as the first segment ----
+	// 判斷是否「從停車場車位出發」— 若有 TargetParkingLot 且車離其 AnchorPos 很近，
+	// 在 PrependStartBoundEdgeSegment 時把 StartDist 往前推 n（產生等腰三角形斜邊 2）
+	// Detect parked-exit: if TargetParkingLot set and car is near its anchor, ask
+	// PrependStartBoundEdgeSegment to shift StartDist forward by ParkingTriangleBaseLength,
+	// so the spline follow resumes at (ProjPt + n along edge) — giving us exit hypotenuse 2.
+	bool bTriangleExit = false;
+	{
+		const float TriggerSq = FMath::Square(ParkingTriangleBaseLength * 1.5f);
+		for (TActorIterator<AParkingLotActor> It(World); It; ++It)
+		{
+			AParkingLotActor* Lot = *It;
+			if (!Lot) continue;
+			const FVector Anchor = Lot->GetAnchorArrowPosition();
+			if (FVector::DistSquared2D(CarPos, Anchor) < TriggerSq)
+			{
+				bTriangleExit = true;
+				UE_LOG(LogTemp, Warning,
+					TEXT("[PARK-NAV] Parked-exit detected near '%s' — using triangle hypotenuse 2 on start"),
+					*Lot->ParkingLotName);
+				break;
+			}
+		}
+	}
+
 	if (bHaveStartBoundEdge && StartBoundEdge)
 	{
-		PrependStartBoundEdgeSegment(*StartBoundEdge, bStartBoundForward, StartBoundProjDistAbs);
+		PrependStartBoundEdgeSegment(*StartBoundEdge, bStartBoundForward, StartBoundProjDistAbs, bTriangleExit);
 	}
 
 	if (PathSegments.Num() == 0)
@@ -535,15 +556,15 @@ void URoadPathFollowerComponent::StartNavigationInternal(int32 FromNodeId, int32
 }
 
 // ============================================================================
-//  StartFollowing — 自動導航到隨機停車場或路邊停車
-//  Auto-navigate to a random parking lot or roadside zone.
+//  StartFollowing — 自動導航到隨機停車場
+//  Auto-navigate to a random parking lot.
 // ============================================================================
 void URoadPathFollowerComponent::StartFollowing()
 {
 	UWorld* World = GetWorld();
 	if (!World) return;
 
-	// 找場景中的停車場或路邊停車 / Find parking destinations in level
+	// 找場景中有空位的停車場 / Find parking lots with free spots
 	TArray<AParkingLotActor*> Lots;
 	for (TActorIterator<AParkingLotActor> It(World); It; ++It)
 	{
@@ -551,35 +572,16 @@ void URoadPathFollowerComponent::StartFollowing()
 			Lots.Add(*It);
 	}
 
-	TArray<ARoadsideParkingActor*> Roadsides;
-	for (TActorIterator<ARoadsideParkingActor> It(World); It; ++It)
-	{
-		if (*It && (*It)->GetSpotCount() > 0 && (*It)->FindAvailableSpot() != INDEX_NONE)
-			Roadsides.Add(*It);
-	}
-
-	const int32 TotalOptions = Lots.Num() + Roadsides.Num();
-	if (TotalOptions == 0)
+	if (Lots.Num() == 0)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[START] No parking destinations found — cannot auto-start"));
 		return;
 	}
 
-	const int32 Pick = FMath::RandRange(0, TotalOptions - 1);
-	if (Pick < Lots.Num())
-	{
-		AParkingLotActor* Lot = Lots[Pick];
-		UE_LOG(LogTemp, Warning, TEXT("[PARK-NAV] [START] Auto-navigate to ParkingLot '%s'"), *Lot->ParkingLotName);
-		NavigateToParkingLot(Lot);
-	}
-	else
-	{
-		ARoadsideParkingActor* RS = Roadsides[Pick - Lots.Num()];
-		const int32 SpotIdx = RS->FindAvailableSpot();
-		const FVector Pos = RS->GetSpotWorldPosition(SpotIdx);
-		UE_LOG(LogTemp, Warning, TEXT("[START] Auto-navigate to Roadside '%s' spot=%d"), *RS->ZoneName, SpotIdx);
-		NavigateToRoadside(RS, Pos, RS->bIsLeftSide, SpotIdx);
-	}
+	const int32 Pick = FMath::RandRange(0, Lots.Num() - 1);
+	AParkingLotActor* Lot = Lots[Pick];
+	UE_LOG(LogTemp, Warning, TEXT("[PARK-NAV] [START] Auto-navigate to ParkingLot '%s'"), *Lot->ParkingLotName);
+	NavigateToParkingLot(Lot);
 }
 
 // ============================================================================
@@ -743,7 +745,6 @@ void URoadPathFollowerComponent::NavigateToParkingLot(AParkingLotActor* ParkingL
 	DestinationType = EDestinationType::ParkingLot;
 	TargetParkingLot = ParkingLot;
 	TargetParkingSpotIndex = SpotIndex;
-	TargetRoadsideParking = nullptr;
 
 	// ============================================================================
 	// [PARK-NAV] 流程 / Flow:
@@ -844,126 +845,6 @@ void URoadPathFollowerComponent::NavigateToParkingLot(AParkingLotActor* ParkingL
 		*ParkingLot->ParkingLotName, PathSegments.Num(),
 		bIsFollowing ? TEXT("true") : TEXT("false"),
 		ParkingLot->bIsLeftSide ? TEXT("L") : TEXT("R"), SpotIndex);
-}
-
-// ============================================================================
-//  NavigateToRoadside — 導航到路邊停車位置
-//  Navigate to roadside parking position.
-// ============================================================================
-void URoadPathFollowerComponent::NavigateToRoadside(ARoadsideParkingActor* RoadsideActor, const FVector& Position, bool bLeftSide, int32 SpotIndex)
-{
-	if (!RoadsideActor)
-	{
-		UE_LOG(LogTemp, Error, TEXT("[NAV-RS] NavigateToRoadside — null RoadsideActor!"));
-		OnPathComplete.Broadcast(false);
-		return;
-	}
-
-	UWorld* World = GetWorld();
-	if (!World) { UE_LOG(LogTemp, Error, TEXT("[NAV-RS] No World!")); return; }
-
-	URoadNetworkSubsystem* Sub = World->GetSubsystem<URoadNetworkSubsystem>();
-	if (!Sub) { UE_LOG(LogTemp, Error, TEXT("[NAV-RS] No RoadNetworkSubsystem!")); return; }
-
-	UE_LOG(LogTemp, Warning, TEXT("[NAV-RS] === NavigateToRoadside START === Zone='%s' NearestEdgeId=%d spot=%d pos=(%.0f,%.0f,%.0f)"),
-		*RoadsideActor->ZoneName, RoadsideActor->NearestEdgeId, SpotIndex, Position.X, Position.Y, Position.Z);
-
-	// 釋放上一個目的地佔的車格（如有）— 必須在 OccupySpot 之前做
-	// Release any previously-held spot BEFORE occupying a new one
-	ReleasePreviousDestinationSpot();
-
-	// 佔用停車格 / Occupy spot
-	if (SpotIndex != INDEX_NONE)
-	{
-		RoadsideActor->OccupySpot(SpotIndex, GetOwner());
-	}
-
-	// 儲存目的地狀態 / Store destination state
-	DestinationType = EDestinationType::RoadsideParking;
-	TargetRoadsideParking = RoadsideActor;
-	TargetRoadsideSpotIndex = SpotIndex;
-	TargetRoadsidePosition = Position;
-	bTargetRoadsideLeftSide = bLeftSide;
-	TargetParkingLot = nullptr;
-	TargetParkingSpotIndex = INDEX_NONE;
-
-	// ---- 直接用預先綁定的 EdgeId（BindParkingActorsToEdges 在 BuildRoadCache 時已設定）----
-	// ---- Use pre-bound EdgeId (set by BindParkingActorsToEdges during BuildRoadCache) ----
-	if (SpotIndex == INDEX_NONE)
-	{
-		UE_LOG(LogTemp, Error, TEXT("[NAV-RS] SpotIndex is INDEX_NONE — cannot resolve bound edge"));
-		OnPathComplete.Broadcast(false);
-		return;
-	}
-
-	const int32 NavEdgeId = RoadsideActor->GetSpotEdgeId(SpotIndex);
-	if (NavEdgeId == INDEX_NONE)
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[NAV-RS] Spot[%d] has no bound EdgeId! Check TargetRoadActorLabel='%s' on roadside actor."),
-			SpotIndex, *RoadsideActor->TargetRoadActorLabel);
-		RoadsideActor->ReleaseSpot(SpotIndex);
-		OnPathComplete.Broadcast(false);
-		return;
-	}
-
-	const FRoadGraphEdge* BoundEdge = Sub->GetGraphEdgeById(NavEdgeId);
-	if (!BoundEdge || !BoundEdge->InputSpline)
-	{
-		UE_LOG(LogTemp, Error, TEXT("[NAV-RS] Bound EdgeId=%d invalid!"), NavEdgeId);
-		RoadsideActor->ReleaseSpot(SpotIndex);
-		OnPathComplete.Broadcast(false);
-		return;
-	}
-
-	// 用 Arrow 方向跟 spline 切線比對，決定沿 BoundEdge 行駛方向與 Entry Node
-	// Compare Arrow forward vs spline tangent at spot projection to pick drive direction
-	const FVector SpotFwd = RoadsideActor->GetSpotWorldForward(SpotIndex);
-	const float SpotKey = BoundEdge->InputSpline->FindInputKeyClosestToWorldLocation(Position);
-	const float SpotSplineDist = BoundEdge->InputSpline->GetDistanceAlongSplineAtSplineInputKey(SpotKey);
-	const FVector SpotSplineDir = BoundEdge->InputSpline->GetDirectionAtDistanceAlongSpline(
-		SpotSplineDist, ESplineCoordinateSpace::World);
-	const float SpotDot = FVector::DotProduct(SpotFwd.GetSafeNormal2D(), SpotSplineDir.GetSafeNormal2D());
-
-	// dot >= 0 → car drives spline-forward → Entry=StartNode; else Entry=EndNode
-	// A* 目標是 ENTRY（不是 Exit），之後手動 append BoundEdge 截到投影點
-	const bool bForwardDrive = (SpotDot >= 0.0f);
-	const int32 EntryNodeId = bForwardDrive ? BoundEdge->StartNodeId : BoundEdge->EndNodeId;
-
-	// Clamp projection to edge's spline range
-	const float BoundMinDist = FMath::Min(BoundEdge->StartDistanceOnSpline, BoundEdge->EndDistanceOnSpline);
-	const float BoundMaxDist = FMath::Max(BoundEdge->StartDistanceOnSpline, BoundEdge->EndDistanceOnSpline);
-	const float ProjDistAbs = FMath::Clamp(SpotSplineDist, BoundMinDist, BoundMaxDist);
-
-	UE_LOG(LogTemp, Warning,
-		TEXT("[NAV-RS] Spot[%d] Bound Edge=%d Start=%d End=%d | Dot=%.2f → Entry=%d (fwd=%d) ProjDist=%.0f"),
-		SpotIndex, NavEdgeId, BoundEdge->StartNodeId, BoundEdge->EndNodeId,
-		SpotDot, EntryNodeId, bForwardDrive ? 1 : 0, ProjDistAbs);
-
-	if (EntryNodeId == INDEX_NONE)
-	{
-		UE_LOG(LogTemp, Error, TEXT("[NAV-RS] Bound Edge has invalid node IDs!"));
-		RoadsideActor->ReleaseSpot(SpotIndex);
-		OnPathComplete.Broadcast(false);
-		return;
-	}
-
-	ParkingMode = EParkingMode::RoadsideStop;
-
-	UE_LOG(LogTemp, Warning, TEXT("[NAV-RS] Calling NavigateToNode(Entry=%d) bIsFollowing=%s NavState=%d"),
-		EntryNodeId, bIsFollowing ? TEXT("true") : TEXT("false"), (int32)NavState);
-
-	NavigateToNode(EntryNodeId);
-
-	// 手動附加 BoundEdge 作為最後一段，EndDist 截到投影距離
-	// Manually append BoundEdge as the final segment, truncated to projection dist
-	AppendBoundEdgeFinalSegment(*BoundEdge, bForwardDrive, ProjDistAbs);
-
-	// NavigateToNode 會覆蓋 DestinationWorldLocation，所以要在之後再設
-	DestinationWorldLocation = Position;
-
-	UE_LOG(LogTemp, Warning, TEXT("[NAV-RS] === NavigateToRoadside END === PathSegments=%d bIsFollowing=%s"),
-		PathSegments.Num(), bIsFollowing ? TEXT("true") : TEXT("false"));
 }
 
 // ============================================================================
@@ -1097,11 +978,15 @@ void URoadPathFollowerComponent::AppendBoundEdgeFinalSegment(
 		Seg.EndNodeId = BoundEdge.StartNodeId;
 	}
 
-	// 截到投影距離（絕對 spline 距離）
-	// Truncate to projection (absolute spline distance)
+	// 截到投影距離 − n（等腰三角形斜邊 1 的起點：ProjPt 前 n 處）
+	// Truncate to (projection − n along travel direction) — this is the entry hypotenuse's base point.
+	// The remaining Hermite "parking curve" then runs from here (edge direction) to AnchorPos (arrow direction),
+	// forming hypotenuse 1 of the isosceles triangle.
 	const float BoundMinDist = FMath::Min(BoundEdge.StartDistanceOnSpline, BoundEdge.EndDistanceOnSpline);
 	const float BoundMaxDist = FMath::Max(BoundEdge.StartDistanceOnSpline, BoundEdge.EndDistanceOnSpline);
-	Seg.EndDist = FMath::Clamp(ProjDistAbs, BoundMinDist, BoundMaxDist);
+	const float ClampedProj = FMath::Clamp(ProjDistAbs, BoundMinDist, BoundMaxDist);
+	const float PulledBack = ClampedProj - Seg.Direction * ParkingTriangleBaseLength;
+	Seg.EndDist = FMath::Clamp(PulledBack, BoundMinDist, BoundMaxDist);
 
 	// 最後一段沒有下一個路口，TurnAtEnd = None
 	Seg.TurnAtEnd = ETurnSignal::None;
@@ -1773,10 +1658,6 @@ FString URoadPathFollowerComponent::GetDestinationName() const
 	{
 		return TargetParkingLot->ParkingLotName;
 	}
-	if (DestinationType == EDestinationType::RoadsideParking && TargetRoadsideParking.IsValid())
-	{
-		return TargetRoadsideParking->ZoneName;
-	}
 	return FString();
 }
 
@@ -1785,10 +1666,6 @@ int32 URoadPathFollowerComponent::GetTargetSpotIndex() const
 	if (DestinationType == EDestinationType::ParkingLot)
 	{
 		return TargetParkingSpotIndex;
-	}
-	if (DestinationType == EDestinationType::RoadsideParking)
-	{
-		return TargetRoadsideSpotIndex;
 	}
 	return INDEX_NONE;
 }
@@ -1963,31 +1840,6 @@ void URoadPathFollowerComponent::TickComponent(
 					TargetParkingLot->bIsLeftSide ? TEXT("true") : TEXT("false"),
 					RemainDist);
 			}
-			else if (DestinationType == EDestinationType::RoadsideParking
-				&& TargetRoadsideParking.IsValid()
-				&& TargetRoadsideSpotIndex != INDEX_NONE)
-			{
-				// --- 路邊停車：漸進式橫向偏移（像換車道）+ 存 Arrow 方向 ---
-				// --- Roadside: gradual lateral offset (like lane change) + store Arrow dir ---
-				const FVector SpotPos = TargetRoadsideParking->GetSpotWorldPosition(TargetRoadsideSpotIndex);
-				RoadsideSpotForward = TargetRoadsideParking->GetSpotWorldForward(TargetRoadsideSpotIndex);
-
-				FVector SplineEndPos, EndTravelDir, EndTravelRight;
-				SampleSplineAtDist(Seg, Seg.EndDist, 0.0f, SplineEndPos, EndTravelDir, EndTravelRight);
-
-				const FVector Delta = SpotPos - SplineEndPos;
-				ParkingTargetOffset = FVector::DotProduct(Delta, EndTravelRight);
-				CurrentTurnSignal = (ParkingTargetOffset < 0.0f) ? ETurnSignal::Left : ETurnSignal::Right;
-
-				UE_LOG(LogTemp, Warning,
-					TEXT("[PARK-0.5] ROADSIDE spot=%d | SpotPos=(%.0f,%.0f,%.0f) SpotFwd=(%.2f,%.2f,%.2f) | TargetOffset=%.0f signal=%s remain=%.0f"),
-					TargetRoadsideSpotIndex,
-					SpotPos.X, SpotPos.Y, SpotPos.Z,
-					RoadsideSpotForward.X, RoadsideSpotForward.Y, RoadsideSpotForward.Z,
-					ParkingTargetOffset,
-					(CurrentTurnSignal == ETurnSignal::Left) ? TEXT("LEFT") : TEXT("RIGHT"),
-					RemainDist);
-			}
 			else
 			{
 				// --- 預設：右側路肩（原邏輯）---
@@ -2087,14 +1939,37 @@ void URoadPathFollowerComponent::TickComponent(
 
 		if (T < 1.0f)
 		{
-			// 曲線進行中 — 直接定位，不經 VInterpTo
-			// Curve in progress — direct positioning, no VInterpTo
-			const FVector CurvePos = FMath::CubicInterp(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T);
-			const FVector CurveTangent = FMath::CubicInterpDerivative(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T);
+			FVector CurvePos;
+			FVector CurveTangent;
+
+			if (bIsUTurnCurve)
+			{
+				// 半圓弧：P(t) = Center + R*(cos(πt)*U + sin(πt)*V)
+				// Semicircle arc: P(t) = Center + R*(cos(πt)*U + sin(πt)*V)
+				const float Angle = PI * T;
+				const float CosA = FMath::Cos(Angle);
+				const float SinA = FMath::Sin(Angle);
+				const FVector Flat = UTurnCenter + UTurnArcRadius * (CosA * UTurnAxisU + SinA * UTurnAxisV);
+				CurvePos = FVector(Flat.X, Flat.Y, FMath::Lerp(UTurnArcZ0, UTurnArcZ1, T));
+
+				// 切線 dP/dθ = R*(-sin(θ)*U + cos(θ)*V)
+				// Tangent dP/dθ = R*(-sin(θ)*U + cos(θ)*V)
+				CurveTangent = UTurnArcRadius * (-SinA * UTurnAxisU + CosA * UTurnAxisV);
+			}
+			else
+			{
+				// 一般 Hermite 曲線 / Normal Hermite curve
+				CurvePos = FMath::CubicInterp(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T);
+				CurveTangent = FMath::CubicInterpDerivative(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T);
+			}
+
+			// 旋轉用 RInterpTo 平滑過渡，不直接 snap → 轉彎時自然地邊移動邊轉
+			// Rotation via RInterpTo for smooth transition, not snap → natural turning
 			FRotator FinalRot = Owner->GetActorRotation();
 			if (CurveTangent.SizeSquared() > 1.0f)
 			{
-				FinalRot = CurveTangent.Rotation();
+				const FRotator TargetRot = CurveTangent.Rotation();
+				FinalRot = FMath::RInterpTo(FinalRot, TargetRot, DeltaTime, RotationInterpSpeed);
 			}
 			Owner->SetActorLocationAndRotation(CurvePos, FinalRot);
 			return; // 還在曲線上 → 跳過正常 spline 邏輯 / Still on curve → skip normal spline
@@ -2148,6 +2023,50 @@ void URoadPathFollowerComponent::TickComponent(
 	// ================================================================
 	ReferenceDistance += CurrentSpeed * DeltaTime * Seg.Direction;
 
+	// 3a. 自然段切換：若參考點通過 EndDist 且下一段存在，把 overshoot 帶到新段。
+	//     這是直線連接的唯一切換點 — 不做瞬間移動，因為兩段在 junction node 相接。
+	// 3a. Natural segment advance: when ReferenceDistance passes EndDist and a next
+	//     segment exists, carry overshoot forward. This is the ONE place straight
+	//     junctions hand off — no teleport, because the two segments meet at the
+	//     junction node (world positions are continuous).
+	while (CurrentSegmentIndex + 1 < PathSegments.Num())
+	{
+		const FPathSegmentInternal& CurSeg = PathSegments[CurrentSegmentIndex];
+		const bool bPassedEnd =
+			(CurSeg.Direction > 0.0f && ReferenceDistance >= CurSeg.EndDist)
+			|| (CurSeg.Direction < 0.0f && ReferenceDistance <= CurSeg.EndDist);
+		if (!bPassedEnd) break;
+
+		// 只有直線銜接才自動切段；轉彎 / U-turn 要靠 Step 5 建立 Hermite / 半圓弧
+		// Only auto-advance for straight junctions; turns / U-turns need Step 5 curves
+		if (CurSeg.TurnAtEnd != ETurnSignal::None || CurSeg.bUTurnAtEnd)
+		{
+			// 把 ReferenceDistance 夾在 EndDist，等 Step 5 的 junction curve 接手
+			// Clamp to EndDist, let Step 5's junction curve take over
+			ReferenceDistance = CurSeg.EndDist;
+			break;
+		}
+
+		const float Overshoot = (CurSeg.Direction > 0.0f)
+			? (ReferenceDistance - CurSeg.EndDist)
+			: (CurSeg.EndDist - ReferenceDistance);
+
+		CurrentSegmentIndex++;
+		Seg = PathSegments[CurrentSegmentIndex];
+		ReferenceDistance = Seg.StartDist + Overshoot * Seg.Direction;
+
+		// 新段車道數可能不同 → clamp
+		// New segment may have different lane count → clamp
+		const int32 NewLaneCount = FMath::Max(1, Seg.DrivingRule.ForwardLaneCount);
+		TargetLaneIndex = FMath::Clamp(TargetLaneIndex, 0, NewLaneCount - 1);
+		CurrentLaneIndex = TargetLaneIndex;
+		CurrentTurnSignal = ETurnSignal::None;
+
+		UE_LOG(LogTemp, Warning,
+			TEXT("SEG_ADVANCE(straight): → Seg[%d] RefDist=%.0f Overshoot=%.0f LateralOffset=%.0f"),
+			CurrentSegmentIndex, ReferenceDistance, Overshoot, CurrentLateralOffset);
+	}
+
 	// ================================================================
 	//  4. 車道切換插值
 	//     Lane change interpolation
@@ -2168,10 +2087,10 @@ void URoadPathFollowerComponent::TickComponent(
 		}
 	}
 	else if (NavState == ENavState::Parking
-		&& (DestinationType == EDestinationType::None || DestinationType == EDestinationType::RoadsideParking))
+		&& DestinationType == EDestinationType::None)
 	{
-		// 路邊停車 / 預設停車：用 lateral offset 漸進靠邊
-		// Roadside / default parking: gradual lateral offset to target
+		// 預設停車：用 lateral offset 漸進靠邊
+		// Default parking: gradual lateral offset to target
 		CurrentLateralOffset = FMath::FInterpConstantTo(
 			CurrentLateralOffset, ParkingTargetOffset, DeltaTime, LaneChangeSpeed);
 	}
@@ -2224,65 +2143,32 @@ void URoadPathFollowerComponent::TickComponent(
 		// 只有「幾乎直線」才跳過 curve。
 		// Note: U-turns still use the curve (needed to actually turn around);
 		// only near-straight junctions skip the curve.
+		float JDot = 1.0f, JCross = 0.0f;
+		ETurnSignal TmpTurn;
+		bool bTmpU;
+		ComputeTurnAtJunction(Seg, NextSeg, TmpTurn, bTmpU, &JDot, &JCross);
+
+		const bool bSkipStraight = (JDot > JunctionStraightDot);
+
+		if (bSkipStraight)
 		{
-			float JDot = 1.0f, JCross = 0.0f;
-			ETurnSignal TmpTurn;
-			bool bTmpU;
-			ComputeTurnAtJunction(Seg, NextSeg, TmpTurn, bTmpU, &JDot, &JCross);
-
-			UE_LOG(LogTemp, Warning,
-				TEXT("JUNCTION_DOT_CHECK: Dot=%.3f CrossZ=%.3f StraightDot=%.3f UTurnDot=%.3f Turn=%s%s TurnSignal=%d"),
-				JDot, JCross, JunctionStraightDot, JunctionUTurnDot,
-				(TmpTurn == ETurnSignal::Left) ? TEXT("LEFT") :
-				(TmpTurn == ETurnSignal::Right) ? TEXT("RIGHT") : TEXT("NONE"),
-				bTmpU ? TEXT(" [U-TURN]") : TEXT(""),
-				(int32)CurrentTurnSignal);
-
-			const bool bSkipStraight = (JDot > JunctionStraightDot);
-			const bool bSkipUTurn = (JDot < JunctionUTurnDot);
-
-			if (bSkipStraight || bSkipUTurn)
-			{
-				// 直線或 U-turn：都不生成 Hermite 曲線，直接 snap-switch 到下一段
-				// Straight or U-turn: skip curve entirely, snap-switch to next segment
-				const FPathSegmentInternal& OldSeg = PathSegments[CurrentSegmentIndex];
-				const float Overshoot = FMath::Max(0.0f,
-					(OldSeg.Direction > 0.0f)
-						? (ReferenceDistance - OldSeg.EndDist)
-						: (OldSeg.EndDist - ReferenceDistance));
-
-				CurrentSegmentIndex++;
-				Seg = PathSegments[CurrentSegmentIndex];
-
-				// 對齊 ReferenceDistance 到新段起點 + overshoot
-				ReferenceDistance = Seg.StartDist + Overshoot * Seg.Direction;
-
-				CurrentTurnSignal = ETurnSignal::None;
-				const int32 NewLaneCount = Seg.DrivingRule.ForwardLaneCount;
-				TargetLaneIndex = FMath::Min(TargetLaneIndex, NewLaneCount - 1);
-				CurrentLaneIndex = TargetLaneIndex;
-				bIsChangingLane = false;
-				CurrentLateralOffset = ComputeTargetLaneOffset(TargetLaneIndex);
-				bJustExitedJunctionCurve = true;
-
-				// U-turn snap 時車頭要瞬間翻轉到新段切線方向，否則車還朝舊方向
-				// For U-turn snap, flip car rotation to the new segment's travel direction
-				if (bSkipUTurn)
-				{
-					FVector NewPos, NewDir, NewRight;
-					SampleSplineAtDist(Seg, ReferenceDistance, CurrentLateralOffset,
-						NewPos, NewDir, NewRight);
-					const FRotator NewRot = NewDir.Rotation();
-					Owner->SetActorLocationAndRotation(NewPos, NewRot);
-				}
-
-				UE_LOG(LogTemp, Warning,
-					TEXT("JUNCTION_SKIP_%s: Dot=%.3f → snap to Seg[%d] RefDist=%.0f"),
-					bSkipUTurn ? TEXT("UTURN") : TEXT("STRAIGHT"),
-					JDot, CurrentSegmentIndex, ReferenceDistance);
-				return;
-			}
+			// 直線：不建立 Hermite 曲線，也不在這裡切段。
+			// 讓車子繼續沿 OldSeg 以當前速度行駛，Step 3a 會在
+			// ReferenceDistance 真正到達 EndDist 時自然切到 NextSeg，
+			// 世界座標完全連續 → 零瞬移。
+			// Straight: don't create curve, don't advance segment here.
+			// Car keeps driving on OldSeg; Step 3a naturally advances when
+			// ReferenceDistance reaches EndDist → zero teleport.
 		}
+		else
+		{
+		UE_LOG(LogTemp, Warning,
+			TEXT("JUNCTION_DOT_CHECK: Dot=%.3f CrossZ=%.3f StraightDot=%.3f UTurnDot=%.3f Turn=%s%s TurnSignal=%d"),
+			JDot, JCross, JunctionStraightDot, JunctionUTurnDot,
+			(TmpTurn == ETurnSignal::Left) ? TEXT("LEFT") :
+			(TmpTurn == ETurnSignal::Right) ? TEXT("RIGHT") : TEXT("NONE"),
+			bTmpU ? TEXT(" [U-TURN]") : TEXT(""),
+			(int32)CurrentTurnSignal);
 
 		// 曲線終點：深入下一段 EffectiveBlendDist 的位置
 		// Curve end: EffectiveBlendDist into next segment
@@ -2333,21 +2219,118 @@ void URoadPathFollowerComponent::TickComponent(
 		bIsUTurnCurve = Seg.bUTurnAtEnd;
 		if (bIsUTurnCurve)
 		{
-			// 掉頭時終點偏移（往右或往左偏 UTurnRadius，確保 U 型）
-			// Offset next position laterally by UTurnRadius for wide U-shape
+			/*
+			// U 型掉頭：以 UTurnRadius 為半徑建立一個寬大的 U 曲線
+// U-turn: build a wide U-shape curve of radius UTurnRadius.
+//
+// 策略：把切線同時往前 + 往側邊拉，讓 Hermite 曲線自然地弧出去再繞回來，
+// 而不是用反向切線硬折出尖角。側邊方向由 TurnSignal 決定。
+// Strategy: pull both tangents forward + sideways so the Hermite naturally
+// bulges outward and loops back, instead of cusping with antiparallel tangents.
+// Sideways direction depends on the TurnSignal.
+			const FVector OwnerFwd = Owner->GetActorForwardVector();
 			const FVector OwnerRight = Owner->GetActorRightVector();
-			// 根據轉彎方向決定偏移方向 / Offset direction based on turn signal
+			const FVector NextFwd = NextDir.GetSafeNormal();
+			const FVector NextRightDir = FVector::CrossProduct(NextFwd, FVector::UpVector).GetSafeNormal();
+
+			// 根據轉彎方向決定 U 型偏向（左手或右手）
+			// Sideways bias direction for the U bulge (left-hand or right-hand U).
 			const float SideSign = (CurrentTurnSignal == ETurnSignal::Left) ? -1.0f : 1.0f;
+
 			JCurveP1 = NextPos;
 
 			const float Dist = (JCurveP1 - JCurveP0).Size();
-			const float UTurnTangentLen = FMath::Max(Dist, UTurnRadius) * UTurnTangentScale;
-			JCurveT0 = Owner->GetActorForwardVector() * UTurnTangentLen;
-			JCurveT1 = NextDir.GetSafeNormal() * UTurnTangentLen;
+			// 切線長度 = UTurnRadius × UTurnTangentScale，用 UTurnRadius 主宰曲線寬度
+			// Tangent length = UTurnRadius × UTurnTangentScale — UTurnRadius dominates width.
+			const float UTurnTangentLen = UTurnRadius * UTurnTangentScale;
 
-			// U 型曲線更長（半圓形，約 π * R）
-			// U-turn curve is longer (semicircle ~ π * R)
-			JCurveLength = FMath::Max(Dist * 1.5f, UTurnRadius * PI * 0.8f);
+			// T0：沿當前前方 + 側向偏移 → 讓曲線一開始就往外弧
+			// T0: forward + sideways bias → curve bulges outward at entry
+			const FVector T0Dir = (OwnerFwd + OwnerRight * SideSign * 0.6f).GetSafeNormal();
+			JCurveT0 = T0Dir * UTurnTangentLen;
+
+			// T1：沿下一段前方 - 側向偏移 → 讓曲線尾端從外側順順收回來
+			// T1: next-segment forward - sideways bias → curve sweeps back inward at exit
+			const FVector T1Dir = (NextFwd + NextRightDir * SideSign * 0.6f).GetSafeNormal();
+			JCurveT1 = T1Dir * UTurnTangentLen;
+
+			// U 型曲線長度 ~ π × UTurnRadius（半圓周長）
+			// U-turn curve length ~ π × UTurnRadius (semicircle perimeter)
+			JCurveLength = FMath::Max(Dist * 1.5f, UTurnRadius * PI);
+			*/
+			// U 型掉頭：用參數化半圓弧 (parametric semicircle)，不用 Hermite。
+			// Hermite 在反向切線下容易產生 8 字形；半圓弧保證自然平滑。
+			// U-turn: parametric semicircle instead of Hermite.
+			// Hermite with antiparallel tangents creates figure-8; semicircle is natural.
+			//
+			// P0 = 車目前位置, P1 = 下一段取樣位置
+			// Center = (P0+P1)/2, 半徑 R = max(|P0-P1|/2, UTurnRadius)
+			// U 軸 = Center→P0 方向, V 軸 = 車子前方（掃掠方向）
+			// 角度 0..π 沿 U/V 畫半圓
+			JCurveP1 = NextPos;
+
+			const FVector MidPt = (JCurveP0 + JCurveP1) * 0.5f;
+			const float HalfDist = (JCurveP1 - JCurveP0).Size2D() * 0.5f;
+			// 半徑 = max(半距離, UTurnRadius)，UTurnRadius 控制最小 U 寬度
+			// Radius = max(half-distance, UTurnRadius) — UTurnRadius sets minimum U width
+			UTurnArcRadius = FMath::Max(HalfDist, UTurnRadius);
+
+			// U 軸 = 圓心→P0（2D），歸一化
+			// U axis = Center→P0 (2D), normalized
+			const FVector ToP0 = JCurveP0 - MidPt;
+			UTurnAxisU = FVector(ToP0.X, ToP0.Y, 0.0f).GetSafeNormal();
+			if (UTurnAxisU.IsNearlyZero())
+			{
+				// P0≈P1 → fallback 用右方向 / fallback to right vector
+				UTurnAxisU = Owner->GetActorRightVector();
+			}
+
+			// V 軸 = 車子前方投影到水平面（掃掠方向）
+			// V axis = car's forward projected to horizontal (sweep direction)
+			const FVector OwnerFwd2D = FVector(Owner->GetActorForwardVector().X,
+				Owner->GetActorForwardVector().Y, 0.0f).GetSafeNormal();
+			UTurnAxisV = OwnerFwd2D;
+
+			// 如果 UTurnRadius > HalfDist，圓心需要偏移讓弧經過 P0 和 P1
+			// If UTurnRadius > HalfDist, offset center so arc passes through P0 & P1
+			if (UTurnArcRadius > HalfDist + 1.0f)
+			{
+				// 圓心從 MidPt 沿 -V 方向後退，使半徑 R 的圓通過 P0 和 P1
+				// Center shifts backward along -V so a circle of radius R passes through P0 & P1
+				const float BackDist = FMath::Sqrt(FMath::Max(UTurnArcRadius * UTurnArcRadius - HalfDist * HalfDist, 0.0f));
+				UTurnCenter = MidPt - UTurnAxisV * BackDist;
+			}
+			else
+			{
+				UTurnCenter = MidPt;
+			}
+
+			// 重新計算 U 軸（從實際圓心到 P0）
+			// Recalculate U axis from actual center to P0
+			const FVector CToP0 = FVector(JCurveP0.X - UTurnCenter.X, JCurveP0.Y - UTurnCenter.Y, 0.0f);
+			if (CToP0.SizeSquared() > 1.0f)
+			{
+				UTurnAxisU = CToP0.GetSafeNormal();
+			}
+			// V 軸 = U 軸旋轉 90° 朝車前方（確保掃掠方向正確）
+			// V axis = U rotated 90° toward car forward (ensure correct sweep direction)
+			const FVector CandidateV = FVector(-UTurnAxisU.Y, UTurnAxisU.X, 0.0f);
+			UTurnAxisV = (FVector::DotProduct(CandidateV, OwnerFwd2D) >= 0.0f) ? CandidateV : -CandidateV;
+
+			// 記錄 Z 高度，線性插值 / Record Z heights for linear lerp
+			UTurnArcZ0 = JCurveP0.Z;
+			UTurnArcZ1 = JCurveP1.Z;
+
+			// 曲線長度 = π × R × UTurnTangentScale（可調速度感）
+			// Arc length = π × R × UTurnTangentScale (tunable speed feel)
+			JCurveLength = PI * UTurnArcRadius * UTurnTangentScale;
+
+			UE_LOG(LogTemp, Warning,
+				TEXT("UTURN_ARC_INIT: P0=(%.0f,%.0f) P1=(%.0f,%.0f) Center=(%.0f,%.0f) R=%.0f ArcLen=%.0f"),
+				JCurveP0.X, JCurveP0.Y, JCurveP1.X, JCurveP1.Y,
+				UTurnCenter.X, UTurnCenter.Y, UTurnArcRadius, JCurveLength);
+
+			
 		}
 		else
 		{
@@ -2375,21 +2358,15 @@ void URoadPathFollowerComponent::TickComponent(
 			CurrentLateralOffset, NextSegLaneOffset,
 			(int32)CurrentTurnSignal, NextLaneCount, JCurveNextLaneIndex);
 
-		// 立刻走第一步，不浪費一幀（消除入彎停頓）
-		// Execute first curve step immediately (eliminates 1-frame stall at entry)
-		{
-			JCurveProgress = CurrentSpeed * DeltaTime;
-			const float T0Frame = FMath::Clamp(JCurveProgress / FMath::Max(JCurveLength, 1.0f), 0.0f, 1.0f);
-			const FVector FirstPos = FMath::CubicInterp(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T0Frame);
-			const FVector FirstTan = FMath::CubicInterpDerivative(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T0Frame);
-			FRotator FirstRot = Owner->GetActorRotation();
-			if (FirstTan.SizeSquared() > 1.0f)
-			{
-				FirstRot = FirstTan.Rotation();
-			}
-			Owner->SetActorLocationAndRotation(FirstPos, FirstRot);
-		}
+		// 不做「第一步 SetActorLocationAndRotation」— P0 已設為車子當前位置，
+		// JCurveProgress 從 0 開始，下一幀 Tick 的 JCurve 更新會以 CurrentSpeed 沿曲線
+		// 平滑推進，沒有 1 幀停頓也沒有瞬間移動。
+		// No "first-step SetActorLocationAndRotation" — P0 is already the car's current
+		// pose and JCurveProgress starts at 0; the next Tick's curve update advances
+		// smoothly at CurrentSpeed with neither a 1-frame stall nor a teleport.
+		JCurveProgress = 0.0f;
 		return;
+		} // else (not straight → curve)
 	}
 
 	// ---- 檢查段結束（沒有下一段時才會到這裡）----
@@ -2416,31 +2393,6 @@ void URoadPathFollowerComponent::TickComponent(
 				TEXT("[PARK-NAV] [CURVE] LOT START: P0=(%.0f,%.0f,%.0f) P1=(%.0f,%.0f,%.0f) CurveLen=%.0f"),
 				ParkCurveP0.X, ParkCurveP0.Y, ParkCurveP0.Z,
 				ParkCurveP1.X, ParkCurveP1.Y, ParkCurveP1.Z,
-				ParkCurveLength);
-		}
-		else if (NavState == ENavState::Parking && !bOnParkingCurve
-			&& DestinationType == EDestinationType::RoadsideParking
-			&& TargetRoadsideParking.IsValid()
-			&& TargetRoadsideSpotIndex != INDEX_NONE)
-		{
-			// --- 路邊停車：短距離最終對齊曲線（從路邊 offset 位置到 Arrow 精確位置+方向）---
-			// --- Roadside: short final alignment curve (from road-edge offset pos to exact Arrow pos+dir) ---
-			const FVector SpotPos = TargetRoadsideParking->GetSpotWorldPosition(TargetRoadsideSpotIndex);
-
-			ParkCurveP0 = Owner->GetActorLocation();
-			ParkCurveP1 = SpotPos;
-			const float CurveDist = (ParkCurveP1 - ParkCurveP0).Size();
-			ParkCurveT0 = Owner->GetActorForwardVector() * CurveDist * ParkingCurveTangentScale;
-			ParkCurveT1 = RoadsideSpotForward.GetSafeNormal() * CurveDist * ParkingCurveTangentScale;
-			ParkCurveLength = FMath::Max(CurveDist * 1.3f, 100.0f);
-			ParkCurveProgress = 0.0f;
-			bOnParkingCurve = true;
-
-			UE_LOG(LogTemp, Warning,
-				TEXT("[PARK-CURVE] ROADSIDE START: P0=(%.0f,%.0f,%.0f) P1=(%.0f,%.0f,%.0f) SpotFwd=(%.2f,%.2f,%.2f) CurveLen=%.0f"),
-				ParkCurveP0.X, ParkCurveP0.Y, ParkCurveP0.Z,
-				ParkCurveP1.X, ParkCurveP1.Y, ParkCurveP1.Z,
-				RoadsideSpotForward.X, RoadsideSpotForward.Y, RoadsideSpotForward.Z,
 				ParkCurveLength);
 		}
 		else if (!bOnParkingCurve)
