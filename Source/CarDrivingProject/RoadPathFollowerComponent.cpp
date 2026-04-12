@@ -73,6 +73,7 @@ void URoadPathFollowerComponent::ResetFollowingState()
 	bIsFollowing = false;
 	bOnJunctionCurve = false;
 	bIsUTurnCurve = false;
+	bIsGapBridgeCurve = false;
 	bJustExitedJunctionCurve = false;
 	bIsChangingLane = false;
 	bOnParkingCurve = false;
@@ -1612,7 +1613,9 @@ float URoadPathFollowerComponent::ComputeDesiredSpeed() const
 
 	// 曲線全程維持低速，出曲線後才由 FInterpTo 慢慢加速
 	// Hold low speed for entire curve. Post-curve FInterpTo ramps up naturally.
-	if (bOnJunctionCurve)
+	// Gap bridge 曲線不減速 — 視覺上是直線，只是 spline 距離不連續而已。
+	// Gap bridge curves don't slow down — visually straight, just non-contiguous spline distance.
+	if (bOnJunctionCurve && !bIsGapBridgeCurve)
 	{
 		if (bIsUTurnCurve)
 		{
@@ -1979,6 +1982,7 @@ void URoadPathFollowerComponent::TickComponent(
 		// ---- T >= 1.0: Curve done, fall through to new segment's spline logic (same frame!) ----
 		bOnJunctionCurve = false;
 		bIsUTurnCurve = false;
+		bIsGapBridgeCurve = false;
 		CurrentSegmentIndex++;
 
 		if (CurrentSegmentIndex >= PathSegments.Num())
@@ -2029,6 +2033,10 @@ void URoadPathFollowerComponent::TickComponent(
 	//     segment exists, carry overshoot forward. This is the ONE place straight
 	//     junctions hand off — no teleport, because the two segments meet at the
 	//     junction node (world positions are continuous).
+	const FVector PreAdvancePos = Owner->GetActorLocation();  // DEBUG: 切段前世界位置
+	const int32 PreAdvanceSegIdx = CurrentSegmentIndex;       // DEBUG: 切段前段號
+	const float PreAdvanceRefDist = ReferenceDistance;        // DEBUG: 切段前 RefDist
+
 	while (CurrentSegmentIndex + 1 < PathSegments.Num())
 	{
 		const FPathSegmentInternal& CurSeg = PathSegments[CurrentSegmentIndex];
@@ -2037,16 +2045,49 @@ void URoadPathFollowerComponent::TickComponent(
 			|| (CurSeg.Direction < 0.0f && ReferenceDistance <= CurSeg.EndDist);
 		if (!bPassedEnd) break;
 
-		// 只有直線銜接才自動切段；轉彎 / U-turn 要靠 Step 5 建立 Hermite / 半圓弧
-		// Only auto-advance for straight junctions; turns / U-turns need Step 5 curves
+		// 轉彎 / U-turn → 夾在 EndDist，讓 Step 5 用曲線接手
+		// Turn / U-turn → clamp to EndDist, let Step 5 curve handle it
 		if (CurSeg.TurnAtEnd != ETurnSignal::None || CurSeg.bUTurnAtEnd)
 		{
-			// 把 ReferenceDistance 夾在 EndDist，等 Step 5 的 junction curve 接手
-			// Clamp to EndDist, let Step 5's junction curve take over
 			ReferenceDistance = CurSeg.EndDist;
 			break;
 		}
 
+		// 先檢查 junction gap：舊段末端 vs 新段起點的世界位置差
+		// 如果差太大（> 100cm），代表兩段在 spline 上不連續，不能直接切 —
+		// 夾在 EndDist，讓 Step 5 用 Hermite 曲線平滑過渡。
+		// Pre-check junction gap: world distance between old-end and new-start.
+		// If gap > 100cm, the two segments are NOT spatially contiguous on the spline —
+		// clamp to EndDist and let Step 5 create a Hermite curve for smooth transition.
+		const FPathSegmentInternal& NextSeg = PathSegments[CurrentSegmentIndex + 1];
+
+		FVector OldEndPos, OldEndDir, OldEndRight;
+		SampleSplineAtDist(CurSeg, CurSeg.EndDist, CurrentLateralOffset,
+			OldEndPos, OldEndDir, OldEndRight);
+
+		FVector NewStartPos, NewStartDir, NewStartRight;
+		SampleSplineAtDist(NextSeg, NextSeg.StartDist, CurrentLateralOffset,
+			NewStartPos, NewStartDir, NewStartRight);
+
+		const float JunctionGap = FVector::Dist(OldEndPos, NewStartPos);
+
+		if (JunctionGap > 100.0f)
+		{
+			// 不連續 → 夾在 EndDist，Step 5 會建 Hermite 曲線
+			// Non-contiguous → clamp, Step 5 will create Hermite curve
+			ReferenceDistance = CurSeg.EndDist;
+			UE_LOG(LogTemp, Warning,
+				TEXT("SEG_ADVANCE blocked (JunctionGap=%.0f > 100): Seg[%d] EndDist=%.0f → Step5 curve | ")
+				TEXT("OldEnd=(%.0f,%.0f,%.0f) NewStart=(%.0f,%.0f,%.0f) Spline=%s"),
+				JunctionGap, CurrentSegmentIndex, CurSeg.EndDist,
+				OldEndPos.X, OldEndPos.Y, OldEndPos.Z,
+				NewStartPos.X, NewStartPos.Y, NewStartPos.Z,
+				CurSeg.Spline ? *CurSeg.Spline->GetOwner()->GetName() : TEXT("null"));
+			break;
+		}
+
+		// Gap 夠小 → 安全切段
+		// Gap is small → safe to advance
 		const float Overshoot = (CurSeg.Direction > 0.0f)
 			? (ReferenceDistance - CurSeg.EndDist)
 			: (CurSeg.EndDist - ReferenceDistance);
@@ -2055,16 +2096,14 @@ void URoadPathFollowerComponent::TickComponent(
 		Seg = PathSegments[CurrentSegmentIndex];
 		ReferenceDistance = Seg.StartDist + Overshoot * Seg.Direction;
 
-		// 新段車道數可能不同 → clamp
-		// New segment may have different lane count → clamp
 		const int32 NewLaneCount = FMath::Max(1, Seg.DrivingRule.ForwardLaneCount);
 		TargetLaneIndex = FMath::Clamp(TargetLaneIndex, 0, NewLaneCount - 1);
 		CurrentLaneIndex = TargetLaneIndex;
 		CurrentTurnSignal = ETurnSignal::None;
 
 		UE_LOG(LogTemp, Warning,
-			TEXT("SEG_ADVANCE(straight): → Seg[%d] RefDist=%.0f Overshoot=%.0f LateralOffset=%.0f"),
-			CurrentSegmentIndex, ReferenceDistance, Overshoot, CurrentLateralOffset);
+			TEXT("SEG_ADVANCE(straight): Seg[%d]→Seg[%d] RefDist=%.0f Overshoot=%.0f Gap=%.0f Speed=%.0f"),
+			PreAdvanceSegIdx, CurrentSegmentIndex, ReferenceDistance, Overshoot, JunctionGap, CurrentSpeed);
 	}
 
 	// ================================================================
@@ -2148,17 +2187,24 @@ void URoadPathFollowerComponent::TickComponent(
 		bool bTmpU;
 		ComputeTurnAtJunction(Seg, NextSeg, TmpTurn, bTmpU, &JDot, &JCross);
 
-		const bool bSkipStraight = (JDot > JunctionStraightDot);
+		// 檢查 junction gap：即使 Dot 說「直線」，如果兩段在 spline 上世界位置不連續
+		// （gap > 100cm），仍然需要 Hermite 曲線來平滑過渡。
+		// Check junction gap: even if Dot says "straight", if the two segments are
+		// non-contiguous in world space (gap > 100cm), we still need a Hermite curve.
+		FVector Step5OldEnd, Step5OldEndDir, Step5OldEndR;
+		SampleSplineAtDist(Seg, Seg.EndDist, CurrentLateralOffset,
+			Step5OldEnd, Step5OldEndDir, Step5OldEndR);
+		FVector Step5NewStart, Step5NewStartDir, Step5NewStartR;
+		SampleSplineAtDist(NextSeg, NextSeg.StartDist, CurrentLateralOffset,
+			Step5NewStart, Step5NewStartDir, Step5NewStartR);
+		const float Step5JunctionGap = FVector::Dist(Step5OldEnd, Step5NewStart);
+
+		const bool bSkipStraight = (JDot > JunctionStraightDot) && (Step5JunctionGap < 100.0f);
 
 		if (bSkipStraight)
 		{
-			// 直線：不建立 Hermite 曲線，也不在這裡切段。
-			// 讓車子繼續沿 OldSeg 以當前速度行駛，Step 3a 會在
-			// ReferenceDistance 真正到達 EndDist 時自然切到 NextSeg，
-			// 世界座標完全連續 → 零瞬移。
-			// Straight: don't create curve, don't advance segment here.
-			// Car keeps driving on OldSeg; Step 3a naturally advances when
-			// ReferenceDistance reaches EndDist → zero teleport.
+			// 真正的直線且世界位置連續 → 不建曲線，Step 3a 會自然切段
+			// Truly straight AND spatially contiguous → no curve, Step 3a handles it
 		}
 		else
 		{
@@ -2170,9 +2216,10 @@ void URoadPathFollowerComponent::TickComponent(
 			bTmpU ? TEXT(" [U-TURN]") : TEXT(""),
 			(int32)CurrentTurnSignal);
 
-		// 曲線終點：深入下一段 EffectiveBlendDist 的位置
-		// Curve end: EffectiveBlendDist into next segment
-		const float EntryDist = EffectiveBlendDist;
+		// 曲線終點：一般轉彎深入下一段 EffectiveBlendDist；U-turn 只到起點附近
+		// Curve end: normal turns go EffectiveBlendDist into next seg; U-turn stays near start
+		const bool bUpcomingUTurn = Seg.bUTurnAtEnd;
+		const float EntryDist = bUpcomingUTurn ? 0.0f : EffectiveBlendDist;
 		const float NextSampleDist = NextSeg.StartDist + EntryDist * NextSeg.Direction;
 
 		// 根據轉彎方向決定新段的目標車道
@@ -2214,123 +2261,106 @@ void URoadPathFollowerComponent::TickComponent(
 		// T0 = car's ACTUAL forward, ensures curve starts from current heading
 		JCurveP0 = Owner->GetActorLocation();
 
+		// 標記 gap bridge：Dot 說直線但世界位置不連續 → 不減速
+		// Mark gap bridge: Dot says straight but world positions non-contiguous → no slowdown
+		bIsGapBridgeCurve = (JDot > JunctionStraightDot) && (Step5JunctionGap >= 100.0f);
+
 		// U 型掉頭：用 UTurnRadius 把終點偏移到旁邊，產生大 U 曲線
 		// U-turn: offset endpoint sideways by UTurnRadius to create a wide U-shape
 		bIsUTurnCurve = Seg.bUTurnAtEnd;
 		if (bIsUTurnCurve)
 		{
-			/*
-			// U 型掉頭：以 UTurnRadius 為半徑建立一個寬大的 U 曲線
-// U-turn: build a wide U-shape curve of radius UTurnRadius.
-//
-// 策略：把切線同時往前 + 往側邊拉，讓 Hermite 曲線自然地弧出去再繞回來，
-// 而不是用反向切線硬折出尖角。側邊方向由 TurnSignal 決定。
-// Strategy: pull both tangents forward + sideways so the Hermite naturally
-// bulges outward and loops back, instead of cusping with antiparallel tangents.
-// Sideways direction depends on the TurnSignal.
-			const FVector OwnerFwd = Owner->GetActorForwardVector();
-			const FVector OwnerRight = Owner->GetActorRightVector();
-			const FVector NextFwd = NextDir.GetSafeNormal();
-			const FVector NextRightDir = FVector::CrossProduct(NextFwd, FVector::UpVector).GetSafeNormal();
-
-			// 根據轉彎方向決定 U 型偏向（左手或右手）
-			// Sideways bias direction for the U bulge (left-hand or right-hand U).
-			const float SideSign = (CurrentTurnSignal == ETurnSignal::Left) ? -1.0f : 1.0f;
-
-			JCurveP1 = NextPos;
-
-			const float Dist = (JCurveP1 - JCurveP0).Size();
-			// 切線長度 = UTurnRadius × UTurnTangentScale，用 UTurnRadius 主宰曲線寬度
-			// Tangent length = UTurnRadius × UTurnTangentScale — UTurnRadius dominates width.
-			const float UTurnTangentLen = UTurnRadius * UTurnTangentScale;
-
-			// T0：沿當前前方 + 側向偏移 → 讓曲線一開始就往外弧
-			// T0: forward + sideways bias → curve bulges outward at entry
-			const FVector T0Dir = (OwnerFwd + OwnerRight * SideSign * 0.6f).GetSafeNormal();
-			JCurveT0 = T0Dir * UTurnTangentLen;
-
-			// T1：沿下一段前方 - 側向偏移 → 讓曲線尾端從外側順順收回來
-			// T1: next-segment forward - sideways bias → curve sweeps back inward at exit
-			const FVector T1Dir = (NextFwd + NextRightDir * SideSign * 0.6f).GetSafeNormal();
-			JCurveT1 = T1Dir * UTurnTangentLen;
-
-			// U 型曲線長度 ~ π × UTurnRadius（半圓周長）
-			// U-turn curve length ~ π × UTurnRadius (semicircle perimeter)
-			JCurveLength = FMath::Max(Dist * 1.5f, UTurnRadius * PI);
-			*/
-			// U 型掉頭：用參數化半圓弧 (parametric semicircle)，不用 Hermite。
-			// Hermite 在反向切線下容易產生 8 字形；半圓弧保證自然平滑。
-			// U-turn: parametric semicircle instead of Hermite.
-			// Hermite with antiparallel tangents creates figure-8; semicircle is natural.
+			// U 型掉頭：P0 和 P1 都在同一個 junction node（Seg.EndDist），
+			// 只差橫向偏移（當前車道 vs 下一段車道）。
+			// 半圓弧從 P0 繞到 P1，半徑 R = max(|P0-P1|/2, UTurnRadius)。
 			//
-			// P0 = 車目前位置, P1 = 下一段取樣位置
-			// Center = (P0+P1)/2, 半徑 R = max(|P0-P1|/2, UTurnRadius)
-			// U 軸 = Center→P0 方向, V 軸 = 車子前方（掃掠方向）
-			// 角度 0..π 沿 U/V 畫半圓
-			JCurveP1 = NextPos;
+			// U-turn: P0 and P1 are both at the SAME junction node (Seg.EndDist),
+			// differing only in lateral offset (current lane vs next-seg lane).
+			// Semicircle arc from P0 to P1, radius R = max(|P0-P1|/2, UTurnRadius).
 
-			const FVector MidPt = (JCurveP0 + JCurveP1) * 0.5f;
-			const float HalfDist = (JCurveP1 - JCurveP0).Size2D() * 0.5f;
-			// 半徑 = max(半距離, UTurnRadius)，UTurnRadius 控制最小 U 寬度
-			// Radius = max(half-distance, UTurnRadius) — UTurnRadius sets minimum U width
+			// P0 = 車的當前位置（已設定） / P0 = car's current pos (already set)
+			// P1 = Seg.EndDist 取樣，但用 NextSeg 的車道偏移
+			// P1 = sample at Seg.EndDist but with NextSeg's lane offset
+			FVector JunctionPosP1, JunctionDirP1, JunctionRightP1;
+			SampleSplineAtDist(Seg, Seg.EndDist, NextSegLaneOffset,
+				JunctionPosP1, JunctionDirP1, JunctionRightP1);
+			JCurveP1 = JunctionPosP1;
+
+			// 同時取得 P0 在 junction node 的精確位置（車可能還沒到 EndDist）
+			// Also get P0's exact position at junction node (car may not be at EndDist yet)
+			FVector JunctionPosP0, JunctionDirP0, JunctionRightP0;
+			SampleSplineAtDist(Seg, Seg.EndDist, CurrentLateralOffset,
+				JunctionPosP0, JunctionDirP0, JunctionRightP0);
+
+			// P0P1 的距離 = 兩條車道的橫向間距
+			// P0P1 distance = lateral gap between the two lanes
+			const float LaneDist = FVector::Dist2D(JunctionPosP0, JCurveP1);
+			const float HalfDist = LaneDist * 0.5f;
+
+			// R = max(HalfDist, UTurnRadius)
 			UTurnArcRadius = FMath::Max(HalfDist, UTurnRadius);
 
-			// U 軸 = 圓心→P0（2D），歸一化
-			// U axis = Center→P0 (2D), normalized
-			const FVector ToP0 = JCurveP0 - MidPt;
-			UTurnAxisU = FVector(ToP0.X, ToP0.Y, 0.0f).GetSafeNormal();
-			if (UTurnAxisU.IsNearlyZero())
-			{
-				// P0≈P1 → fallback 用右方向 / fallback to right vector
-				UTurnAxisU = Owner->GetActorRightVector();
-			}
-
-			// V 軸 = 車子前方投影到水平面（掃掠方向）
-			// V axis = car's forward projected to horizontal (sweep direction)
+			// 圓心 C = P0P1 中點，如果 R > HalfDist 則往車前方後退
+			// Center C = midpoint of P0P1, shifted backward if R > HalfDist
+			const FVector MidPt = (JCurveP0 + JCurveP1) * 0.5f;
 			const FVector OwnerFwd2D = FVector(Owner->GetActorForwardVector().X,
 				Owner->GetActorForwardVector().Y, 0.0f).GetSafeNormal();
-			UTurnAxisV = OwnerFwd2D;
 
-			// 如果 UTurnRadius > HalfDist，圓心需要偏移讓弧經過 P0 和 P1
-			// If UTurnRadius > HalfDist, offset center so arc passes through P0 & P1
 			if (UTurnArcRadius > HalfDist + 1.0f)
 			{
-				// 圓心從 MidPt 沿 -V 方向後退，使半徑 R 的圓通過 P0 和 P1
-				// Center shifts backward along -V so a circle of radius R passes through P0 & P1
-				const float BackDist = FMath::Sqrt(FMath::Max(UTurnArcRadius * UTurnArcRadius - HalfDist * HalfDist, 0.0f));
-				UTurnCenter = MidPt - UTurnAxisV * BackDist;
+				const float BackDist = FMath::Sqrt(FMath::Max(
+					UTurnArcRadius * UTurnArcRadius - HalfDist * HalfDist, 0.0f));
+				UTurnCenter = MidPt + OwnerFwd2D * BackDist;
 			}
 			else
 			{
 				UTurnCenter = MidPt;
 			}
 
-			// 重新計算 U 軸（從實際圓心到 P0）
-			// Recalculate U axis from actual center to P0
-			const FVector CToP0 = FVector(JCurveP0.X - UTurnCenter.X, JCurveP0.Y - UTurnCenter.Y, 0.0f);
-			if (CToP0.SizeSquared() > 1.0f)
-			{
-				UTurnAxisU = CToP0.GetSafeNormal();
-			}
-			// V 軸 = U 軸旋轉 90° 朝車前方（確保掃掠方向正確）
-			// V axis = U rotated 90° toward car forward (ensure correct sweep direction)
-			const FVector CandidateV = FVector(-UTurnAxisU.Y, UTurnAxisU.X, 0.0f);
-			UTurnAxisV = (FVector::DotProduct(CandidateV, OwnerFwd2D) >= 0.0f) ? CandidateV : -CandidateV;
+			// U 軸 = Center→P0（半圓起點方向）
+			// U axis = Center→P0 (semicircle start direction)
+			const FVector CToP0 = FVector(JCurveP0.X - UTurnCenter.X,
+				JCurveP0.Y - UTurnCenter.Y, 0.0f);
+			UTurnAxisU = CToP0.SizeSquared() > 1.0f
+				? CToP0.GetSafeNormal()
+				: Owner->GetActorRightVector();
 
-			// 記錄 Z 高度，線性插值 / Record Z heights for linear lerp
+			// V 軸 = U 旋轉 90°，方向朝車前方（掃掠方向）
+			// V axis = U rotated 90°, oriented toward car forward (sweep direction)
+			const FVector CandidateV = FVector(-UTurnAxisU.Y, UTurnAxisU.X, 0.0f);
+			UTurnAxisV = (FVector::DotProduct(CandidateV, OwnerFwd2D) >= 0.0f)
+				? CandidateV : -CandidateV;
+
 			UTurnArcZ0 = JCurveP0.Z;
 			UTurnArcZ1 = JCurveP1.Z;
 
-			// 曲線長度 = π × R × UTurnTangentScale（可調速度感）
-			// Arc length = π × R × UTurnTangentScale (tunable speed feel)
+			// 弧長 = π × R × UTurnTangentScale
 			JCurveLength = PI * UTurnArcRadius * UTurnTangentScale;
 
-			UE_LOG(LogTemp, Warning,
-				TEXT("UTURN_ARC_INIT: P0=(%.0f,%.0f) P1=(%.0f,%.0f) Center=(%.0f,%.0f) R=%.0f ArcLen=%.0f"),
-				JCurveP0.X, JCurveP0.Y, JCurveP1.X, JCurveP1.Y,
-				UTurnCenter.X, UTurnCenter.Y, UTurnArcRadius, JCurveLength);
+			// JCurveNextRefDist 覆蓋：U-turn 結束後從 NextSeg 起點開始
+			// Override: after U-turn, start at NextSeg's start
+			JCurveNextRefDist = NextSeg.StartDist;
 
-			
+			// DEBUG
+			const FVector ArcAtT0 = UTurnCenter + UTurnArcRadius * UTurnAxisU;
+			const FVector ArcAtT1 = UTurnCenter - UTurnArcRadius * UTurnAxisU;
+
+			UE_LOG(LogTemp, Warning,
+				TEXT("UTURN_ARC_INIT: P0=(%.0f,%.0f,%.0f) P1=(%.0f,%.0f,%.0f) LaneDist=%.0f | ")
+				TEXT("Center=(%.0f,%.0f) R=%.0f HalfDist=%.0f UTurnRadius=%.0f | ")
+				TEXT("ArcLen=%.0f | U=(%.3f,%.3f) V=(%.3f,%.3f) | ")
+				TEXT("CurLateralOff=%.0f NextLateralOff=%.0f | ")
+				TEXT("ArcAt0=(%.0f,%.0f) ArcAtPI=(%.0f,%.0f) | ")
+				TEXT("Seg[%d] EndDist=%.0f Spline=%s"),
+				JCurveP0.X, JCurveP0.Y, JCurveP0.Z,
+				JCurveP1.X, JCurveP1.Y, JCurveP1.Z, LaneDist,
+				UTurnCenter.X, UTurnCenter.Y, UTurnArcRadius, HalfDist, UTurnRadius,
+				JCurveLength,
+				UTurnAxisU.X, UTurnAxisU.Y, UTurnAxisV.X, UTurnAxisV.Y,
+				CurrentLateralOffset, NextSegLaneOffset,
+				ArcAtT0.X, ArcAtT0.Y, ArcAtT1.X, ArcAtT1.Y,
+				CurrentSegmentIndex, Seg.EndDist,
+				Seg.Spline ? *Seg.Spline->GetOwner()->GetName() : TEXT("null"));
 		}
 		else
 		{
@@ -2456,12 +2486,34 @@ void URoadPathFollowerComponent::TickComponent(
 	//     Normal driving — snap to spline position + rotation follows tangent
 	// ================================================================
 	const FRotator CurrentRot = Owner->GetActorRotation();
+	const FVector CurrentPos = Owner->GetActorLocation();
 
 	// 位置：直接用 Spline 取樣位置（不做 VInterpTo）
 	// 車的位移完全由 ReferenceDistance 驅動（Step 3），每幀等速 → 零抖動
 	// Position: directly use spline sample (no VInterpTo)
 	// Movement driven entirely by ReferenceDistance (Step 3), constant per frame → zero jitter
 	const FVector FinalPos = RefPos;
+
+	// DEBUG: 偵測瞬移 — 如果這一幀車子移動距離遠大於 speed*dt，代表有跳躍
+	{
+		const float FrameMoveDist = FVector::Dist(CurrentPos, FinalPos);
+		const float ExpectedMove = CurrentSpeed * DeltaTime;
+		// 容差 = 預期移動 + 200cm（容許 lateral offset 變化 + 浮點誤差）
+		if (FrameMoveDist > ExpectedMove + 200.0f && CurrentSpeed > 1.0f)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("STEP6_TELEPORT! FrameMove=%.0f Expected=%.0f (Speed=%.0f dt=%.4f) | ")
+				TEXT("Seg[%d] RefDist=%.0f LateralOff=%.0f | ")
+				TEXT("CarPos=(%.0f,%.0f,%.0f) → FinalPos=(%.0f,%.0f,%.0f) | ")
+				TEXT("SegAdvanced=%s JustExitedCurve=%d"),
+				FrameMoveDist, ExpectedMove, CurrentSpeed, DeltaTime,
+				CurrentSegmentIndex, ReferenceDistance, CurrentLateralOffset,
+				CurrentPos.X, CurrentPos.Y, CurrentPos.Z,
+				FinalPos.X, FinalPos.Y, FinalPos.Z,
+				(CurrentSegmentIndex != PreAdvanceSegIdx) ? TEXT("YES") : TEXT("NO"),
+				bJustExitedJunctionCurve ? 1 : 0);
+		}
+	}
 
 	// 旋轉：用「實際移動方向」（含橫向偏移分量），車斜切時車頭會自然轉向
 	// Rotation: use ACTUAL movement direction (including lateral component)

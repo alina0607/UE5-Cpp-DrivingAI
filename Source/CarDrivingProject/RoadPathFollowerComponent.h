@@ -622,6 +622,10 @@ private:
 	/// Whether following a U-turn curve (uses UTurn params instead of Junction params)
 	bool bIsUTurnCurve = false;
 
+	/// 是否為 gap bridge 曲線（直線但世界位置不連續 → 不減速）
+	/// Whether this is a gap-bridge curve (straight but non-contiguous → no slowdown)
+	bool bIsGapBridgeCurve = false;
+
 	// U-turn 半圓弧參數（bIsUTurnCurve=true 時使用，替代 Hermite）
 	// Semicircle arc params (used instead of Hermite when bIsUTurnCurve=true)
 	FVector UTurnCenter = FVector::ZeroVector;   // 半圓圓心
