@@ -1942,10 +1942,11 @@ void URoadPathFollowerComponent::TickComponent(
 
 		if (T < 1.0f)
 		{
-			FVector CurvePos;
-			FVector CurveTangent;
 
 			/*
+			
+			FVector CurvePos;
+			FVector CurveTangent;
 			if (bIsUTurnCurve)
 			{
 				// 半圓弧：P(t) = Center + R*(cos(πt)*U + sin(πt)*V)
@@ -1978,19 +1979,26 @@ void URoadPathFollowerComponent::TickComponent(
 			*/
 
 
+			const FVector CurvePos = FMath::CubicInterp(
+				JCurveP0, JCurveT0, JCurveP1, JCurveT1, T);
 
-			// 曲線進行中 — 直接定位，不經 VInterpTo
-// Curve in progress — direct positioning, no VInterpTo
-			CurvePos = FMath::CubicInterp(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T);
-			CurveTangent = FMath::CubicInterpDerivative(JCurveP0, JCurveT0, JCurveP1, JCurveT1, T);
+			// 用「這幀移動方向」而不是「切線方向」
+			// 切線在 t=0 就已側偏，直接用會造成車頭瞬間轉
+			// Use actual frame-to-frame movement direction instead of tangent
+			// Tangent is already sideways at t=0, causing snap rotation
+			const FVector PrevPos = Owner->GetActorLocation();
+			const FVector MoveDelta = CurvePos - PrevPos;
+
 			FRotator FinalRot = Owner->GetActorRotation();
-			if (CurveTangent.SizeSquared() > 1.0f)
+			if (MoveDelta.SizeSquared2D() > 1.0f)
 			{
-				FinalRot = CurveTangent.Rotation();
+				const FRotator TargetRot = MoveDelta.Rotation();
+				FinalRot = FMath::RInterpTo(
+					FinalRot, TargetRot, DeltaTime, UTurnRotationSpeed);
 			}
 
 			Owner->SetActorLocationAndRotation(CurvePos, FinalRot);
-			return; // 還在曲線上 → 跳過正常 spline 邏輯 / Still on curve → skip normal spline
+			return;// 還在曲線上 → 跳過正常 spline 邏輯 / Still on curve → skip normal spline
 		}
 
 		// ---- T >= 1.0：曲線結束，直接銜接新段的 Spline 邏輯（同一幀！）----

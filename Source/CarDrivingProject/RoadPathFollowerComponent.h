@@ -281,6 +281,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|U-Turn", meta = (ClampMin = "0.3", ClampMax = "5.0"))
 	float UTurnTangentScale = 1.0f;
 
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|U-Turn")
+	float UTurnRotationSpeed = 5.0f;
+
 	// ================================================================
 	//  車道 / Lane Control
 	// ================================================================
