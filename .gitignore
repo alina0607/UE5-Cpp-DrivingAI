@@ -6,8 +6,7 @@ Saved/
 Build/
 
 
-*.umap
-*.uasset
+
 
 # Visual Studio
 .vs/

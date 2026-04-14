@@ -9,21 +9,21 @@ void ADrivingMapHUD::BeginPlay()
 	APlayerController* PC = GetOwningPlayerController();
 	if (!PC) return;
 
-	// 決定 Widget 類別 / Determine widget class
+	// Determine widget class
 	TSubclassOf<UDrivingMapWidget> WidgetClass = MapWidgetClass;
 	if (!WidgetClass)
 	{
 		WidgetClass = UDrivingMapWidget::StaticClass();
 	}
 
-	// 建立地圖 Widget / Create map widget
+	// Create map widget
 	MapWidget = CreateWidget<UDrivingMapWidget>(PC, WidgetClass);
 	if (MapWidget)
 	{
 		MapWidget->AddToViewport(100);
 	}
 
-	// 綁定快捷鍵 / Bind hotkeys
+	// Bind hotkeys
 	EnableInput(PC);
 	if (InputComponent)
 	{
@@ -53,7 +53,6 @@ void ADrivingMapHUD::HandleToggleMap()
 
 	if (MapWidget->bIsFullscreen)
 	{
-		// 全螢幕：顯示游標、允許 UI 互動
 		// Fullscreen: show cursor, enable UI interaction
 		PC->bShowMouseCursor = true;
 		FInputModeGameAndUI InputMode;
@@ -63,7 +62,6 @@ void ADrivingMapHUD::HandleToggleMap()
 	}
 	else
 	{
-		// 小地圖：隱藏游標、回到遊戲輸入
 		// Minimap: hide cursor, return to game input
 		PC->bShowMouseCursor = false;
 		PC->SetInputMode(FInputModeGameOnly());
@@ -76,12 +74,12 @@ void ADrivingMapHUD::HandleEscapeKey()
 
 	if (MapWidget->bIsFullscreen)
 	{
-		// 先關閉全螢幕 / Close fullscreen first
+		// Close fullscreen first
 		HandleToggleMap();
 	}
 	else if (MapWidget->GetSelectedVehicle())
 	{
-		// 取消選取車輛 / Deselect vehicle
+		// Deselect vehicle
 		MapWidget->DeselectVehicle();
 	}
 }

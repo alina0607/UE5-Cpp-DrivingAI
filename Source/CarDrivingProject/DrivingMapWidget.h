@@ -124,6 +124,47 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text")
 	FVector2D ParkingLotNameOffset = FVector2D(8.0, -6.0);
 
+
+	// ---- 導航路線 / Navigation Route ----
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Colors")
+	FLinearColor RouteColor = FLinearColor(1.0f, 0.6f, 0.1f, 0.85f);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Route")
+	float RouteThicknessFullscreen = 3.5f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Route")
+	float RouteThicknessMinimap = 2.0f;
+
+	// ---- 道路 Edge / Road Edge ----
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Colors")
+	FLinearColor EdgeColor = FLinearColor(0.3f, 0.6f, 1.0f, 0.6f);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Route")
+	float EdgeThicknessFullscreen = 3.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Route")
+	float EdgeThicknessMinimap = 1.5f;
+
+	// ---- 停車場圓圈外框 / Parking Lot Circle Outline ----
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Colors")
+	FLinearColor ParkingLotOutlineColor = FLinearColor(1.0f, 1.0f, 1.0f, 0.8f);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text")
+	float ParkingLotOutlineThickness = 1.5f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text")
+	float ParkingLotCircleRadius = 6.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Colors")
+	FLinearColor ParkingLotHoverColor = FLinearColor(1.0f, 1.0f, 0.2f, 1.0f);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text")
+	int32 ParkingLotHoverFontSize = 20;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text")
+	FLinearColor ParkingLotHoverTextColor = FLinearColor(1.0f, 1.0f, 0.2f, 1.0f);
+
+
 	// ================================================================
 	//  右側資訊面板 / Right Info Panel
 	// ================================================================
@@ -196,9 +237,17 @@ protected:
 	virtual FReply NativeOnMouseWheel(const FGeometry& InGeometry,
 		const FPointerEvent& InMouseEvent) override;
 
+	virtual FReply NativeOnMouseMove(const FGeometry& InGeometry,
+		const FPointerEvent& InMouseEvent) override;
+
 private:
 
+
+
 	// ---- 快取 / Cache ----
+
+// Hover 狀態
+	TWeakObjectPtr<AParkingLotActor> HoveredParkingLot;
 
 	TArray<FMapVehicleCache> CachedVehicles;
 	bool bCacheBuilt = false;

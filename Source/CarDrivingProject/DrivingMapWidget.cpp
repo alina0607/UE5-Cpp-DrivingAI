@@ -127,6 +127,7 @@ int32 UDrivingMapWidget::NativePaint(
 	// ---- 1. 背景 ----
 	DrawBackground(OutDrawElements, AllottedGeometry, MapOrigin, MapSize, LayerId);
 
+	/*
 	// ---- 2. 道路 Spline 曲線 / Road spline curves ----
 	{
 		FPaintContext EdgeCtx(AllottedGeometry, MyCullingRect, OutDrawElements, LayerId + 1,
@@ -136,7 +137,7 @@ int32 UDrivingMapWidget::NativePaint(
 		{
 			if (URoadNetworkSubsystem* RS = World->GetSubsystem<URoadNetworkSubsystem>())
 			{
-				const FLinearColor EdgeColor(0.3f, 0.6f, 1.0f, 0.6f);
+				const float EdgeThickness = bIsFullscreen ? EdgeThicknessFullscreen : EdgeThicknessMinimap; // 新增
 				// 每條 Edge 沿 Spline 取樣多個點畫曲線
 				// Sample multiple points along each edge's spline to draw curves
 				constexpr int32 SplineSampleCount = 20;
@@ -162,7 +163,7 @@ int32 UDrivingMapWidget::NativePaint(
 						if (s > 0)
 						{
 							UWidgetBlueprintLibrary::DrawLine(
-								EdgeCtx, PrevMapPt, MapPt, EdgeColor, true, 1.0f);
+								EdgeCtx, PrevMapPt, MapPt, EdgeColor, true, EdgeThickness);
 						}
 						PrevMapPt = MapPt;
 					}
@@ -170,7 +171,7 @@ int32 UDrivingMapWidget::NativePaint(
 			}
 		}
 	}
-
+	*/
 	// ---- 3. 車輛箭頭 ----
 	FPaintContext Context(AllottedGeometry, MyCullingRect, OutDrawElements, LayerId + 1,
 		InWidgetStyle, bParentEnabled);
@@ -210,8 +211,7 @@ int32 UDrivingMapWidget::NativePaint(
 
 			if (RoutePoints.Num() > 1)
 			{
-				const FLinearColor RouteColor(1.0f, 0.6f, 0.1f, 0.85f);
-				const float RouteThickness = bIsFullscreen ? 3.5f : 2.0f;
+				const float RouteThickness = bIsFullscreen ? RouteThicknessFullscreen : RouteThicknessMinimap; // 已有，改用成員變數
 
 				FVector2D PrevPt = WorldToMap(RoutePoints[0], MapOrigin, MapSize);
 				for (int32 r = 1; r < RoutePoints.Num(); ++r)
@@ -263,30 +263,15 @@ int32 UDrivingMapWidget::NativePaint(
 				if (!Lot) continue;
 
 				FVector2D LotMapPos = WorldToMap(Lot->GetActorLocation(), MapOrigin, MapSize);
-				DrawCircle(Context, LotMapPos, 6.0f, ParkingLotColor, 2.0f);
 
-				// 用自訂字體大小和顏色畫名稱 / Draw name with custom font size & color
-				if (bShowParkingNames)
-				{
-					FSlateDrawElement::MakeText(OutDrawElements, LayerId + 2,
-						AllottedGeometry.ToPaintGeometry(
-							FVector2f(200.0f, 20.0f),
-							FSlateLayoutTransform(FVector2f(
-								static_cast<float>(LotMapPos.X + ParkingLotNameOffset.X),
-								static_cast<float>(LotMapPos.Y + ParkingLotNameOffset.Y)))),
-						FString::Printf(TEXT("P %s"), *Lot->ParkingLotName),
-						LotFont, ESlateDrawEffect::None, ParkingLotTextColor);
-				}
+				const bool bHovered = (HoveredParkingLot.IsValid() && HoveredParkingLot.Get() == Lot);
+				const FLinearColor CurrentLotColor = bHovered ? ParkingLotHoverColor : ParkingLotColor;
 
-				for (int32 s = 0; s < Lot->SpotCount; ++s)
-				{
-					FVector2D SpotPos = WorldToMap(Lot->GetSpotWorldPosition(s), MapOrigin, MapSize);
-					const bool bOcc = Lot->IsSpotOccupied(s);
-					const float Rad = bOcc ? 2.5f : 3.5f;
-					FLinearColor SpotColor = bOcc
-						? FLinearColor(0.5f, 0.5f, 0.5f, 0.5f) : ParkingLotColor;
-					DrawCircle(Context, SpotPos, Rad, SpotColor, 1.5f);
-				}
+				DrawCircle(Context, LotMapPos, ParkingLotCircleRadius, CurrentLotColor, 2.0f);
+				DrawCircle(Context, LotMapPos,
+					ParkingLotCircleRadius + ParkingLotOutlineThickness + 1.0f,
+					bHovered ? ParkingLotHoverColor : ParkingLotOutlineColor,
+					ParkingLotOutlineThickness);
 			}
 
 		}
@@ -445,6 +430,54 @@ int32 UDrivingMapWidget::NativePaint(
 		}
 	}
 
+
+	// ---- Hover 名稱顯示（視窗中上）----
+	if (bIsFullscreen && HoveredParkingLot.IsValid())
+	{
+		FSlateFontInfo HoverFont = FAppStyle::GetFontStyle("NormalFont");
+		HoverFont.Size = ParkingLotHoverFontSize;
+
+		FVector2D WidgetSize = AllottedGeometry.GetLocalSize();
+		const FString HoverText = HoveredParkingLot->ParkingLotName;
+
+		// 置中上方
+		const float TextWidth = 300.0f;
+		const float TextX = (WidgetSize.X - TextWidth) * 0.5f;
+		const float TextY = WidgetSize.Y * 0.05f;
+
+		FSlateDrawElement::MakeText(
+			OutDrawElements, LayerId + 3,
+			AllottedGeometry.ToPaintGeometry(
+				FVector2f(TextWidth, 40.0f),
+				FSlateLayoutTransform(FVector2f(TextX, TextY))),
+			HoverText,
+			HoverFont,
+			ESlateDrawEffect::None,
+			ParkingLotHoverTextColor);
+
+
+		HoverFont.Size = ParkingLotFontSize;
+
+		// 用停車場世界座標轉地圖座標
+		FVector2D LotMapPos = WorldToMap(
+			HoveredParkingLot->GetActorLocation(), MapOrigin, MapSize);
+
+		const FString HoverText2 = HoveredParkingLot->ParkingLotName;
+
+		FSlateDrawElement::MakeText(
+			OutDrawElements, LayerId + 3,
+			AllottedGeometry.ToPaintGeometry(
+				FVector2f(TextWidth, 40.0f),
+				FSlateLayoutTransform(FVector2f(
+					LotMapPos.X + ParkingLotNameOffset.X,
+					LotMapPos.Y + ParkingLotNameOffset.Y))),
+			HoverText2,
+			HoverFont,
+			ESlateDrawEffect::None,
+			ParkingLotTextColor);
+
+	} 
+
 	return LayerId + 3;
 }
 
@@ -544,6 +577,23 @@ FReply UDrivingMapWidget::NativeOnMouseWheel(
 	return FReply::Unhandled();
 }
 
+FReply UDrivingMapWidget::NativeOnMouseMove(const FGeometry& InGeometry, const FPointerEvent& InMouseEvent)
+{
+	if (!bIsFullscreen)
+	{
+		HoveredParkingLot = nullptr;
+		return FReply::Unhandled();
+	}
+
+	FVector2D LocalPos = InGeometry.AbsoluteToLocal(InMouseEvent.GetScreenSpacePosition());
+	FVector2D MapOrigin, MapSize;
+	GetMapDrawRect(InGeometry, MapOrigin, MapSize);
+
+	HoveredParkingLot = FindParkingLotNearMapPos(LocalPos, MapOrigin, MapSize, 22.0f);
+
+	return FReply::Unhandled();
+}
+
 // ================================================================
 //  公開 API / Public API
 // ================================================================
@@ -551,6 +601,8 @@ FReply UDrivingMapWidget::NativeOnMouseWheel(
 void UDrivingMapWidget::ToggleMapSize()
 {
 	bIsFullscreen = !bIsFullscreen;
+	if (!bIsFullscreen) HoveredParkingLot = nullptr;
+
 	SetVisibility(bIsFullscreen ? ESlateVisibility::Visible : ESlateVisibility::HitTestInvisible);
 }
 
@@ -699,6 +751,10 @@ void UDrivingMapWidget::BuildNodeCache()
 	}
 
 	bCacheBuilt = true;
+
+	UE_LOG(LogTemp, Warning, TEXT("[MAP] WorldBoundsMin=(%.0f, %.0f) WorldBoundsMax=(%.0f, %.0f)"),
+		WorldBoundsMin.X, WorldBoundsMin.Y,
+		WorldBoundsMax.X, WorldBoundsMax.Y);
 }
 
 void UDrivingMapWidget::UpdateVehicleCache()
@@ -732,13 +788,17 @@ FVector2D UDrivingMapWidget::WorldToMap(
 	const FVector2D& MapOrigin,
 	const FVector2D& MapSize) const
 {
-	double RangeX = WorldBoundsMax.X - WorldBoundsMin.X;
-	double RangeY = WorldBoundsMax.Y - WorldBoundsMin.Y;
+	// 改用背景圖對應的固定世界範圍
+	const FVector2D& BoundsMin = MapTextureWorldMin;
+	const FVector2D& BoundsMax = MapTextureWorldMax;
+
+	double RangeX = BoundsMax.X - BoundsMin.X;
+	double RangeY = BoundsMax.Y - BoundsMin.Y;
 	if (RangeX < 1.0) RangeX = 1.0;
 	if (RangeY < 1.0) RangeY = 1.0;
 
-	double NormX = (WorldPos.X - WorldBoundsMin.X) / RangeX;
-	double NormY = (WorldPos.Y - WorldBoundsMin.Y) / RangeY;
+	double NormX = (WorldPos.X - BoundsMin.X) / RangeX;
+	double NormY = (WorldPos.Y - BoundsMin.Y) / RangeY;
 
 	return FVector2D(
 		MapOrigin.X + NormY * MapSize.X,

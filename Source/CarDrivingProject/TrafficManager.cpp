@@ -44,9 +44,6 @@ void ATrafficManager::CollectParkingActors()
 		AllParkingLots.Add(*It);
 	}
 
-	UE_LOG(LogTemp, Warning,
-		TEXT("TrafficManager: Found %d ParkingLots"),
-		AllParkingLots.Num());
 }
 
 // ============================================================================
@@ -121,8 +118,6 @@ void ATrafficManager::SpawnAllVehicles()
 			continue;
 		}
 
-		UE_LOG(LogTemp, Warning, TEXT("[TRAFFIC] Config[%d] class=%s Count=%d MinSpeed=%.0f MaxSpeed=%.0f"),
-			CfgIdx, *Config.VehicleClass->GetName(), Config.Count, Config.MinSpeed, Config.MaxSpeed);
 
 		for (int32 i = 0; i < Config.Count; ++i)
 		{
@@ -151,7 +146,7 @@ void ATrafficManager::SpawnAllVehicles()
 			if (PF)
 			{
 				const float RandSpeed = FMath::FRandRange(Config.MinSpeed, Config.MaxSpeed);
-				PF->MaxSpeed = RandSpeed;
+				PF->MaxSpeed = 1500.f;
 				PF->bAutoStart = false;
 				PF->ParkingMode = EParkingMode::RoadsideStop;
 

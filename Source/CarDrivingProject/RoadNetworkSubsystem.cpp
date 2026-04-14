@@ -642,14 +642,12 @@ void URoadNetworkSubsystem::BuildGraphNodes()
 
 // ============================================================================
 //  BindParkingActorsToEdges
-//  掃描場景所有停車場 / 路邊停車，把每個 Spot 對應到正確的 Graph EdgeId
 //  Scan all parking actors, assign correct Graph EdgeId per spot
 // ============================================================================
 void URoadNetworkSubsystem::BindParkingActorsToEdges()
 {
 #if WITH_EDITOR
-    // GetActorLabel 只在編輯器/PIE 有意義；packaged build 會回傳 internal name
-    // GetActorLabel only meaningful in editor/PIE; packaged builds return internal name
+    // GetActorLabel only meaningful in editor; packaged builds return internal name
 #endif
 
     UWorld* World = GetWorld();
@@ -663,7 +661,6 @@ void URoadNetworkSubsystem::BindParkingActorsToEdges()
     {
         if (!ParkingActor) return;
 
-        // ---- Step 1: 收集所有 GetActorLabel().Contains(TargetLabel) 的 RoadActor 對應的 Edges ----
         // ---- Collect all GraphEdges whose RoadActor matches the label ----
         TArray<int32> CandidateEdgeIds;
         CandidateEdgeIds.Reserve(8);
@@ -682,17 +679,10 @@ void URoadNetworkSubsystem::BindParkingActorsToEdges()
 
         if (CandidateEdgeIds.Num() == 0)
         {
-            UE_LOG(LogTemp, Warning,
-                TEXT("[BIND-PARK] '%s': No edges matched RoadActor label '%s'"),
-                *ParkingActor->GetName(), *TargetLabel);
             return;
         }
 
-        UE_LOG(LogTemp, Log,
-            TEXT("[BIND-PARK] '%s': %d candidate edges matched label '%s'"),
-            *ParkingActor->GetName(), CandidateEdgeIds.Num(), *TargetLabel);
 
-        // ---- Step 2: 每個 Spot 找最佳 Edge ----
         // ---- For each spot, find best edge from candidates ----
         for (int32 SpotIdx = 0; SpotIdx < SpotPositions.Num(); ++SpotIdx)
         {
@@ -708,7 +698,6 @@ void URoadNetworkSubsystem::BindParkingActorsToEdges()
                 const FRoadGraphEdge& E = GraphEdges[EdgeId];
                 if (!E.InputSpline) continue;
 
-                // 把 spot 投影到此 edge 的 spline 上，但只取 [StartDist, EndDist] 範圍內
                 // Project spot to spline, clamp to [StartDist, EndDist] of this edge
                 const float Key = E.InputSpline->FindInputKeyClosestToWorldLocation(SpotPos);
                 float ProjDist = E.InputSpline->GetDistanceAlongSplineAtSplineInputKey(Key);
@@ -721,8 +710,6 @@ void URoadNetworkSubsystem::BindParkingActorsToEdges()
                 const FVector SplineDir = E.InputSpline->GetDirectionAtDistanceAlongSpline(
                     ProjDist, ESplineCoordinateSpace::World).GetSafeNormal2D();
 
-                // Edge 是無向的（同一條路段同時代表正反兩向行駛），所以接受 |dot| ≥ 0.866
-                // 真正的行駛方向由 NavigateTo* 在執行時決定（看 dot 正負選 StartNode 或 EndNode）
                 // Edge is undirected (one segment represents both travel directions),
                 // so accept |dot| ≥ 0.866. The actual travel direction is decided
                 // at NavigateTo* time based on dot sign (StartNode vs EndNode as goal).
@@ -741,20 +728,10 @@ void URoadNetworkSubsystem::BindParkingActorsToEdges()
             if (BestEdgeId != INDEX_NONE)
             {
                 Assign(SpotIdx, BestEdgeId);
-                UE_LOG(LogTemp, Log,
-                    TEXT("[BIND-PARK] '%s' Spot[%d] → Edge=%d (dist=%.0f dot=%.2f)"),
-                    *ParkingActor->GetName(), SpotIdx, BestEdgeId, BestDist, BestDot);
-            }
-            else
-            {
-                UE_LOG(LogTemp, Warning,
-                    TEXT("[BIND-PARK] '%s' Spot[%d] → NO matching edge (no candidate within 30°)"),
-                    *ParkingActor->GetName(), SpotIdx);
             }
         }
     };
 
-    // ---- [PARK-NAV] ParkingLot Actors：用 Arrow[0] 當唯一錨點，挑候選 edges 裡最近的那段 sub-edge ----
     // ---- [PARK-NAV] For each ParkingLot: use Arrow[0] as the single anchor, pick nearest candidate sub-edge ----
     for (TActorIterator<AParkingLotActor> It(World); It; ++It)
     {
@@ -764,11 +741,7 @@ void URoadNetworkSubsystem::BindParkingActorsToEdges()
         const FString& TargetLabel = Lot->TargetRoadActorLabel;
         const FVector AnchorPos = Lot->GetAnchorArrowPosition();
 
-        UE_LOG(LogTemp, Warning,
-            TEXT("[PARK-NAV] '%s' begin binding — AnchorPos=(%.0f,%.0f,%.0f) TargetLabel='%s'"),
-            *Lot->ParkingLotName, AnchorPos.X, AnchorPos.Y, AnchorPos.Z, *TargetLabel);
 
-        // Step 1: 收集所有 ActorLabel 符合的候選 edges
         // Step 1: collect candidate edges by actor label
         TArray<int32> CandidateEdgeIds;
         CandidateEdgeIds.Reserve(8);
@@ -785,15 +758,9 @@ void URoadNetworkSubsystem::BindParkingActorsToEdges()
 
         if (CandidateEdgeIds.Num() == 0)
         {
-            UE_LOG(LogTemp, Error,
-                TEXT("[PARK-NAV] '%s' NO candidate edges matched label '%s' — parking lot unreachable"),
-                *Lot->ParkingLotName, *TargetLabel);
             continue;
         }
 
-        UE_LOG(LogTemp, Warning,
-            TEXT("[PARK-NAV] '%s' %d candidate edges for label '%s'"),
-            *Lot->ParkingLotName, CandidateEdgeIds.Num(), *TargetLabel);
 
         // Step 2: 把 Arrow[0] 投影到每段候選 sub-edge 的 [Lo,Hi] 範圍內，挑最近者
         //         不做方向 dot 過濾（Edge 無向，方向由 NavigateToParkingLot 執行期決定）
@@ -818,9 +785,6 @@ void URoadNetworkSubsystem::BindParkingActorsToEdges()
                 ProjDist, ESplineCoordinateSpace::World);
             const float Dist = FVector::Dist(AnchorPos, ClosestPt);
 
-            UE_LOG(LogTemp, Log,
-                TEXT("[PARK-NAV]   cand Edge=%d range[%.0f..%.0f] clampProj=%.0f pt=(%.0f,%.0f,%.0f) dist=%.0f"),
-                EdgeId, Lo, Hi, ProjDist, ClosestPt.X, ClosestPt.Y, ClosestPt.Z, Dist);
 
             if (Dist < BestDist)
             {
@@ -832,18 +796,11 @@ void URoadNetworkSubsystem::BindParkingActorsToEdges()
 
         if (BestEdgeId == INDEX_NONE)
         {
-            UE_LOG(LogTemp, Error,
-                TEXT("[PARK-NAV] '%s' failed to pick best edge from %d candidates"),
-                *Lot->ParkingLotName, CandidateEdgeIds.Num());
             continue;
         }
 
         Lot->AssignBoundEdge(BestEdgeId, BestProjPt);
 
-        UE_LOG(LogTemp, Warning,
-            TEXT("[PARK-NAV] '%s' BOUND → Edge=%d dist=%.0fcm projPt=(%.0f,%.0f,%.0f)"),
-            *Lot->ParkingLotName, BestEdgeId, BestDist,
-            BestProjPt.X, BestProjPt.Y, BestProjPt.Z);
     }
 
 }
@@ -1075,344 +1032,9 @@ FRoadGraphPath URoadNetworkSubsystem::FindPathAStar(int32 StartNodeId, int32 Goa
 /// </summary>
 void URoadNetworkSubsystem::DrawDebugGraph()
 {
-    UWorld* World = GetWorld();
-    if (!World)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("DrawDebugGraph: World is null"));
-        return;
-    }
-
-    const ARoadWorldSettings* RoadSettings = GetRoadWorldSettings();
-    if (!RoadSettings)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("DrawDebugGraph: WorldSettings is not ARoadWorldSettings"));
-        return;
-    }
-
-    const float Duration = RoadSettings->DebugDrawDuration;
-    const float NodeRadius = RoadSettings->DebugNodeRadius;
-    const float EdgeThickness = RoadSettings->DebugEdgeThickness;
-    const float ZOff = RoadSettings->DebugDrawZOffset;
-    const FVector EdgeZOffset(0.0f, 0.0f, ZOff);
-    const FVector NodeZOffset(0.0f, 0.0f, ZOff);
-    const FVector AStarZOffset(0.0f, 0.0f, ZOff + 200.0f); // A* 比 edge 再高 200
-
-    const bool bHasFinalNodes = GraphNodes.Num() > 0;
-    const bool bHasFinalEdges = GraphEdges.Num() > 0;
-
-    /*
-    Draw edges first.
-    Prefer finalized GraphEdges if available;
-    otherwise fall back to EdgeCandidates.
-    */
-    if (RoadSettings->bDrawDebugEdges)
-    {
-        if (bHasFinalEdges)
-        {
-            for (const FRoadGraphEdge& Edge : GraphEdges)
-            {
-                if (Edge.InputSpline)
-                {
-                    /*Sample along the spline and approximate the curved edge
-                    using multiple line segments.
-                    */
-                    const float StartDist = Edge.StartDistanceOnSpline;
-                    const float EndDist = Edge.EndDistanceOnSpline;
-
-                    const float SegmentStep = 300.0f;
-                    const int32 NumSegments = FMath::Max(
-                        1,
-                        FMath::CeilToInt((EndDist - StartDist) / SegmentStep)
-                    );
-
-                    FVector PrevPoint =
-                        Edge.InputSpline->GetLocationAtDistanceAlongSpline(
-                            StartDist,
-                            ESplineCoordinateSpace::World
-                        ) + EdgeZOffset;
-
-                    for (int32 SegmentIndex = 1; SegmentIndex <= NumSegments; ++SegmentIndex)
-                    {
-                        const float Alpha = static_cast<float>(SegmentIndex) / static_cast<float>(NumSegments);
-                        const float CurrentDist = FMath::Lerp(StartDist, EndDist, Alpha);
-
-                        const FVector CurrentPoint =
-                            Edge.InputSpline->GetLocationAtDistanceAlongSpline(
-                                CurrentDist,
-                                ESplineCoordinateSpace::World
-                            ) + EdgeZOffset;
-
-                        DrawDebugLine(
-                            World,
-                            PrevPoint,
-                            CurrentPoint,
-                            FColor::Cyan,
-                            false,
-                            Duration,
-                            0,
-                            EdgeThickness
-                        );
-
-                        PrevPoint = CurrentPoint;
-                    }
-                }
-                else
-                {
-                    DrawDebugLine(
-                        World,
-                        Edge.StartWorldLocation,
-                        Edge.EndWorldLocation,
-                        FColor::Cyan,
-                        false,
-                        Duration,
-                        0,
-                        EdgeThickness
-                    );
-                }
-
-                // Optionally draw edge id and node connection info at the midpoint.
-                if (RoadSettings->bDrawDebugEdgeLabels)
-                {
-                    const FVector MidPoint =
-                        (Edge.StartWorldLocation + Edge.EndWorldLocation) * 0.5f + EdgeZOffset;
-
-                    DrawDebugString(
-                        World,
-                        MidPoint + FVector(0.0f, 0.0f, 100.0f),
-                        FString::Printf(
-                            TEXT("E%d  %d->%d"),
-                            Edge.EdgeId,
-                            Edge.StartNodeId,
-                            Edge.EndNodeId),
-                        nullptr,
-                        FColor::Cyan,
-                        Duration,
-                        false
-                    );
-                }
-            }
-        }
-        else
-        {
-            for (const FRoadEdgeCandidate& Edge : EdgeCandidates)
-            {
-                DrawDebugLine(
-                    World,
-                    Edge.StartWorldLocation,
-                    Edge.EndWorldLocation,
-                    FColor::Blue,
-                    false,
-                    Duration,
-                    0,
-                    EdgeThickness
-                );
-            }
-        }
-    }
-
-    /*
-    Draw nodes next.
-    Prefer finalized GraphNodes if available;
-    otherwise fall back to NodeCandidates.
-    */
-    if (RoadSettings->bDrawDebugNodes)
-    {
-        if (bHasFinalNodes)
-        {
-            for (const FRoadGraphNode& Node : GraphNodes)
-            {
-                const FVector NodeDrawPos = Node.WorldLocation + NodeZOffset;
-
-                DrawDebugSphere(
-                    World,
-                    NodeDrawPos,
-                    NodeRadius,
-                    12,
-                    FColor::Green,
-                    false,
-                    Duration,
-                    0,
-                    10.0f
-                );
-
-                if (RoadSettings->bDrawDebugNodeLabels)
-                {
-                    DrawDebugString(
-                        World,
-                        NodeDrawPos + FVector(0.0f, 0.0f, 150.0f),
-                        FString::Printf(
-                            TEXT("N%d  E:%d"),
-                            Node.NodeId,
-                            Node.ConnectedEdgeIds.Num()),
-                        nullptr,
-                        FColor::White,
-                        Duration,
-                        false
-                    );
-                }
-            }
-        }
-        else
-        {
-            for (const FRoadGraphNodeCandidate& Node : NodeCandidates)
-            {
-                DrawDebugSphere(
-                    World,
-                    Node.WorldLocation,
-                    NodeRadius,
-                    12,
-                    FColor::Yellow,
-                    false,
-                    Duration,
-                    0,
-                    10.0f
-                );
-
-                // Optionally draw candidate node id and merged endpoint count.
-                if (RoadSettings->bDrawDebugNodeLabels)
-                {
-                    DrawDebugString(
-                        World,
-                        Node.WorldLocation + FVector(0.0f, 0.0f, 250.0f),
-                        FString::Printf(
-                            TEXT("NC%d  M:%d"),
-                            Node.NodeId,
-                            Node.MergedEndpointCount),
-                        nullptr,
-                        FColor::Yellow,
-                        Duration,
-                        false
-                    );
-                }
-            }
-        }
-    }
-
-    // ---- Draw junction candidates (red, larger than nodes) ----
-    for (int32 i = 0; i < JunctionCandidates.Num(); ++i)
-    {
-        const FRoadJunctionCandidate& J = JunctionCandidates[i];
-
-        const FVector JunctionDrawPos = J.WorldLocation + NodeZOffset;
-
-        DrawDebugSphere(
-            World,
-            JunctionDrawPos,
-            NodeRadius * 1.5f,   // Slightly larger than normal nodes
-            12,
-            FColor::Red,         // Red = junction
-            false,
-            Duration,
-            0,
-            12.0f
-        );
-
-        // Print junction index and connected edges above the sphere
-        FString JEdgesStr;
-        for (int32 k = 0; k < J.ConnectedEdgeIndices.Num(); ++k)
-        {
-            if (k > 0) { JEdgesStr += TEXT(","); }
-            JEdgesStr += FString::Printf(TEXT("E%d"), J.ConnectedEdgeIndices[k]);
-        }
-
-        DrawDebugString(
-            World,
-            JunctionDrawPos + FVector(0.0f, 0.0f, 150.0f),
-            FString::Printf(TEXT("J%d [%s]"), i, *JEdgesStr),
-            nullptr,
-            FColor::Red,
-            Duration,
-            false
-        );
-    }
-
-    UE_LOG(
-        LogTemp,
-        Warning,
-        TEXT("DrawDebugGraph: Mode=%s | Nodes=%d | Edges=%d | Junctions=%d"),
-        (bHasFinalNodes || bHasFinalEdges) ? TEXT("FinalGraph") : TEXT("Candidates"),
-        bHasFinalNodes ? GraphNodes.Num() : NodeCandidates.Num(),
-        bHasFinalEdges ? GraphEdges.Num() : EdgeCandidates.Num(),
-        JunctionCandidates.Num()
-    );
-
-    // ---- 寫死測試：用 A* 找路徑並畫黃色粗線 ----
-    // Hardcoded test: run A* between two nodes and draw the path in yellow
-    if (bHasFinalEdges && bHasFinalNodes)
-    {
-        const int32 TestStartNode = 9;
-        const int32 TestGoalNode = 2;
-
-        const FRoadGraphPath TestPath = FindPathAStar(TestStartNode, TestGoalNode);
-
-
-        if (TestPath.bPathFound)
-        {
-            // 對路徑中每對相鄰 node，找到連接的 edge 並沿 spline 畫黃色粗線
-            // For each adjacent node pair in the path, find the connecting edge
-            // and draw it as a thick yellow line along the spline
-            for (int32 i = 0; i < TestPath.NodePath.Num() - 1; ++i)
-            {
-                const int32 FromNode = TestPath.NodePath[i];
-                const int32 ToNode = TestPath.NodePath[i + 1];
-
-                for (const FRoadGraphEdge& Edge : GraphEdges)
-                {
-                    const bool bMatch =
-                        (Edge.StartNodeId == FromNode && Edge.EndNodeId == ToNode)
-                        || (Edge.StartNodeId == ToNode && Edge.EndNodeId == FromNode);
-
-                    if (!bMatch)
-                    {
-                        continue;
-                    }
-
-                    if (!Edge.InputSpline)
-                    {
-                        break;
-                    }
-
-                    // 沿 spline 取樣畫線（比 edge 再高 200cm，方便辨識）
-                    // Sample along spline and draw (higher than edges for visibility)
-                    const float FromDist = Edge.StartDistanceOnSpline;
-                    const float ToDist = Edge.EndDistanceOnSpline;
-                    const int32 NumSteps = FMath::Max(1,
-                        FMath::CeilToInt(FMath::Abs(ToDist - FromDist) / 200.0f));
-
-                    FVector PrevPt = Edge.InputSpline->GetLocationAtDistanceAlongSpline(
-                        FromDist, ESplineCoordinateSpace::World) + AStarZOffset;
-
-                    for (int32 S = 1; S <= NumSteps; ++S)
-                    {
-                        const float D = FMath::Lerp(FromDist, ToDist,
-                            static_cast<float>(S) / static_cast<float>(NumSteps));
-
-                        const FVector Pt = Edge.InputSpline->GetLocationAtDistanceAlongSpline(
-                            D, ESplineCoordinateSpace::World) + AStarZOffset;
-
-                        DrawDebugLine(
-                            World,
-                            PrevPt,
-                            Pt,
-                            FColor::Yellow,
-                            false,
-                            Duration,
-                            0,
-                            EdgeThickness * 3.0f
-                        );
-
-                        PrevPt = Pt;
-                    }
-
-                    break;  // 找到了就不用繼續搜尋
-                }
-            }
-        }
-    }
 }
 
 // ============================================================================
-//  GetGraphEdgeById — 用 EdgeId 查找 Graph Edge
 //  Look up a graph edge by its EdgeId
 // ============================================================================
 const FRoadGraphEdge* URoadNetworkSubsystem::GetGraphEdgeById(int32 EdgeId) const
