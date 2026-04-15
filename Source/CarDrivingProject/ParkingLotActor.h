@@ -29,34 +29,26 @@ public:
 	AParkingLotActor();
 
 	// ================================================================
-	//  Mesh / 外觀
+	//  Mesh外觀
 	// ================================================================
 
-	/// 建物 Mesh（在 BP 裡設定 Static Mesh）/ Building mesh (set mesh in BP)
+	///Building mesh (set mesh in BP)
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mesh")
 	TObjectPtr<UStaticMeshComponent> BuildingMesh;
 
-	/// 停車場地板 Mesh / Parking floor mesh
+	///Parking floor mesh
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mesh")
 	TObjectPtr<UStaticMeshComponent> ParkingMesh;
 
 	// ================================================================
-	//  設定 / Configuration
+	// Configuration
 	// ================================================================
 
-	/// 停車場自訂名稱（地圖上顯示）/ Custom name displayed on map
+	///Custom name displayed on map
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Parking Lot")
 	FString ParkingLotName = TEXT("Parking Lot");
 
-	/// 停車格大小（半徑，cm）— 用於視覺化 Box / Spot half-extent (cm) for visualization box
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Parking Lot")
-	FVector SpotHalfExtent = FVector(250.0f, 125.0f, 10.0f);
 
-	/// 停車場在道路的哪一側（true=左側 false=右側）
-	/// Which side of the road (true=left, false=right).
-	/// Auto-detected from position relative to nearest road, or override manually.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Parking Lot")
-	bool bIsLeftSide = false;
 
 	/// 此停車場關聯的 BP_DriveRoad Actor 名稱（編輯器設定）
 	/// 例如填 "BP_DriveRoad_5"，BindParkingActorsToEdges 時用 GetActorLabel().Contains() 配對
@@ -140,32 +132,32 @@ public:
 	/// Called by RoadNetworkSubsystem: set bound edge + projection point for the whole lot
 	void AssignBoundEdge(int32 EdgeId, const FVector& ProjectionPoint);
 
+	bool IsLeftSide() const { return bIsLeftSide; }
+
 protected:
 	virtual void BeginPlay() override;
 
-#if WITH_EDITOR
-	virtual void OnConstruction(const FTransform& Transform) override;
-#endif
 
 private:
 	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<USceneComponent> SceneRoot;
 
-	/// 停車格 Arrow 元件列表（BeginPlay 時從子元件收集）
 	/// Spot arrow components (collected from children at BeginPlay)
 	UPROPERTY()
 	TArray<TObjectPtr<UArrowComponent>> SpotArrows;
 
-	/// 佔用狀態 / Occupation state (parallel to SpotArrows)
+	/// Occupation state (parallel to SpotArrows)
 	TArray<bool> SpotOccupied;
 
-	/// 佔用車輛 / Occupying vehicles
+	///Occupying vehicles
 	UPROPERTY()
 	TArray<TWeakObjectPtr<AActor>> SpotVehicles;
 
-	/// 每個停車格對應的 Graph EdgeId（由 BindParkingActorsToEdges 設定）
 	/// Per-spot Graph EdgeId (assigned by BindParkingActorsToEdges)
 	TArray<int32> SpotEdgeIds;
+
+	bool bIsLeftSide = false;
+
 
 	void CollectSpotArrows();
 	void DetectRoadSide();

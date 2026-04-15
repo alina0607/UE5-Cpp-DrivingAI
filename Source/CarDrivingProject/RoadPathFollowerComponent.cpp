@@ -845,7 +845,7 @@ void URoadPathFollowerComponent::NavigateToParkingLot(AParkingLotActor* ParkingL
 		TEXT("[PARK-NAV] '%s' === NavigateToParkingLot END === PathSegments=%d bIsFollowing=%s bIsLeftSide=%s targetSpot=%d"),
 		*ParkingLot->ParkingLotName, PathSegments.Num(),
 		bIsFollowing ? TEXT("true") : TEXT("false"),
-		ParkingLot->bIsLeftSide ? TEXT("L") : TEXT("R"), SpotIndex);
+		ParkingLot->IsLeftSide() ? TEXT("L") : TEXT("R"), SpotIndex);
 }
 
 // ============================================================================
@@ -1828,7 +1828,7 @@ void URoadPathFollowerComponent::TickComponent(
 
 				// 轉向燈：直接看 bIsLeftSide（使用者設定）
 				// Turn signal: directly from bIsLeftSide (user-configured)
-				CurrentTurnSignal = TargetParkingLot->bIsLeftSide ? ETurnSignal::Left : ETurnSignal::Right;
+				CurrentTurnSignal = TargetParkingLot->IsLeftSide() ? ETurnSignal::Left : ETurnSignal::Right;
 
 				const float CurveDist = (ParkCurveP1 - SplineEndPos).Size();
 				ParkCurveT1 = AnchorFwd * CurveDist * ParkingCurveTangentScale;
@@ -1840,7 +1840,7 @@ void URoadPathFollowerComponent::TickComponent(
 					AnchorFwd.X, AnchorFwd.Y, AnchorFwd.Z,
 					CurveDist,
 					(CurrentTurnSignal == ETurnSignal::Left) ? TEXT("LEFT") : TEXT("RIGHT"),
-					TargetParkingLot->bIsLeftSide ? TEXT("true") : TEXT("false"),
+					TargetParkingLot->IsLeftSide() ? TEXT("true") : TEXT("false"),
 					RemainDist);
 			}
 			else

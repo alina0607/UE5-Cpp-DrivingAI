@@ -212,25 +212,3 @@ void AParkingLotActor::DetectRoadSide()
 //  編輯器視覺化 / Editor visualization
 // ================================================================
 
-#if WITH_EDITOR
-void AParkingLotActor::OnConstruction(const FTransform& Transform)
-{
-	Super::OnConstruction(Transform);
-
-	// 在編輯器中為每個 Arrow 子元件畫 debug box
-	// Draw debug box for each Arrow child in editor
-	TArray<UArrowComponent*> Arrows;
-	GetComponents<UArrowComponent>(Arrows);
-
-	for (UArrowComponent* Arrow : Arrows)
-	{
-		if (!Arrow) continue;
-
-		const FVector WorldPos = Arrow->GetComponentLocation();
-		const FQuat WorldRot = Arrow->GetComponentQuat();
-
-		DrawDebugBox(GetWorld(), WorldPos, SpotHalfExtent,
-			WorldRot, FColor::Green, false, -1.0f, 0, 2.0f);
-	}
-}
-#endif
