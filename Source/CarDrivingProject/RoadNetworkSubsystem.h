@@ -189,11 +189,10 @@ private:
 	void BuildGraphNodes();
 
 	/// <summary>
-	/// 掃描場景所有 ParkingLotActor，
-	/// 用 TargetRoadActorLabel 配對 RoadActor，再用 Arrow 前方方向選最佳 Edge，
-	/// 把每個 Spot 對應的 EdgeId 寫回停車場 Actor。
-	/// Scan all ParkingLotActor, match by TargetRoadActorLabel,
-	/// pick best edge using Arrow forward direction, assign EdgeId per spot.
+	/// 掃描場景所有 ParkingLotActor，把每個 Lot 的 Arrow[0] 投影到全部 GraphEdges，
+	/// 挑最近的 sub-edge，把 (EdgeId, 投影點) 寫回 Lot->AssignBoundEdge。
+	/// Scan all ParkingLotActor, project Arrow[0] onto every GraphEdge,
+	/// pick the closest sub-edge, assign (EdgeId, projection point) to the lot.
 	/// </summary>
 	void BindParkingActorsToEdges();
 
