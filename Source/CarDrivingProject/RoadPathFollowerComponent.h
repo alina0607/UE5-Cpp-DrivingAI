@@ -266,9 +266,26 @@ public:
 	//  掉頭 / U-Turn
 	// ================================================================
 
-	/// U 型掉頭曲線的寬度（cm）— 越大 U 型越寬越自然
-	/// U-turn curve width (cm) — larger = wider, smoother U-shape
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|U-Turn", meta = (ClampMin = "10"))
+	/// 是否根據當前車道偏移自動計算 U-turn 半徑
+	/// 公式：R = (CurrentLateralOffset + NextLateralOffset) / 2 + Padding
+	/// 車從當前車道翻轉到新段的目標車道，半徑 = 兩者距離的一半
+	/// 從內車道或外車道發起 U-turn 都正確
+	///
+	/// Whether to auto-compute U-turn radius from lane offsets.
+	/// Formula: R = (CurrentLateralOffset + NextLateralOffset) / 2 + Padding
+	/// The car flips from current lane to the target lane on the new segment;
+	/// radius = half the distance between them. Works for inner or outer lane.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|U-Turn")
+	bool bAutoUTurnRadius = true;
+
+	/// 自動半徑的額外 padding（cm）— 讓 U 型不會剛好貼著對向車道邊緣
+	/// Extra padding for auto radius (cm) — avoids scraping the opposite lane edge
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|U-Turn", meta = (ClampMin = "0", EditCondition = "bAutoUTurnRadius"))
+	float UTurnRadiusPadding = 50.0f;
+
+	/// 手動設定的 U-turn 半徑（bAutoUTurnRadius=false 時使用）
+	/// Manual U-turn radius (used when bAutoUTurnRadius is false)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|U-Turn", meta = (ClampMin = "10", EditCondition = "!bAutoUTurnRadius"))
 	float UTurnRadius = 100.0f;
 
 	/// U 型掉頭時的速度比例（相對 MaxSpeed）— 與 JunctionMinSpeedRatio 類似
@@ -284,6 +301,11 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|U-Turn")
 	float UTurnRotationSpeed = 5.0f;
+
+	/// U-turn 結束後位置平滑過渡速度 — 越大越快收斂到 spline
+	/// Post-U-turn position blend speed — higher = faster convergence to spline
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|U-Turn", meta = (ClampMin = "1.0", ClampMax = "30.0"))
+	float PostUTurnBlendSpeed = 6.0f;
 
 	// ================================================================
 	//  車道 / Lane Control

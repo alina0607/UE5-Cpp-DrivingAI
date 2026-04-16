@@ -2044,21 +2044,95 @@ void URoadPathFollowerComponent::TickComponent(
 		// ================================================================
 		if (bWasUTurn && Seg.Spline)
 		{
-			const float NewKey = Seg.Spline->FindInputKeyClosestToWorldLocation(UTurnFinalCarPos);
-			const float NewDist = Seg.Spline->GetDistanceAlongSplineAtSplineInputKey(NewKey);
+			// 只在 Seg[1] 的 [StartDist, EndDist] 範圍內搜尋最近點
+			// 原因：Spline 可能被多條 edge 共用，FindInputKeyClosestToWorldLocation
+			// 會搜整條 spline，可能回傳落在 Seg[1] 範圍外的點（世界距離幾百公尺），
+			// 造成 Step 6 吸附到極遠處瞬移。
+			//
+			// Search nearest point ONLY within Seg[1]'s [StartDist, EndDist] range.
+			// Reason: the spline may be shared across multiple edges, so
+			// FindInputKeyClosestToWorldLocation can return a point outside this
+			// segment's own range — hundreds of metres away — causing Step 6 to
+			// snap there. We do a coarse + refine sample sweep inside the range.
+			const float Lo = FMath::Min(Seg.StartDist, Seg.EndDist);
+			const float Hi = FMath::Max(Seg.StartDist, Seg.EndDist);
+
+			auto DistSqAt = [&](float D)
+			{
+				const FVector P = Seg.Spline->GetLocationAtDistanceAlongSpline(
+					D, ESplineCoordinateSpace::World);
+				return FVector::DistSquared(UTurnFinalCarPos, P);
+			};
+
+			// Coarse: 64 等分 / 64-way coarse sweep
+			const int32 CoarseN = 64;
+			float BestDist = Lo;
+			float BestDistSq = DistSqAt(Lo);
+			for (int32 i = 1; i <= CoarseN; ++i)
+			{
+				const float D = Lo + (Hi - Lo) * (float(i) / float(CoarseN));
+				const float Dsq = DistSqAt(D);
+				if (Dsq < BestDistSq) { BestDistSq = Dsq; BestDist = D; }
+			}
+
+			// Refine: 在最佳區間周圍多次細化 / Refine around best candidate
+			float Step = (Hi - Lo) / float(CoarseN);
+			for (int32 iter = 0; iter < 4; ++iter)
+			{
+				const float Near = FMath::Max(Lo, BestDist - Step);
+				const float Far  = FMath::Min(Hi, BestDist + Step);
+				const int32 RefineN = 16;
+				for (int32 i = 0; i <= RefineN; ++i)
+				{
+					const float D = Near + (Far - Near) * (float(i) / float(RefineN));
+					const float Dsq = DistSqAt(D);
+					if (Dsq < BestDistSq) { BestDistSq = Dsq; BestDist = D; }
+				}
+				Step /= float(RefineN);
+			}
+
+			const float NewDist = BestDist;
 			const FVector NewSplinePt = Seg.Spline->GetLocationAtDistanceAlongSpline(
 				NewDist, ESplineCoordinateSpace::World);
-			const float ReprojDelta = FVector::Dist(UTurnFinalCarPos, NewSplinePt);
+			const float ReprojDelta = FMath::Sqrt(BestDistSq);
 			const float OldRefDist = JCurveNextRefDist;
 
-			ReferenceDistance = NewDist;
-
 			UE_LOG(LogTemp, Warning,
-				TEXT("[UTURN-END] CarPos=(%.0f,%.0f,%.0f) → NewSeg[%d] OldRefDist(JCurveNextRefDist)=%.0f → ReprojRefDist=%.0f SplinePt=(%.0f,%.0f,%.0f) LateralGap=%.1f"),
+				TEXT("[UTURN-END] CarPos=(%.0f,%.0f,%.0f) → NewSeg[%d] Range=[%.0f,%.0f] OldRefDist(JCurveNextRefDist)=%.0f → ReprojRefDist=%.0f SplinePt=(%.0f,%.0f,%.0f) LateralGap=%.1f"),
 				UTurnFinalCarPos.X, UTurnFinalCarPos.Y, UTurnFinalCarPos.Z,
-				CurrentSegmentIndex, OldRefDist, NewDist,
+				CurrentSegmentIndex, Lo, Hi, OldRefDist, NewDist,
 				NewSplinePt.X, NewSplinePt.Y, NewSplinePt.Z,
 				ReprojDelta);
+
+			// 如果 LateralGap 太大（新段 spline 遠離車子），代表 A* 路徑
+			// 在 U-turn 後不連續，追那條 spline 會讓車穿越虛空 20 秒。
+			// 直接從車的當前位置重新規劃到目的地。
+			//
+			// If the gap is huge (next segment's spline is far from the car),
+			// the A* path is spatially disconnected after the U-turn. Following
+			// that spline would drive through void for 20+ seconds. Instead,
+			// re-plan the entire path from the car's current position.
+			const float UTurnReprojMaxGap = 2000.0f; // 20m 閾值 / threshold (cm)
+			if (ReprojDelta > UTurnReprojMaxGap && DestinationNodeId != INDEX_NONE)
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("[UTURN-REPLAN] LateralGap=%.0f > %.0f — re-navigating from current pos to DestNode=%d"),
+					ReprojDelta, UTurnReprojMaxGap, DestinationNodeId);
+
+				// 清除曲線狀態 / Clear curve state
+				bOnJunctionCurve = false;
+				bIsUTurnCurve = false;
+				bIsGapBridgeCurve = false;
+				bJustExitedJunctionCurve = false;
+				CurrentTurnSignal = ETurnSignal::None;
+
+				// 重新從車的位置規劃路徑（會自動 FindStartBoundEdge → A* → BuildPathSegments）
+				// Re-plan from car's position (auto: FindStartBoundEdge → A* → BuildPathSegments)
+				StartNavigationInternal(INDEX_NONE, DestinationNodeId);
+				return;
+			}
+
+			ReferenceDistance = NewDist;
 		}
 		else
 		{
@@ -2382,7 +2456,44 @@ void URoadPathFollowerComponent::TickComponent(
 			const FVector Right2D = FVector(-OwnerFwd2D.Y, OwnerFwd2D.X, 0.0f);
 			const FVector SideDir2D = Right2D * SideSign;
 
-			const float R = UTurnRadius;
+			// 自動計算 U-turn 半徑：
+			//
+			// 幾何推導（以 SideDir = -Right = 左側 為例）：
+			//   P0（車當前位置）= spline中線 + CurOffset × Right
+			//   P1（U-turn 終點）= spline中線 − NextOffset × Right
+			//     （新段方向反轉 → 新段的 Right 是舊 Right 的反向 → 對新段的
+			//       NextOffset 相對舊座標就是 −NextOffset）
+			//   P1 − P0 = −(CurOffset + NextOffset) × Right
+			//            = (CurOffset + NextOffset) × SideDir   (SideDir = −Right)
+			//   半圓弧 P1 = P0 + 2R × SideDir
+			//   → 2R = CurOffset + NextOffset
+			//   → R  = (CurOffset + NextOffset) / 2 + Padding
+			//
+			// 不管從內車道轉還是外車道轉都適用：CurOffset 和 NextOffset 各自反映
+			// 車在各自段的實際車道偏移量。
+			//
+			// Auto-compute U-turn radius from lane positions:
+			//   P0 = spline centre + CurOffset × Right
+			//   P1 = spline centre − NextOffset × Right  (new seg reverses direction)
+			//   Distance = CurOffset + NextOffset = 2R
+			//   R = (CurOffset + NextOffset) / 2 + Padding
+			// Works for inner-lane or outer-lane U-turns: each offset reflects
+			// the car's actual lane position on its respective segment.
+			float R;
+			if (bAutoUTurnRadius)
+			{
+				const float CurOff = FMath::Abs(CurrentLateralOffset);
+				const float NextOff = FMath::Abs(NextSegLaneOffset);
+				R = FMath::Max((CurOff + NextOff) * 0.5f + UTurnRadiusPadding, 50.0f);
+
+				UE_LOG(LogTemp, Warning,
+					TEXT("[UTURN-AUTO-R] CurLane=%d CurOff=%.0f NextLane=%d NextOff=%.0f Padding=%.0f → R=%.0f (Diameter=%.0f)"),
+					CurrentLaneIndex, CurOff, JCurveNextLaneIndex, NextOff, UTurnRadiusPadding, R, R * 2.0f);
+			}
+			else
+			{
+				R = UTurnRadius;
+			}
 
 			// 圓心 / Circle center (flat, inherits P0.Z)
 			UTurnCenter = FVector(
@@ -2684,9 +2795,46 @@ void URoadPathFollowerComponent::TickComponent(
 	// 車的位移完全由 ReferenceDistance 驅動（Step 3），每幀等速 → 零抖動
 	// Position: directly use spline sample (no VInterpTo)
 	// Movement driven entirely by ReferenceDistance (Step 3), constant per frame → zero jitter
-	const FVector FinalPos = RefPos;
+	//
+	// 例外：剛結束 Junction Curve（特別是 U-turn）→ 車的實際位置可能離 RefPos
+	// 有幾百 cm 的 gap（reproject 誤差 + lane offset 切換）。硬吸附會瞬移，
+	// 改用 VInterpTo 指數衰減平滑收斂，直到 gap 夠小再清旗標恢復硬吸附。
+	//
+	// Exception: just exited a junction curve (esp. U-turn) → car may be
+	// a few hundred cm from RefPos. Hard-snapping teleports; use VInterpTo
+	// for exponential-decay blending until the gap closes.
+	FVector FinalPos;
+	if (bJustExitedJunctionCurve)
+	{
+		const float GapDist = FVector::Dist(CurrentPos, RefPos);
+		// 容差：gap 小於 ~2 幀移動量就算收斂完畢
+		const float GapTolerance = FMath::Max(CurrentSpeed * DeltaTime * 2.0f + 10.0f, 30.0f);
+
+		if (GapDist <= GapTolerance)
+		{
+			// 已經靠近 RefPos → 清旗標，恢復硬吸附
+			FinalPos = RefPos;
+			bJustExitedJunctionCurve = false;
+		}
+		else
+		{
+			// 用 VInterpTo 做指數衰減平滑（而非定速 catchup）
+			// 視覺上是自然的減速收斂，沒有突兀的跳躍或恆速追趕感
+			// Exponential-decay blend via VInterpTo (instead of constant-speed catchup).
+			// Visually: smooth deceleration into the spline, no abrupt jump or
+			// constant-speed "chasing" feel.
+			FinalPos = FMath::VInterpTo(CurrentPos, RefPos, DeltaTime, PostUTurnBlendSpeed);
+		}
+	}
+	else
+	{
+		FinalPos = RefPos;
+	}
 
 	// DEBUG: 偵測瞬移 — 如果這一幀車子移動距離遠大於 speed*dt，代表有跳躍
+	// 跳過 bJustExitedJunctionCurve 期間的偵測（VInterpTo 平滑收斂中，不是真瞬移）
+	// Skip during post-curve blend (VInterpTo convergence, not a real teleport)
+	if (!bJustExitedJunctionCurve)
 	{
 		const float FrameMoveDist = FVector::Dist(CurrentPos, FinalPos);
 		const float ExpectedMove = CurrentSpeed * DeltaTime;
