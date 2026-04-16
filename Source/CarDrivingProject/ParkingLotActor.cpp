@@ -30,19 +30,18 @@ void AParkingLotActor::BeginPlay()
 }
 
 // ================================================================
-//  收集子元件中的 Arrow 作為停車格 / Collect child arrows as spots
+//  Collect child arrows as spots
 // ================================================================
 
 void AParkingLotActor::CollectSpotArrows()
 {
 	SpotArrows.Reset();
 
-	// 收集所有 UArrowComponent 子元件
 	// Collect all UArrowComponent children
 	TArray<UArrowComponent*> Arrows;
 	GetComponents<UArrowComponent>(Arrows);
 
-	// 按名稱排序（Spot_0, Spot_1, ...）/ Sort by name
+	// （Spot_0, Spot_1, ...）/ Sort by name
 	Arrows.Sort([](const UArrowComponent& A, const UArrowComponent& B)
 	{
 		return A.GetName() < B.GetName();
@@ -134,13 +133,12 @@ void AParkingLotActor::AssignSpotEdgeId(int32 SpotIndex, int32 EdgeId)
 	SpotEdgeIds[SpotIndex] = EdgeId;
 }
 
-// [PARK-NAV] 一次設定整個停車場的綁定 Edge + 投影點
 // [PARK-NAV] Set bound edge + projection point for the whole lot
 void AParkingLotActor::AssignBoundEdge(int32 EdgeId, const FVector& ProjectionPoint)
 {
 	BoundEdgeId = EdgeId;
 	BoundProjectionPoint = ProjectionPoint;
-	// 同步寫到所有 SpotEdgeIds，讓舊 API 也能用 / Mirror to all spot slots for legacy API
+	// Mirror to all spot slots for legacy API
 	for (int32 i = 0; i < SpotEdgeIds.Num(); ++i)
 	{
 		SpotEdgeIds[i] = EdgeId;
@@ -152,7 +150,7 @@ void AParkingLotActor::AssignBoundEdge(int32 EdgeId, const FVector& ProjectionPo
 }
 
 // ================================================================
-//  道路側邊偵測 / Road side detection
+//  Road side detection
 // ================================================================
 
 void AParkingLotActor::DetectRoadSide()
@@ -207,8 +205,4 @@ void AParkingLotActor::DetectRoadSide()
 			*ParkingLotName, BestEdgeId, bIsLeftSide ? TEXT("Left") : TEXT("Right"));
 	}
 }
-
-// ================================================================
-//  編輯器視覺化 / Editor visualization
-// ================================================================
 

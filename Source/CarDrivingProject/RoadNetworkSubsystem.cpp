@@ -1,5 +1,3 @@
-// Fill out your copyright notice in the Description page of Project Settings.
-
 
 #include "RoadNetworkSubsystem.h"
 #include "Kismet/GameplayStatics.h"
@@ -762,8 +760,6 @@ void URoadNetworkSubsystem::BindParkingActorsToEdges()
         }
 
 
-        // Step 2: 把 Arrow[0] 投影到每段候選 sub-edge 的 [Lo,Hi] 範圍內，挑最近者
-        //         不做方向 dot 過濾（Edge 無向，方向由 NavigateToParkingLot 執行期決定）
         // Step 2: project Anchor onto each sub-edge clamped to its [Lo,Hi]; pick smallest dist.
         //         No direction filter — edge is undirected; direction picked at Navigate time.
         int32 BestEdgeId = INDEX_NONE;

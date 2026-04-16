@@ -51,7 +51,7 @@ void UDrivingMapWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTim
 		BuildNodeCache();
 	}
 
-	// 背景圖 Brush 設定（一次）/ Setup brush once
+	// Setup brush once
 	if (!bBrushReady && MapTexture)
 	{
 		SetupBrush();
@@ -59,7 +59,6 @@ void UDrivingMapWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTim
 
 	UpdateVehicleCache();
 
-	// ---- ESC：跟隨車輛時按 ESC 退回自由相機 ----
 	// ---- ESC: return to free camera while following vehicle ----
 	if (!bFreeCameraMode && SelectedVehiclePtr.IsValid())
 	{
@@ -69,18 +68,16 @@ void UDrivingMapWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTim
 			{
 				DeselectVehicle();
 				if (bIsFullscreen) ToggleMapSize();
-				return; // 這幀不再處理其他操控 / Skip rest of input this frame
+				return; // Skip rest of input this frame
 			}
 		}
 	}
 
-	// ---- 自由相機模式：WASD + 右鍵旋轉 ----
 	// ---- Free camera mode: WASD move + RMB rotate ----
 	if (bFreeCameraMode && !bIsFullscreen)
 	{
 		UpdateFreeCamera(InDeltaTime);
 	}
-	// ---- 跟隨模式：右鍵拖曳旋轉 CameraBoom ----
 	// ---- Follow mode: RMB drag to orbit CameraBoom ----
 	else if (!bFreeCameraMode && SelectedVehiclePtr.IsValid() && !bIsFullscreen)
 	{
@@ -105,7 +102,7 @@ void UDrivingMapWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTim
 }
 
 // ================================================================
-//  繪製 / Paint
+//  Paint
 // ================================================================
 
 int32 UDrivingMapWidget::NativePaint(
@@ -124,11 +121,10 @@ int32 UDrivingMapWidget::NativePaint(
 	GetMapDrawRect(AllottedGeometry, MapOrigin, MapSize);
 	if (MapSize.X < 1.0 || MapSize.Y < 1.0) return LayerId;
 
-	// ---- 1. 背景 ----
 	DrawBackground(OutDrawElements, AllottedGeometry, MapOrigin, MapSize, LayerId);
 
 	/*
-	// ---- 2. 道路 Spline 曲線 / Road spline curves ----
+	// ---- Road spline curves ----
 	{
 		FPaintContext EdgeCtx(AllottedGeometry, MyCullingRect, OutDrawElements, LayerId + 1,
 			InWidgetStyle, bParentEnabled);
@@ -172,7 +168,6 @@ int32 UDrivingMapWidget::NativePaint(
 		}
 	}
 	*/
-	// ---- 3. 車輛箭頭 ----
 	FPaintContext Context(AllottedGeometry, MyCullingRect, OutDrawElements, LayerId + 1,
 		InWidgetStyle, bParentEnabled);
 
@@ -199,7 +194,7 @@ int32 UDrivingMapWidget::NativePaint(
 		DrawArrow(Context, MapPos, MapDir, ArrowSize, Color, 2.5f);
 	}
 
-	// ---- 3.5 選中車輛的路線粗線 / Selected vehicle route thick line ----
+	// ---- Selected vehicle route thick line ----
 	if (SelectedVehiclePtr.IsValid())
 	{
 		URoadPathFollowerComponent* PF =
@@ -211,7 +206,7 @@ int32 UDrivingMapWidget::NativePaint(
 
 			if (RoutePoints.Num() > 1)
 			{
-				const float RouteThickness = bIsFullscreen ? RouteThicknessFullscreen : RouteThicknessMinimap; // 已有，改用成員變數
+				const float RouteThickness = bIsFullscreen ? RouteThicknessFullscreen : RouteThicknessMinimap;
 
 				FVector2D PrevPt = WorldToMap(RoutePoints[0], MapOrigin, MapSize);
 				for (int32 r = 1; r < RoutePoints.Num(); ++r)
@@ -223,7 +218,7 @@ int32 UDrivingMapWidget::NativePaint(
 				}
 			}
 
-			// 終點標記 / Destination marker
+			// Destination marker
 			if (!SelectedDestinationWorldPos.IsNearlyZero())
 			{
 				FVector2D DestMapPos = WorldToMap(SelectedDestinationWorldPos, MapOrigin, MapSize);
@@ -233,7 +228,7 @@ int32 UDrivingMapWidget::NativePaint(
 		}
 	}
 
-	// ---- 4. 邊框 / Border ----
+	// ---- Border ----
 	{
 		FVector2D TL = MapOrigin;
 		FVector2D TR(MapOrigin.X + MapSize.X, MapOrigin.Y);
@@ -246,17 +241,17 @@ int32 UDrivingMapWidget::NativePaint(
 		UWidgetBlueprintLibrary::DrawLine(Context, BL, TL, BorderColor, true, BorderThick);
 	}
 
-	// ---- 5. 停車場標示 / Parking lot markers ----
+	// ---- Parking lot markers ----
 	if (bIsFullscreen)
 	{
 		UWorld* ParkWorld = GetWorld();
 		if (ParkWorld)
 		{
-			// 停車場字體 / Parking lot font
+			// Parking lot font
 			FSlateFontInfo LotFont = FAppStyle::GetFontStyle("NormalFont");
 			LotFont.Size = ParkingLotFontSize;
 
-			// 停車場 / Parking lots
+			// Parking lots
 			for (TActorIterator<AParkingLotActor> It(ParkWorld); It; ++It)
 			{
 				AParkingLotActor* Lot = *It;
@@ -277,7 +272,7 @@ int32 UDrivingMapWidget::NativePaint(
 		}
 	}
 
-	// ---- 5.5 提示文字 / Hint text ----
+	// ---- Hint text ----
 	if (!bIsFullscreen)
 	{
 		FVector2D HintPos(MapOrigin.X, MapOrigin.Y - 16.0);
@@ -294,7 +289,6 @@ int32 UDrivingMapWidget::NativePaint(
 			FLinearColor(0.6f, 0.65f, 0.7f, 0.8f));
 	}
 
-	// ---- 6. 右側資訊面板（全螢幕 + 選中車輛時）----
 	//      Right info panel — far right, semi-transparent bg, scaled font
 	if (bIsFullscreen && SelectedVehiclePtr.IsValid())
 	{
@@ -304,14 +298,14 @@ int32 UDrivingMapWidget::NativePaint(
 		{
 			FVector2D WidgetSize = AllottedGeometry.GetLocalSize();
 
-			// 面板定位：螢幕最右邊 / Panel: far right of screen
+			// Panel: far right of screen
 			const float PanelWidth = WidgetSize.X * 0.22f;
 			const float PanelMarginRight = WidgetSize.X * 0.01f;
 			const float PanelX = WidgetSize.X - PanelWidth - PanelMarginRight;
 			const float PanelTopY = WidgetSize.Y * 0.05f;
 			const float PanelHeight = WidgetSize.Y * 0.75f;
 
-			// ---- 半透明背景 / Semi-transparent background ----
+			// ---- Semi-transparent background ----
 			{
 				FPaintGeometry BgGeo = AllottedGeometry.ToPaintGeometry(
 					FVector2f(static_cast<float>(PanelWidth), static_cast<float>(PanelHeight)),
@@ -335,7 +329,7 @@ int32 UDrivingMapWidget::NativePaint(
 			FSlateFontInfo ScaledFont = FAppStyle::GetFontStyle("NormalFont");
 			ScaledFont.Size = static_cast<int32>(10.0f * InfoPanelFontScale);
 
-			// 輔助 lambda：在面板畫一行文字 / Helper: draw one line of scaled text
+			// Helper: draw one line of scaled text
 			auto DrawPanelLine = [&](const FString& Text, const FLinearColor& Color)
 			{
 				FSlateDrawElement::MakeText(OutDrawElements, LayerId + 2,
@@ -349,12 +343,12 @@ int32 UDrivingMapWidget::NativePaint(
 			DrawPanelLine(TEXT("--- Vehicle Info ---"), TitleColor);
 			TextY += LineH * 0.3f;
 
-			// 速度 / Speed
+			// Speed
 			const float SpeedKmh = PF->GetCurrentSpeed() * 0.036f;
 			const float MaxKmh = PF->MaxSpeed * 0.036f;
 			DrawPanelLine(FString::Printf(TEXT("Speed: %.1f / %.0f km/h"), SpeedKmh, MaxKmh), InfoColor);
 
-			// 狀態 / State
+			// State
 			FString StateStr;
 			switch (PF->GetNavState())
 			{
@@ -365,21 +359,21 @@ int32 UDrivingMapWidget::NativePaint(
 			}
 			DrawPanelLine(FString::Printf(TEXT("State: %s"), *StateStr), InfoColor);
 
-			// 方向燈 / Turn signal
+			// Turn signal
 			FString SignalStr = TEXT("None");
 			if (PF->GetTurnSignal() == ETurnSignal::Left) SignalStr = TEXT("LEFT");
 			else if (PF->GetTurnSignal() == ETurnSignal::Right) SignalStr = TEXT("RIGHT");
 			DrawPanelLine(FString::Printf(TEXT("Signal: %s"), *SignalStr), InfoColor);
 
-			// 車道 / Lane
+			// Lane
 			DrawPanelLine(FString::Printf(TEXT("Lane: %d"), PF->CurrentLaneIndex), InfoColor);
 
-			// 障礙物 / Obstacle
+			// Obstacle
 			const float ObDist = PF->GetObstacleDistance();
 			FString ObStr = (ObDist < 0.0f) ? TEXT("None") : FString::Printf(TEXT("%.0f cm"), ObDist);
 			DrawPanelLine(FString::Printf(TEXT("Obstacle: %s"), *ObStr), InfoColor);
 
-			// 超車 / Overtake
+			// Overtake
 			FString OvtStr;
 			FLinearColor OvtColor = InfoColor;
 			switch (PF->GetOvertakeState())
@@ -390,7 +384,7 @@ int32 UDrivingMapWidget::NativePaint(
 			}
 			DrawPanelLine(FString::Printf(TEXT("Overtake: %s"), *OvtStr), OvtColor);
 
-			// 目的地 / Destination
+			// Destination
 			{
 				FString DestStr;
 				FLinearColor DestColor = DimColor;
@@ -409,7 +403,7 @@ int32 UDrivingMapWidget::NativePaint(
 				}
 				DrawPanelLine(DestStr, DestColor);
 
-				// 目的地名稱 + 停車格 / Destination name + spot index
+				// Destination name + spot index
 				if (!DestName.IsEmpty())
 				{
 					DrawPanelLine(FString::Printf(TEXT("  Name: %s"), *DestName), DestColor);

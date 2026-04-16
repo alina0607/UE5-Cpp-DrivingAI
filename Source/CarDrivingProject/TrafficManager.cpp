@@ -18,7 +18,6 @@ ATrafficManager::ATrafficManager()
 }
 
 // ============================================================================
-//  BeginPlay — 延遲到下一幀 spawn（確保 RoadNetworkSubsystem 已 BuildRoadCache）
 //  Delay spawn to next frame (ensure road graph is built).
 // ============================================================================
 void ATrafficManager::BeginPlay()
@@ -29,7 +28,6 @@ void ATrafficManager::BeginPlay()
 }
 
 // ============================================================================
-//  CollectParkingActors — 收集場景中所有停車場
 //  Collect all parking lot actors from the level.
 // ============================================================================
 void ATrafficManager::CollectParkingActors()
@@ -47,7 +45,6 @@ void ATrafficManager::CollectParkingActors()
 }
 
 // ============================================================================
-//  SpawnAllVehicles — 從停車場位置生成車輛
 //  Spawn vehicles from parking lots.
 // ============================================================================
 void ATrafficManager::SpawnAllVehicles()
@@ -57,7 +54,7 @@ void ATrafficManager::SpawnAllVehicles()
 
 	CollectParkingActors();
 
-	// 計算可用出生點總數 / Count total available spawn points
+	// Count total available spawn points
 	int32 TotalParkingSpots = 0;
 	for (AParkingLotActor* Lot : AllParkingLots)
 	{
@@ -74,8 +71,7 @@ void ATrafficManager::SpawnAllVehicles()
 
 	if (VehicleConfigs.Num() == 0) return;
 
-	// 建出生點列表 / Build spawn point list
-	// 每個出生點存: 位置、旋轉、是否已使用
+	// Build spawn point list
 	struct FSpawnPoint
 	{
 		FVector Position;
@@ -85,7 +81,7 @@ void ATrafficManager::SpawnAllVehicles()
 
 	TArray<FSpawnPoint> SpawnPoints;
 
-	// 停車場的停車格 / Parking lot spots
+	// Parking lot spots
 	for (AParkingLotActor* Lot : AllParkingLots)
 	{
 		if (!Lot) continue;
@@ -98,7 +94,7 @@ void ATrafficManager::SpawnAllVehicles()
 		}
 	}
 
-	// 打亂出生點順序 / Shuffle spawn points
+	// Shuffle spawn points
 	for (int32 i = SpawnPoints.Num() - 1; i > 0; --i)
 	{
 		const int32 j = FMath::RandRange(0, i);
@@ -121,7 +117,7 @@ void ATrafficManager::SpawnAllVehicles()
 
 		for (int32 i = 0; i < Config.Count; ++i)
 		{
-			// 找一個未用的出生點 / Find an unused spawn point
+			// Find an unused spawn point
 			if (SpawnPointIdx >= SpawnPoints.Num())
 			{
 				UE_LOG(LogTemp, Warning,
@@ -162,7 +158,6 @@ void ATrafficManager::SpawnAllVehicles()
 				PF ? PF->MaxSpeed : 0.0f,
 				SP.Position.X, SP.Position.Y, SP.Position.Z);
 
-			// 延遲一小段時間再分配目的地（讓車先停好在出生點）
 			// Short delay before assigning destination (let car settle at spawn)
 			FTimerHandle TimerHandle;
 			FTimerDelegate TimerDelegate;
@@ -176,13 +171,9 @@ void ATrafficManager::SpawnAllVehicles()
 			GetWorldTimerManager().SetTimer(TimerHandle, TimerDelegate, 0.5f, false);
 		}
 	}
-
-	UE_LOG(LogTemp, Warning,
-		TEXT("TrafficManager: Total %d vehicles spawned"), SpawnedVehicles.Num());
 }
 
 // ============================================================================
-//  AssignRandomDestination — 隨機選停車場作為目的地
 //  Randomly pick a parking lot as destination.
 // ============================================================================
 void ATrafficManager::AssignRandomDestination(ADrivingVehiclePawn* Vehicle)
@@ -200,10 +191,7 @@ void ATrafficManager::AssignRandomDestination(ADrivingVehiclePawn* Vehicle)
 		return;
 	}
 
-	UE_LOG(LogTemp, Warning, TEXT("[TRAFFIC] AssignRandomDestination — %d lots, vehicle at (%.0f,%.0f,%.0f)"),
-		TotalLots, Vehicle->GetActorLocation().X, Vehicle->GetActorLocation().Y, Vehicle->GetActorLocation().Z);
-
-	// 隨機選一個停車場 / Pick random parking lot
+	//Pick random parking lot
 	const int32 RandIdx = FMath::RandRange(0, TotalLots - 1);
 	AParkingLotActor* Lot = AllParkingLots[RandIdx];
 	if (Lot)
@@ -219,7 +207,7 @@ void ATrafficManager::AssignRandomDestination(ADrivingVehiclePawn* Vehicle)
 		}
 	}
 
-	// 再試其它停車場 / Retry other parking lots
+	// Retry other parking lots
 	for (AParkingLotActor* OtherLot : AllParkingLots)
 	{
 		if (!OtherLot) continue;
@@ -231,11 +219,9 @@ void ATrafficManager::AssignRandomDestination(ADrivingVehiclePawn* Vehicle)
 		}
 	}
 
-	UE_LOG(LogTemp, Warning, TEXT("[TRAFFIC] All destinations full, cannot assign"));
 }
 
 // ============================================================================
-//  OnVehiclePathComplete — 到達後延遲重新導航
 //  Re-navigate after delay when path completes.
 // ============================================================================
 void ATrafficManager::OnVehiclePathComplete(bool bSuccess)

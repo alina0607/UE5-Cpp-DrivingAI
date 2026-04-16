@@ -26,7 +26,6 @@ public:
     static FRoadDrivingRule GetDrivingRuleFromRoadData(const FRoadRuntimeData& RoadData);
 
     /// <summary>
-    /// 直接從 RoadType 數值取得行駛規則（不需要完整的 FRoadRuntimeData）
     /// Get driving rule directly from a RoadType value (without full FRoadRuntimeData).
     /// </summary>
     static FRoadDrivingRule GetDrivingRuleFromRoadType(uint8 RoadType);

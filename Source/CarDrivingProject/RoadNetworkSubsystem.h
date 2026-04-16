@@ -189,8 +189,6 @@ private:
 	void BuildGraphNodes();
 
 	/// <summary>
-	/// 掃描場景所有 ParkingLotActor，把每個 Lot 的 Arrow[0] 投影到全部 GraphEdges，
-	/// 挑最近的 sub-edge，把 (EdgeId, 投影點) 寫回 Lot->AssignBoundEdge。
 	/// Scan all ParkingLotActor, project Arrow[0] onto every GraphEdge,
 	/// pick the closest sub-edge, assign (EdgeId, projection point) to the lot.
 	/// </summary>

@@ -12,7 +12,7 @@ class URoadPathFollowerComponent;
 class USpringArmComponent;
 class UTexture2D;
 
-/// 地圖上的車輛快取 / Cached vehicle info for map rendering
+/// Cached vehicle info for map rendering
 struct FMapVehicleCache
 {
 	TWeakObjectPtr<AActor> Actor;
@@ -22,10 +22,7 @@ struct FMapVehicleCache
 	float Speed = 0.0f;
 };
 
-/// 駕駛地圖 Widget — 精簡版
-///
-/// 功能：背景圖 + 車輛箭頭 + 點擊跟隨/導航
-/// Features: background texture + vehicle arrows + click-to-follow/navigate
+/// background texture + vehicle arrows + click-to-follow/navigate
 UCLASS()
 class CARDRIVINGPROJECT_API UDrivingMapWidget : public UUserWidget
 {
@@ -34,7 +31,7 @@ class CARDRIVINGPROJECT_API UDrivingMapWidget : public UUserWidget
 public:
 
 	// ================================================================
-	//  地圖模式 / Map Mode
+	//  Map Mode
 	// ================================================================
 
 	UPROPERTY(BlueprintReadWrite, Category = "Driving Map")
@@ -44,7 +41,7 @@ public:
 	void ToggleMapSize();
 
 	// ================================================================
-	//  車輛選取與攝影機 / Vehicle Selection & Camera
+	//  Vehicle Selection & Camera
 	// ================================================================
 
 	UFUNCTION(BlueprintCallable, Category = "Driving Map")
@@ -57,26 +54,23 @@ public:
 	AActor* GetSelectedVehicle() const;
 
 	// ================================================================
-	//  地圖背景 / Map Background
+	//  Map Background
 	// ================================================================
 
-	/// 背景圖（匯入 UE 的 Texture2D，在 BP 裡設定）
 	/// Background image — import your screenshot as Texture2D, set in BP
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Background")
 	TObjectPtr<UTexture2D> MapTexture;
 
-	/// 背景圖對應的世界座標範圍 — 左下角
 	/// World coordinate of the bottom-left corner of your map image
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Background")
 	FVector2D MapTextureWorldMin = FVector2D(-50000.0, -50000.0);
 
-	/// 背景圖對應的世界座標範圍 — 右上角
 	/// World coordinate of the top-right corner of your map image
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Background")
 	FVector2D MapTextureWorldMax = FVector2D(50000.0, 50000.0);
 
 	// ================================================================
-	//  外觀設定 / Visual Settings
+	// Visual Settings
 	// ================================================================
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Minimap")
@@ -88,7 +82,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Fullscreen")
 	float FullscreenCoverage = 0.85f;
 
-	/// 背景色（無背景圖時）/ Fallback background color
+	/// Fallback background color
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Colors")
 	FLinearColor BackgroundColor = FLinearColor(0.02f, 0.03f, 0.08f, 0.85f);
 
@@ -104,28 +98,28 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Colors")
 	FLinearColor DestinationColor = FLinearColor(1.0f, 0.2f, 0.2f, 1.0f);
 
-	/// 停車場在地圖上的標示顏色 / Parking lot marker color on map
+	/// Parking lot marker color on map
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Colors")
 	FLinearColor ParkingLotColor = FLinearColor(0.2f, 0.9f, 0.9f, 1.0f);
 
-	/// 停車場名稱字體大小 / Parking lot name font size
+	/// Parking lot name font size
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text", meta = (ClampMin = "6", ClampMax = "30"))
 	int32 ParkingLotFontSize = 12;
 
-	/// 停車場名稱文字顏色 / Parking lot name text color
+	/// Parking lot name text color
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text")
 	FLinearColor ParkingLotTextColor = FLinearColor(0.2f, 0.9f, 0.9f, 1.0f);
 
-	/// 是否在地圖上顯示停車場名稱 / Show parking names on map?
+	/// Show parking names on map?
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text")
 	bool bShowParkingNames = true;
 
-	/// 停車場名稱文字偏移（相對於標記點，像素）/ Parking lot name text offset from marker (px)
+	/// Parking lot name text offset from marker (px)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Parking Text")
 	FVector2D ParkingLotNameOffset = FVector2D(8.0, -6.0);
 
 
-	// ---- 導航路線 / Navigation Route ----
+	// ---- Navigation Route ----
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Colors")
 	FLinearColor RouteColor = FLinearColor(1.0f, 0.6f, 0.1f, 0.85f);
 
@@ -135,7 +129,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Route")
 	float RouteThicknessMinimap = 2.0f;
 
-	// ---- 道路 Edge / Road Edge ----
+	// ---- Road Edge ----
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Colors")
 	FLinearColor EdgeColor = FLinearColor(0.3f, 0.6f, 1.0f, 0.6f);
 
@@ -145,7 +139,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Route")
 	float EdgeThicknessMinimap = 1.5f;
 
-	// ---- 停車場圓圈外框 / Parking Lot Circle Outline ----
+	// ---- Parking Lot Circle Outline ----
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Colors")
 	FLinearColor ParkingLotOutlineColor = FLinearColor(1.0f, 1.0f, 1.0f, 0.8f);
 
@@ -166,59 +160,58 @@ public:
 
 
 	// ================================================================
-	//  右側資訊面板 / Right Info Panel
+	//  Right Info Panel
 	// ================================================================
 
-	/// 資訊面板字體大小倍率 / Info panel font size multiplier
+	/// Info panel font size multiplier
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Info Panel", meta = (ClampMin = "0.5", ClampMax = "4.0"))
 	float InfoPanelFontScale = 1.5f;
 
-	/// 資訊面板背景半透明度 / Info panel background opacity
+	/// Info panel background opacity
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Info Panel", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float InfoPanelBackgroundAlpha = 0.6f;
 
-	/// 地圖背景額外邊距倍率（越大背景越大，路線越不會超出）
 	/// Map background extra margin multiplier (larger = more margin, route stays inside)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Minimap", meta = (ClampMin = "0.1", ClampMax = "1.0"))
 	float MapBoundsMarginRatio = 0.25f;
 
 	// ================================================================
-	//  攝影機 / Camera Settings
+	//  Camera Settings
 	// ================================================================
 
-	/// 右鍵拖曳旋轉靈敏度 / Right-click drag orbit sensitivity
+	/// Right-click drag orbit sensitivity
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Camera")
 	float OrbitSensitivity = 1.0f;
 
-	/// 滾輪縮放速度 / Scroll zoom speed
+	/// Scroll zoom speed
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Camera", meta = (ClampMin = "10"))
 	float ZoomSpeed = 80.0f;
 
-	/// SpringArm 最短距離 / Min arm length
+	/// Min arm length
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Camera", meta = (ClampMin = "50"))
 	float MinFollowDistance = 200.0f;
 
-	/// SpringArm 最長距離 / Max arm length
+	/// Max arm length
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Camera")
 	float MaxFollowDistance = 3000.0f;
 
 	// ================================================================
-	//  自由相機 / Free Camera
+	//  Free Camera
 	// ================================================================
 
-	/// 自由相機移動速度（cm/s）/ Free camera movement speed
+	/// Free camera movement speed
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Free Camera")
 	float FreeCameraMoveSpeed = 1500.0f;
 
-	/// 自由相機旋轉速度 / Free camera rotation speed
+	/// Free camera rotation speed
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Free Camera")
 	float FreeCameraRotateSpeed = 2.5f;
 
-	/// 按住 Shift 的加速倍率 / Speed multiplier when holding Shift
+	/// Speed multiplier when holding Shift
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Driving Map|Free Camera")
 	float FreeCameraFastMultiplier = 3.0f;
 
-	/// 目前是否為自由相機模式 / Whether currently in free camera mode
+	/// Whether currently in free camera mode
 	UPROPERTY(BlueprintReadOnly, Category = "Driving Map|Free Camera")
 	bool bFreeCameraMode = true;
 
@@ -244,9 +237,9 @@ private:
 
 
 
-	// ---- 快取 / Cache ----
+	// ---- Cache ----
 
-// Hover 狀態
+// Hover 
 	TWeakObjectPtr<AParkingLotActor> HoveredParkingLot;
 
 	TArray<FMapVehicleCache> CachedVehicles;
@@ -258,37 +251,31 @@ private:
 	UPROPERTY()
 	TWeakObjectPtr<AActor> SelectedVehiclePtr;
 
-	/// 目的地 Actor（停車場）/ Destination actor (parking lot)
+	/// Destination actor (parking lot)
 	UPROPERTY()
 	TWeakObjectPtr<AActor> SelectedDestinationActor;
 
-	/// 目的地世界座標（用於終點標記）/ Destination world position for marker
+	/// Destination world position for marker
 	FVector SelectedDestinationWorldPos = FVector::ZeroVector;
 
-	/// 自由相機 Actor（遊戲開始時建立一次，永不銷毀）
 	/// Persistent free camera actor — spawned once at startup
 	UPROPERTY()
 	TObjectPtr<ACameraActor> FreeCameraActor;
 
-	// ---- 背景 Brush ----
+	// ---- Brush ----
 
 	mutable FSlateBrush MapTextureBrush;
 	bool bBrushReady = false;
 
 	void SetupBrush();
 
-	// ---- 快取建立 ----
 
 	void BuildNodeCache();
 	void UpdateVehicleCache();
 
-	// ---- 座標轉換 ----
-
 	FVector2D WorldToMap(const FVector& WorldPos, const FVector2D& MapOrigin, const FVector2D& MapSize) const;
 	FVector MapToWorld(const FVector2D& MapPos, const FVector2D& MapOrigin, const FVector2D& MapSize) const;
 	void GetMapDrawRect(const FGeometry& Geometry, FVector2D& OutOrigin, FVector2D& OutSize) const;
-
-	// ---- 繪製 ----
 
 	void DrawBackground(FSlateWindowElementList& OutDrawElements, const FGeometry& Geometry,
 		const FVector2D& MapOrigin, const FVector2D& MapSize, int32 LayerId) const;
@@ -299,18 +286,13 @@ private:
 	void DrawCircle(FPaintContext& Context, const FVector2D& Center, float Radius,
 		const FLinearColor& Color, float Thickness = 1.5f, int32 NumSegments = 20) const;
 
-	// ---- 點擊偵測 ----
-
 	AActor* FindVehicleNearMapPos(const FVector2D& LocalPos, const FVector2D& MapOrigin,
 		const FVector2D& MapSize, float Radius) const;
 
-	/// 點擊停車場偵測 — 回傳最近的停車場 Actor / Find parking lot near click
+	/// Find parking lot near click
 	AParkingLotActor* FindParkingLotNearMapPos(const FVector2D& LocalPos, const FVector2D& MapOrigin,
 		const FVector2D& MapSize, float Radius) const;
 
-	// ---- 攝影機 ----
-
-	/// 儲存選車前的 SpringArm 旋轉，取消時還原
 	/// Store original boom rotation before orbit, restore on deselect
 	FRotator OriginalBoomRotation = FRotator::ZeroRotator;
 

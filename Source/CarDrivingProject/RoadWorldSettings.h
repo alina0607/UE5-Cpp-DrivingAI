@@ -64,7 +64,6 @@ public:
     float DebugEdgeThickness = 20.0f;
 
     /// <summary>
-    /// Debug 線條的 Z 軸抬高量（cm）— 避免被路面遮住
     /// Z offset for debug lines (cm) — raise above road surface.
     /// </summary>
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Road Debug")
@@ -91,7 +90,6 @@ public:
     float SplineSampleStep = 200.0f;
 
     /// <summary>
-    /// 標準車道寬度（cm）。3.5m 為國際通用標準
     /// Standard lane width in cm. 3.5m is the international standard.
     /// </summary>
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Road Network")
