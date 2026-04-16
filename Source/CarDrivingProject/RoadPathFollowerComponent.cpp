@@ -386,9 +386,111 @@ void URoadPathFollowerComponent::StartNavigationInternal(int32 FromNodeId, int32
 	float StartBoundProjDistAbs = 0.0f;
 	bool bStartBoundForward = true;
 	int32 StartBoundExitNode = INDEX_NONE;
-	const bool bHaveStartBoundEdge = OwnerActor && FindStartBoundEdge(
-		CarPos, CarFwd,
-		StartBoundEdge, StartBoundProjDistAbs, bStartBoundForward, StartBoundExitNode);
+	bool bHaveStartBoundEdge = false;
+
+	// ---- 停車場出發偵測：如果車在某個停車場的車位附近，優先使用該停車場的 BoundEdge ----
+	// ---- Parking lot departure: if car is near a parking lot spot, prefer that lot's BoundEdge ----
+	// FindStartBoundEdge 全域搜尋最近 edge，可能找到錯誤的（例如旁邊經過的海岸道路），
+	// 導致出發路徑完全偏離道路。使用停車場的 BoundEdge 保證起始 edge 是正確的。
+	// FindStartBoundEdge searches ALL edges globally and may pick a wrong nearby edge
+	// (e.g., a coastal road passing close to the parking lot), causing the departure path
+	// to go completely off-road. Using the parking lot's BoundEdge guarantees the correct start edge.
+	bool bTriangleExit = false;
+	AParkingLotActor* DepartureLot = nullptr;
+	{
+		const float SpotSearchRadiusSq = FMath::Square(ParkingTriangleBaseLength * 2.0f);
+		float BestSpotDistSq = SpotSearchRadiusSq;
+
+		for (TActorIterator<AParkingLotActor> It(World); It; ++It)
+		{
+			AParkingLotActor* Lot = *It;
+			if (!Lot || Lot->SpotCount <= 0 || Lot->BoundEdgeId == INDEX_NONE) continue;
+
+			// 檢查所有車位，不只是 Anchor（車可能停在任何車位）
+			// Check all spots, not just anchor (car could be parked at any spot)
+			for (int32 SpotIdx = 0; SpotIdx < Lot->SpotCount; ++SpotIdx)
+			{
+				const FVector SpotPos = Lot->GetSpotWorldPosition(SpotIdx);
+				const float DistSq = FVector::DistSquared2D(CarPos, SpotPos);
+				if (DistSq < BestSpotDistSq)
+				{
+					BestSpotDistSq = DistSq;
+					DepartureLot = Lot;
+				}
+			}
+		}
+
+		if (DepartureLot)
+		{
+			bTriangleExit = true;
+			UE_LOG(LogTemp, Warning,
+				TEXT("[PARK-NAV] Parked-exit detected near '%s' (BoundEdge=%d) — using lot's BoundEdge as start edge"),
+				*DepartureLot->ParkingLotName, DepartureLot->BoundEdgeId);
+
+			// 使用停車場的 BoundEdge 作為起始 edge
+			// Use the parking lot's BoundEdge as the start edge
+			const FRoadGraphEdge* LotBoundEdge = Sub->GetGraphEdgeById(DepartureLot->BoundEdgeId);
+			if (LotBoundEdge && LotBoundEdge->InputSpline)
+			{
+				StartBoundEdge = LotBoundEdge;
+
+				// 用停車場的 BoundProjectionPoint 計算投影距離，而非車的位置
+				// 車在車位裡（離道路很遠），直接投影到整條 spline 可能落到錯誤的 sub-edge 位置
+				// BoundProjectionPoint 是 BuildRoadCache 時 anchor 在 edge 上的精確投影
+				// Use the lot's BoundProjectionPoint for projection distance, NOT car position.
+				// Car is at a parking spot (far from road); projecting car onto spline may land on
+				// wrong sub-edge region. BoundProjectionPoint was computed during BuildRoadCache
+				// as the exact projection of anchor onto the edge.
+				const FVector& ProjPt = DepartureLot->BoundProjectionPoint;
+				const float ProjKey = LotBoundEdge->InputSpline->FindInputKeyClosestToWorldLocation(ProjPt);
+				const float ProjRawDist = LotBoundEdge->InputSpline->GetDistanceAlongSplineAtSplineInputKey(ProjKey);
+				const float LoDist = FMath::Min(LotBoundEdge->StartDistanceOnSpline, LotBoundEdge->EndDistanceOnSpline);
+				const float HiDist = FMath::Max(LotBoundEdge->StartDistanceOnSpline, LotBoundEdge->EndDistanceOnSpline);
+				StartBoundProjDistAbs = FMath::Clamp(ProjRawDist, LoDist, HiDist);
+
+				// 用停車場 anchor 的朝向（而非車的朝向）來決定行進方向
+				// 車停好後朝向通常垂直於道路（面向車位），dot ≈ 0 導致方向判斷隨機
+				// Anchor 的朝向跟 NavigateToParkingLot 到達時用的一樣，方向一定正確
+				// Use parking lot ANCHOR forward (not car forward) to determine travel direction.
+				// When parked, car faces perpendicular to road (into the spot), making dot ≈ 0
+				// and the direction pick essentially random. Anchor forward is the same reference
+				// NavigateToParkingLot uses for arrival, ensuring consistent direction.
+				const FVector AnchorFwd = DepartureLot->GetAnchorArrowForward();
+				const FVector AnchorFwd2D = FVector(AnchorFwd.X, AnchorFwd.Y, 0.0f).GetSafeNormal();
+				const FVector SplineDir = LotBoundEdge->InputSpline->GetDirectionAtDistanceAlongSpline(
+					StartBoundProjDistAbs, ESplineCoordinateSpace::World);
+				const float AnchorDot = FVector::DotProduct(AnchorFwd2D, SplineDir.GetSafeNormal2D());
+
+				// NavigateToParkingLot 到達邏輯：
+				//   bForwardDrive = (AnchorDot >= 0)
+				//   EntryNodeId = bForwardDrive ? StartNodeId : EndNodeId
+				// 出發時車要往 Entry 的「對面」開出去（沿同方向離開 edge），
+				// 所以 ExitNode = bForwardDrive ? EndNodeId : StartNodeId
+				// Arrival logic in NavigateToParkingLot:
+				//   bForwardDrive = (AnchorDot >= 0)
+				//   EntryNode = bForwardDrive ? Start : End
+				// Departure: car drives in same direction, away from entry side,
+				//   so ExitNode = bForwardDrive ? End : Start
+				bStartBoundForward = (AnchorDot >= 0.0f);
+				StartBoundExitNode = bStartBoundForward ? LotBoundEdge->EndNodeId : LotBoundEdge->StartNodeId;
+				bHaveStartBoundEdge = true;
+
+				UE_LOG(LogTemp, Warning,
+					TEXT("[PARK-NAV] Using lot BoundEdge=%d ProjDist=%.0f AnchorDot=%.2f Fwd=%d ExitNode=%d"),
+					LotBoundEdge->EdgeId, StartBoundProjDistAbs, AnchorDot,
+					bStartBoundForward ? 1 : 0, StartBoundExitNode);
+			}
+		}
+	}
+
+	// 如果沒有偵測到停車場出發，用原本的全域搜尋
+	// If no parking lot departure detected, fall back to global nearest edge search
+	if (!bHaveStartBoundEdge && OwnerActor)
+	{
+		bHaveStartBoundEdge = FindStartBoundEdge(
+			CarPos, CarFwd,
+			StartBoundEdge, StartBoundProjDistAbs, bStartBoundForward, StartBoundExitNode);
+	}
 
 	// 如果找到 start bound edge，A* 的起點用 edge 的 exit node，而不是 caller 傳進來的 FromNodeId
 	// If start bound edge found, A* starts from its exit node (caller's FromNodeId becomes fallback)
@@ -430,30 +532,6 @@ void URoadPathFollowerComponent::StartNavigationInternal(int32 FromNodeId, int32
 
 	// ---- 把 start bound edge 的部分段插到最前面 ----
 	// ---- Prepend the partial start bound edge as the first segment ----
-	// 判斷是否「從停車場車位出發」— 若有 TargetParkingLot 且車離其 AnchorPos 很近，
-	// 在 PrependStartBoundEdgeSegment 時把 StartDist 往前推 n（產生等腰三角形斜邊 2）
-	// Detect parked-exit: if TargetParkingLot set and car is near its anchor, ask
-	// PrependStartBoundEdgeSegment to shift StartDist forward by ParkingTriangleBaseLength,
-	// so the spline follow resumes at (ProjPt + n along edge) — giving us exit hypotenuse 2.
-	bool bTriangleExit = false;
-	{
-		const float TriggerSq = FMath::Square(ParkingTriangleBaseLength * 1.5f);
-		for (TActorIterator<AParkingLotActor> It(World); It; ++It)
-		{
-			AParkingLotActor* Lot = *It;
-			if (!Lot) continue;
-			const FVector Anchor = Lot->GetAnchorArrowPosition();
-			if (FVector::DistSquared2D(CarPos, Anchor) < TriggerSq)
-			{
-				bTriangleExit = true;
-				UE_LOG(LogTemp, Warning,
-					TEXT("[PARK-NAV] Parked-exit detected near '%s' — using triangle hypotenuse 2 on start"),
-					*Lot->ParkingLotName);
-				break;
-			}
-		}
-	}
-
 	if (bHaveStartBoundEdge && StartBoundEdge)
 	{
 		PrependStartBoundEdgeSegment(*StartBoundEdge, bStartBoundForward, StartBoundProjDistAbs, bTriangleExit);
@@ -622,15 +700,168 @@ void URoadPathFollowerComponent::NavigateToNode(int32 TargetNodeId)
 		return;
 	}
 
-	// 靜止狀態 → 找「車前方」的 node 當作 A* 起點，避免從車後方節點開始導致倒退
-	// Idle/Parked → use a node IN FRONT of the car as A* start, so we don't drive backward
-	// to a node that happens to be the absolute nearest (which is common when parked at a spot
-	// whose nearest node is behind the car).
+	// ====================================================================
+	// 靜止狀態（Idle / Parked）
+	// 如果車在停車場附近 → bootstrap 到 BoundEdge 上，然後呼叫 RerouteToNode
+	// （跟玩家在地圖上手動按停車場走的程式路徑完全一致）
+	// If car is near a parking lot → bootstrap onto its BoundEdge, then
+	// call RerouteToNode — the exact same code path as a manual map click.
+	// ====================================================================
 	const FVector CarPos = Owner->GetActorLocation();
 	const FVector CarFwd = Owner->GetActorForwardVector();
+
+	// ---- 找車附近的停車場 / Find nearby parking lot ----
+	AParkingLotActor* NearLot = nullptr;
+	{
+		const float SearchRadiusSq = FMath::Square(ParkingTriangleBaseLength * 2.0f);
+		float BestDistSq = SearchRadiusSq;
+		for (TActorIterator<AParkingLotActor> It(World); It; ++It)
+		{
+			AParkingLotActor* Lot = *It;
+			if (!Lot || Lot->SpotCount <= 0 || Lot->BoundEdgeId == INDEX_NONE) continue;
+			for (int32 SpotIdx = 0; SpotIdx < Lot->SpotCount; ++SpotIdx)
+			{
+				const float DistSq = FVector::DistSquared2D(CarPos, Lot->GetSpotWorldPosition(SpotIdx));
+				if (DistSq < BestDistSq)
+				{
+					BestDistSq = DistSq;
+					NearLot = Lot;
+				}
+			}
+		}
+	}
+
+	if (NearLot)
+	{
+		const FRoadGraphEdge* LotEdge = Sub->GetGraphEdgeById(NearLot->BoundEdgeId);
+		if (LotEdge && LotEdge->InputSpline)
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[NAV-NODE] Idle/Parked near '%s' → bootstrap onto BoundEdge=%d then RerouteToNode(%d)"),
+				*NearLot->ParkingLotName, NearLot->BoundEdgeId, TargetNodeId);
+
+			// ---- 用 anchor forward 決定行進方向（跟 NavigateToParkingLot 到達時相同）----
+			// ---- Use anchor forward for direction (same as NavigateToParkingLot arrival) ----
+			const FVector AnchorFwd2D = FVector(
+				NearLot->GetAnchorArrowForward().X,
+				NearLot->GetAnchorArrowForward().Y, 0.0f).GetSafeNormal();
+
+			const FVector& ProjPt = NearLot->BoundProjectionPoint;
+			const float ProjKey = LotEdge->InputSpline->FindInputKeyClosestToWorldLocation(ProjPt);
+			float ProjDist = LotEdge->InputSpline->GetDistanceAlongSplineAtSplineInputKey(ProjKey);
+			const float Lo = FMath::Min(LotEdge->StartDistanceOnSpline, LotEdge->EndDistanceOnSpline);
+			const float Hi = FMath::Max(LotEdge->StartDistanceOnSpline, LotEdge->EndDistanceOnSpline);
+			ProjDist = FMath::Clamp(ProjDist, Lo, Hi);
+
+			const FVector SplineDir = LotEdge->InputSpline->GetDirectionAtDistanceAlongSpline(
+				ProjDist, ESplineCoordinateSpace::World).GetSafeNormal2D();
+			const float AnchorDot = FVector::DotProduct(AnchorFwd2D, SplineDir);
+			const bool bFwd = (AnchorDot >= 0.0f);
+
+			// ---- 建立 bootstrap segment ----
+			FPathSegmentInternal Seg;
+			Seg.Spline = LotEdge->InputSpline;
+			Seg.bTwoRoads = LotEdge->bTwoRoads;
+			Seg.TwoRoadsGapM = LotEdge->TwoRoadsGapM;
+			Seg.RoadType = LotEdge->RoadType;
+			Seg.DrivingRule = URoadRuleLibrary::GetDrivingRuleFromRoadType(LotEdge->RoadType);
+			Seg.RoadWidthMultiplier = LotEdge->RoadWidthMultiplier;
+			Seg.AdditionalWidthM = LotEdge->AdditionalWidthM;
+			Seg.GuardrailSideOffsetCm = LotEdge->GuardrailSideOffsetCm;
+			Seg.AutoLaneWidthCm = LotEdge->AutoLaneWidthCm;
+			Seg.AutoMedianCm = LotEdge->AutoMedianCm;
+			Seg.EdgeId = LotEdge->EdgeId;
+
+			// 從投影點 + ParkingTriangleBaseLength 開始（跟 PrependStartBoundEdgeSegment 的
+			// bTriangleExitOffset 一樣），駛向 exit node
+			// Start from projection + triangle base length (same as PrependStartBoundEdgeSegment
+			// with bTriangleExitOffset), drive toward exit node
+			const float ShiftedStart = ProjDist + (bFwd ? 1.0f : -1.0f) * ParkingTriangleBaseLength;
+			const float ClampedStart = FMath::Clamp(ShiftedStart, Lo, Hi);
+
+			if (bFwd)
+			{
+				Seg.StartDist = ClampedStart;
+				Seg.EndDist = LotEdge->EndDistanceOnSpline;
+				Seg.Direction = 1.0f;
+				Seg.EndNodeId = LotEdge->EndNodeId;
+			}
+			else
+			{
+				Seg.StartDist = ClampedStart;
+				Seg.EndDist = LotEdge->StartDistanceOnSpline;
+				Seg.Direction = -1.0f;
+				Seg.EndNodeId = LotEdge->StartNodeId;
+			}
+
+			// ---- 設置最小 driving state ----
+			if (bIsFollowing) ResetFollowingState();
+			PathSegments.Empty();
+			PathSegments.Add(Seg);
+			CurrentSegmentIndex = 0;
+			ReferenceDistance = Seg.StartDist;
+			CurrentSpeed = 0.0f;
+			TargetLaneIndex = CurrentLaneIndex;
+			CurrentLateralOffset = ComputeTargetLaneOffset(CurrentLaneIndex);
+			bIsChangingLane = false;
+			bOnJunctionCurve = false;
+			bJustExitedJunctionCurve = false;
+			JCurveProgress = 0.0f;
+			CurrentTurnSignal = ETurnSignal::None;
+			NavState = ENavState::Driving;
+			bIsFollowing = true;
+
+			// ---- 呼叫 RerouteToNode — 跟地圖手動點擊完全相同的路徑 ----
+			// ---- Call RerouteToNode — exact same code path as manual map click ----
+			RerouteToNode(TargetNodeId);
+
+			// ---- 出發曲線：從車位 Hermite 到第一段 spline 上 ----
+			// ---- Departure curve: Hermite from parking spot to first segment's spline ----
+			if (PathSegments.Num() > 0)
+			{
+				FPathSegmentInternal& FirstSeg = PathSegments[0];
+				const int32 OutermostLane = FMath::Max(0, FirstSeg.DrivingRule.ForwardLaneCount - 1);
+				const float OuterLaneOffset = ComputeLaneOffsetCm(
+					FirstSeg.bTwoRoads, FirstSeg.TwoRoadsGapM, FirstSeg.RoadType,
+					OutermostLane,
+					FirstSeg.AutoLaneWidthCm, FirstSeg.AutoMedianCm,
+					TwoRoadsMedianAdjustCm, TwoRoadsLaneWidthAdjustCm,
+					SharedRoadMedianAdjustCm, SharedRoadLaneWidthAdjustCm);
+
+				FVector RoadStartPos, RoadStartDir, RoadStartRight;
+				SampleSplineAtDist(FirstSeg, FirstSeg.StartDist, OuterLaneOffset,
+					RoadStartPos, RoadStartDir, RoadStartRight);
+
+				const float DistToRoad = FVector::Dist2D(CarPos, RoadStartPos);
+
+				if (DistToRoad > DepartureCurveTriggerDistance)
+				{
+					DepCurveP0 = CarPos;
+					DepCurveT0 = Owner->GetActorForwardVector() * DistToRoad * DepartureCurveStartTangentScale;
+					DepCurveP1 = RoadStartPos;
+					DepCurveT1 = RoadStartDir.GetSafeNormal() * DistToRoad * DepartureCurveTangentScale;
+					DepCurveLength = FMath::Max(DistToRoad * DepartureCurveLengthMultiplier, DepartureCurveMinLength);
+					DepCurveProgress = 0.0f;
+					bOnDepartureCurve = true;
+
+					TargetLaneIndex = OutermostLane;
+					CurrentLaneIndex = OutermostLane;
+					CurrentLateralOffset = OuterLaneOffset;
+				}
+			}
+
+			UE_LOG(LogTemp, Warning,
+				TEXT("[NAV-NODE] Bootstrap+Reroute done | %d segs | DepartureCurve=%s"),
+				PathSegments.Num(), bOnDepartureCurve ? TEXT("YES") : TEXT("NO"));
+			return;
+		}
+	}
+
+	// ---- Fallback：不在停車場附近 → 原本的 StartNavigationInternal ----
+	// ---- Fallback: not near a parking lot → original StartNavigationInternal ----
 	UE_LOG(LogTemp, Warning,
-		TEXT("[NAV-NODE] Idle/Parked → finding forward node from car pos (%.0f,%.0f,%.0f) fwd=(%.2f,%.2f,%.2f)"),
-		CarPos.X, CarPos.Y, CarPos.Z, CarFwd.X, CarFwd.Y, CarFwd.Z);
+		TEXT("[NAV-NODE] Idle/Parked, not near parking lot → finding forward node from car pos (%.0f,%.0f,%.0f)"),
+		CarPos.X, CarPos.Y, CarPos.Z);
 	const int32 FromNode = FindForwardStartNode(CarPos, CarFwd);
 	if (FromNode == INDEX_NONE)
 	{
@@ -1219,50 +1450,74 @@ void URoadPathFollowerComponent::RerouteToNode(int32 TargetNodeId)
 
 	// ---- 迴轉偵測：A* 第一步是否走回頭路 ----
 	// ---- U-turn detection: does A* first step go backwards ----
-	// 如果 A* 路徑第二個 node == CurSegStartNode → 走回頭路 → junction curve 會飛出路面
-	// 解法：從 FromNode 找一個「前方」鄰居（不是 CurSegStartNode），先走一段再 A*
-	// If A* path[1] == CurSegStartNode → going backwards → junction curve will overshoot
-	// Fix: find a "forward" neighbor of FromNode (not CurSegStartNode), go there first, then A*
+	// U-turn 只允許在兩種位置：
+	//   1. Dead-end node (MergedEndpointCount == 1) — 真正的路末
+	//   2. Junction node (bIsJunction == true) — 路口
+	// 如果 FromNodeId 不是合法的 U-turn 點，往前方 BFS 找最近的合法 U-turn 點，
+	// 先開到那裡再迴轉。
+	// U-turn is only allowed at:
+	//   1. Dead-end nodes (MergedEndpointCount == 1) — true road ends
+	//   2. Junction nodes (bIsJunction == true) — intersections
+	// If FromNodeId is not a valid U-turn point, BFS forward to find the nearest one,
+	// drive there first, then U-turn.
 	if (AStarPath.NodePath.Num() >= 2 && CurSegStartNode != INDEX_NONE
 		&& AStarPath.NodePath[1] == CurSegStartNode)
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("PathFollower: RerouteToNode — U-turn detected, finding forward detour"));
+			TEXT("PathFollower: RerouteToNode — U-turn detected at Node %d (MergedCount=%d IsJunction=%s)"),
+			FromNodeId,
+			Sub->GetGraphNodes().IsValidIndex(FromNodeId) ? Sub->GetGraphNodes()[FromNodeId].MergedEndpointCount : -1,
+			(Sub->IsUTurnAllowedAtNode(FromNodeId) ? TEXT("Y") : TEXT("N")));
 
-		// 從 FromNode 的鄰居中找一個不是 CurSegStartNode 的前方 node
-		// Find a neighbor of FromNode that's not CurSegStartNode
-		const TArray<FRoadGraphNeighbor> Neighbors = Sub->GetNeighborNodes(FromNodeId);
-		int32 ForwardNodeId = INDEX_NONE;
-		for (const FRoadGraphNeighbor& Nb : Neighbors)
+		// 找最近的合法 U-turn 節點（從 FromNodeId 往前方 BFS，不往 CurSegStartNode 方向）
+		// Find nearest valid U-turn node (BFS forward from FromNodeId, excluding CurSegStartNode direction)
+		const int32 UTurnNodeId = Sub->FindNearestUTurnNode(FromNodeId, CurSegStartNode);
+
+		if (UTurnNodeId == FromNodeId)
 		{
-			if (Nb.NeighborNodeId != CurSegStartNode)
-			{
-				ForwardNodeId = Nb.NeighborNodeId;
-				break;
-			}
+			// FromNodeId 本身就是合法 U-turn 點 → 用原始 A* 路徑（包含迴轉）
+			// FromNodeId itself is a valid U-turn point → use original A* path (which includes the U-turn)
+			UE_LOG(LogTemp, Warning,
+				TEXT("PathFollower: RerouteToNode — U-turn allowed at FromNode %d, using original A* path"),
+				FromNodeId);
 		}
-
-		if (ForwardNodeId != INDEX_NONE)
+		else if (UTurnNodeId != INDEX_NONE)
 		{
-			// 從前方 node 重新 A* 到目的地
-			// Re-route from the forward node to destination
-			FRoadGraphPath ForwardPath = Sub->FindPathAStar(ForwardNodeId, TargetNodeId);
-			if (ForwardPath.bPathFound)
+			// 先開到合法 U-turn 點，再從那裡 A* 到目的地
+			// Drive forward to valid U-turn node, then A* from there to destination
+			FRoadGraphPath ForwardPath = Sub->FindPathAStar(FromNodeId, UTurnNodeId);
+			FRoadGraphPath ReturnPath = Sub->FindPathAStar(UTurnNodeId, TargetNodeId);
+
+			if (ForwardPath.bPathFound && ReturnPath.bPathFound)
 			{
-				// 把 FromNodeId 插到路徑前面（FromNode → ForwardNode → ... → dest）
-				// Prepend FromNodeId to path (FromNode → ForwardNode → ... → dest)
-				ForwardPath.NodePath.Insert(FromNodeId, 0);
-				AStarPath = ForwardPath;
+				// 合併路徑：FromNode → ... → UTurnNode → ... → TargetNode
+				// Merge paths: FromNode → ... → UTurnNode → ... → TargetNode
+				FRoadGraphPath MergedPath;
+				MergedPath.bPathFound = true;
+				MergedPath.NodePath = ForwardPath.NodePath;
+
+				// ReturnPath 的第一個 node 是 UTurnNode（已在 ForwardPath 末尾），跳過
+				// ReturnPath's first node is UTurnNode (already at ForwardPath end), skip it
+				for (int32 i = 1; i < ReturnPath.NodePath.Num(); ++i)
+				{
+					MergedPath.NodePath.Add(ReturnPath.NodePath[i]);
+				}
+				MergedPath.TotalCost = ForwardPath.TotalCost + ReturnPath.TotalCost;
+				AStarPath = MergedPath;
 
 				UE_LOG(LogTemp, Warning,
-					TEXT("PathFollower: RerouteToNode — detour via Node %d → %d"),
-					FromNodeId, ForwardNodeId);
+					TEXT("PathFollower: RerouteToNode — U-turn at Node %d (forward detour from %d), merged path %d nodes"),
+					UTurnNodeId, FromNodeId, AStarPath.NodePath.Num());
 			}
-			// 如果前方路也找不到 → 用原始 A* 結果（容忍迴轉）
-			// If forward route fails → use original A* (tolerate U-turn)
+			else
+			{
+				// 路徑找不到 → fallback 到原始 A* 路徑
+				// Path not found → fallback to original A* path
+				UE_LOG(LogTemp, Warning,
+					TEXT("PathFollower: RerouteToNode — forward/return A* failed for UTurnNode %d, using original path"),
+					UTurnNodeId);
+			}
 		}
-		// 如果只有一個鄰居（死路）→ 用原始 A* 結果
-		// If only one neighbor (dead end) → use original A*
 	}
 
 	// 清除當前段之後的所有段 / Clear all segments after current

@@ -107,10 +107,23 @@ public:
 	}
 
 	/// <summary>
-	/// 用 EdgeId 查找對應的 Graph Edge / Find a graph edge by its EdgeId
-	/// @return 指標，找不到回傳 nullptr / Pointer to edge, or nullptr if not found
+	/// Find a graph edge by its EdgeId
+	/// Pointer to edge, or nullptr if not found
 	/// </summary>
 	const FRoadGraphEdge* GetGraphEdgeById(int32 EdgeId) const;
+
+	/// <summary>
+	/// Check whether a node allows U-turns.
+	/// Valid U-turn nodes: dead-end (MergedEndpointCount == 1) or junction (bIsJunction).
+	/// </summary>
+	bool IsUTurnAllowedAtNode(int32 NodeId) const;
+
+	/// <summary>
+	/// BFS from StartNodeId to find the nearest node where U-turn is allowed.
+	/// ExcludeNodeId is excluded from the first hop (prevents going backward).
+	/// Returns INDEX_NONE if no valid U-turn node is reachable.
+	/// </summary>
+	int32 FindNearestUTurnNode(int32 StartNodeId, int32 ExcludeNodeId) const;
 
 private:
 

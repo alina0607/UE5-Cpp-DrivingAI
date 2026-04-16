@@ -422,7 +422,7 @@ void URoadNetworkSubsystem::BuildNodeCandidates()
     or creates a new node candidate if no nearby node exists.
     function inside function: [] capture list
     */
-    auto AddOrMergePoint = [this, MergeDistanceSq](const FVector& Point)
+    auto AddOrMergePoint = [this, MergeDistanceSq](const FVector& Point, bool bFromJunction = false)
         {
             for (FRoadGraphNodeCandidate& ExistingNode : NodeCandidates)
             {
@@ -440,6 +440,12 @@ void URoadNetworkSubsystem::BuildNodeCandidates()
                         ((ExistingNode.WorldLocation * OldCount) + Point) / NewCount;
 
                     ExistingNode.MergedEndpointCount = NewCount;
+
+                    // If this point came from a junction, mark the node as junction
+                    if (bFromJunction)
+                    {
+                        ExistingNode.bIsJunction = true;
+                    }
                     return;
                 }
             }
@@ -449,6 +455,7 @@ void URoadNetworkSubsystem::BuildNodeCandidates()
             NewNode.NodeId = NodeCandidates.Num();
             NewNode.WorldLocation = Point;
             NewNode.MergedEndpointCount = 1;
+            NewNode.bIsJunction = bFromJunction;
 
             NodeCandidates.Add(NewNode);
         };
@@ -466,7 +473,7 @@ void URoadNetworkSubsystem::BuildNodeCandidates()
     for (int32 JIdx = 0; JIdx < JunctionCandidates.Num(); ++JIdx)
     {
         const FRoadJunctionCandidate& Junction = JunctionCandidates[JIdx];
-        AddOrMergePoint(Junction.WorldLocation);
+        AddOrMergePoint(Junction.WorldLocation, /*bFromJunction=*/ true);
     }
 }
 
@@ -619,6 +626,8 @@ void URoadNetworkSubsystem::BuildGraphNodes()
 
         Node.NodeId = Candidate.NodeId;
         Node.WorldLocation = Candidate.WorldLocation;
+        Node.MergedEndpointCount = Candidate.MergedEndpointCount;
+        Node.bIsJunction = Candidate.bIsJunction;
 
         GraphNodes.Add(Node);
     }
@@ -1043,4 +1052,92 @@ const FRoadGraphEdge* URoadNetworkSubsystem::GetGraphEdgeById(int32 EdgeId) cons
         }
     }
     return nullptr;
+}
+
+// ============================================================================
+//  IsUTurnAllowedAtNode — check if a node is a valid U-turn point
+// ============================================================================
+bool URoadNetworkSubsystem::IsUTurnAllowedAtNode(int32 NodeId) const
+{
+    if (!GraphNodes.IsValidIndex(NodeId))
+    {
+        return false;
+    }
+
+    const FRoadGraphNode& Node = GraphNodes[NodeId];
+
+    // Junction nodes always allow U-turns
+    if (Node.bIsJunction)
+    {
+        return true;
+    }
+
+    // Dead-end nodes (single spline endpoint = true road end) allow U-turns
+    if (Node.MergedEndpointCount == 1)
+    {
+        return true;
+    }
+
+    // Merged endpoint nodes (2+ spline endpoints meeting = road middle) do NOT allow U-turns
+    return false;
+}
+
+// ============================================================================
+//  FindNearestUTurnNode — BFS forward to find nearest valid U-turn node
+// ============================================================================
+int32 URoadNetworkSubsystem::FindNearestUTurnNode(int32 StartNodeId, int32 ExcludeNodeId) const
+{
+    if (!GraphNodes.IsValidIndex(StartNodeId))
+    {
+        return INDEX_NONE;
+    }
+
+    // Check if StartNodeId itself allows U-turn
+    if (IsUTurnAllowedAtNode(StartNodeId))
+    {
+        return StartNodeId;
+    }
+
+    // BFS to find nearest valid U-turn node
+    TArray<int32> Queue;
+    TSet<int32> Visited;
+
+    Queue.Add(StartNodeId);
+    Visited.Add(StartNodeId);
+
+    int32 Head = 0;
+    while (Head < Queue.Num())
+    {
+        const int32 CurrentId = Queue[Head++];
+        const TArray<FRoadGraphNeighbor> Neighbors = GetNeighborNodes(CurrentId);
+
+        for (const FRoadGraphNeighbor& Nb : Neighbors)
+        {
+            // On the first hop from StartNodeId, skip ExcludeNodeId (don't go backward)
+            if (CurrentId == StartNodeId && Nb.NeighborNodeId == ExcludeNodeId)
+            {
+                continue;
+            }
+
+            if (Visited.Contains(Nb.NeighborNodeId))
+            {
+                continue;
+            }
+
+            Visited.Add(Nb.NeighborNodeId);
+
+            if (IsUTurnAllowedAtNode(Nb.NeighborNodeId))
+            {
+                return Nb.NeighborNodeId;
+            }
+
+            Queue.Add(Nb.NeighborNodeId);
+        }
+    }
+
+    // No valid U-turn node found — fallback: allow at StartNodeId anyway
+    UE_LOG(LogTemp, Warning,
+        TEXT("[U-TURN] No valid U-turn node found via BFS from Node %d — fallback to StartNodeId"),
+        StartNodeId);
+    return StartNodeId;
 }

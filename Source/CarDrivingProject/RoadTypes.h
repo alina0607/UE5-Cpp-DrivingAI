@@ -230,6 +230,12 @@ struct CARDRIVINGPROJECT_API FRoadGraphNodeCandidate
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     int32 MergedEndpointCount = 0;
+
+    /// <summary>
+    /// Whether this node originated from (or was merged with) a junction candidate.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    bool bIsJunction = false;
 };
 
 /// <summary>
@@ -374,6 +380,21 @@ struct CARDRIVINGPROJECT_API FRoadGraphNode
     /// </summary>
     UPROPERTY(BlueprintReadOnly)
     TArray<int32> ConnectedEdgeIds;
+
+    /// <summary>
+    /// Number of road endpoints merged into this node.
+    /// 1 = dead-end (single spline endpoint, true road end).
+    /// 2+ = merged endpoints (two or more splines meeting, visually same road middle).
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    int32 MergedEndpointCount = 0;
+
+    /// <summary>
+    /// Whether this node is at a junction (where different roads intersect).
+    /// Junction nodes always allow U-turns.
+    /// </summary>
+    UPROPERTY(BlueprintReadOnly)
+    bool bIsJunction = false;
 };
 
 /// <summary>
