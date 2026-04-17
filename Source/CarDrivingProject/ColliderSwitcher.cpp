@@ -13,15 +13,21 @@ void AColliderSwitcher::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// Auto-configure all cubes to respond Block on ObstacleDetect channel
-	for (AActor* Actor : FirstGroup)
+	// Auto-configure all cubes to respond Block on ObstacleDetect channel.
+	// Also stamp tag "TrafficSignal" so PathFollowers can distinguish a red-light
+	// block from a real static obstacle during stuck classification.
+	const FName TrafficSignalTag(TEXT("TrafficSignal"));
+	auto TagAndConfigure = [&](AActor* Actor)
 	{
+		if (!Actor) return;
 		ConfigureObstacleChannel(Actor);
-	}
-	for (AActor* Actor : SecondGroup)
-	{
-		ConfigureObstacleChannel(Actor);
-	}
+		if (!Actor->Tags.Contains(TrafficSignalTag))
+		{
+			Actor->Tags.Add(TrafficSignalTag);
+		}
+	};
+	for (AActor* Actor : FirstGroup)  { TagAndConfigure(Actor); }
+	for (AActor* Actor : SecondGroup) { TagAndConfigure(Actor); }
 
 	// Calculate full cycle duration
 	// Cycle: G1 green → yellow → all-red → G2 green → yellow → all-red

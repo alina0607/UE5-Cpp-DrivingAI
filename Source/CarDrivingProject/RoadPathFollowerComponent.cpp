@@ -8,6 +8,7 @@
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "TimerManager.h"
+#include "UObject/UObjectIterator.h"
 
 // ============================================================================
 //  ComputeLaneOffsetCm — 靜態工具函式（跟之前一樣，不變）
@@ -69,9 +70,72 @@ void URoadPathFollowerComponent::BeginPlay()
 //  ResetFollowingState — 重置所有跟隨/導航狀態（重導航時使用）
 //  Reset all following/navigation state (used when re-routing).
 // ============================================================================
+// ============================================================================
+//  LogEvent — push to ring buffer + UE_LOG with unified tag
+// ============================================================================
+void URoadPathFollowerComponent::LogEvent(const FString& EventText)
+{
+	const float T = (GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f);
+	const FString Line = FString::Printf(TEXT("[%6.1fs] %s"), T, *EventText);
+	RecentEvents.Add(Line);
+	if (RecentEvents.Num() > MaxRecentEvents)
+	{
+		RecentEvents.RemoveAt(0, RecentEvents.Num() - MaxRecentEvents);
+	}
+
+	AActor* Owner = GetOwner();
+	UE_LOG(LogTemp, Warning, TEXT("[TRACE] %s %s"),
+		Owner ? *Owner->GetName() : TEXT("?"), *Line);
+}
+
+// ============================================================================
+//  HandleEnteredNewSegment — called right after CurrentSegmentIndex++.
+//  Detects final-edge entry and forces a pull-over lane change + disables overtake.
+// ============================================================================
+void URoadPathFollowerComponent::HandleEnteredNewSegment()
+{
+	if (!PathSegments.IsValidIndex(CurrentSegmentIndex)) return;
+
+	const bool bFinalNow = (CurrentSegmentIndex == PathSegments.Num() - 1);
+	const FPathSegmentInternal& Seg = PathSegments[CurrentSegmentIndex];
+
+	if (bFinalNow && !bIsFinalEdge)
+	{
+		bIsFinalEdge = true;
+
+		// Cancel any in-progress overtake so we don't leave lanes halfway.
+		if (OvertakeState != EOvertakeState::None)
+		{
+			OvertakeState = EOvertakeState::None;
+			OvertakeTargetActor = nullptr;
+			OvertakeReturnConfirmTimer = 0.0f;
+		}
+
+		// Snap to outermost forward lane for pull-over alignment.
+		const int32 ForwardLanes = FMath::Max(1, Seg.DrivingRule.ForwardLaneCount);
+		const int32 OuterLane = ForwardLanes - 1;
+		if (TargetLaneIndex != OuterLane)
+		{
+			TargetLaneIndex = OuterLane;
+			bIsChangingLane = true;
+			CurrentTurnSignal = (OuterLane > CurrentLaneIndex) ? ETurnSignal::Right : CurrentTurnSignal;
+		}
+
+		LogEvent(FString::Printf(TEXT("ENTER FINAL EDGE seg=%d edge=%d forceLane=%d"),
+			CurrentSegmentIndex, Seg.EdgeId, OuterLane));
+	}
+	else
+	{
+		LogEvent(FString::Printf(TEXT("Seg %d/%d edge=%d lane=%d"),
+			CurrentSegmentIndex, PathSegments.Num() - 1, Seg.EdgeId, CurrentLaneIndex));
+	}
+}
+
+// ============================================================================
 void URoadPathFollowerComponent::ResetFollowingState()
 {
 	bIsFollowing = false;
+	bIsFinalEdge = false;
 	bOnJunctionCurve = false;
 	bIsUTurnCurve = false;
 	bIsGapBridgeCurve = false;
@@ -101,6 +165,9 @@ void URoadPathFollowerComponent::ResetFollowingState()
 	StuckCooldownTimer = 0.0f;
 	ConsecutiveStuckCount = 0;
 	TimeSinceLastStuck = 999.0f;
+	RearWaitAccum = 0.0f;
+	LastYieldReason.Empty();
+	LastYieldLogTime = -999.0f;
 
 	// 注意：停車格的釋放與目的地清除不在這裡做。
 	// ResetFollowingState 會在 NavigateTo* 設定完 Target* 之後（OccupySpot 之後）才呼叫，
@@ -760,6 +827,187 @@ void URoadPathFollowerComponent::SetDepartureContext(AParkingLotActor* SourceLot
 }
 
 // ============================================================================
+//  IsPerformingManeuver — in a junction / U-turn / parking / departure curve?
+// ============================================================================
+bool URoadPathFollowerComponent::IsPerformingManeuver() const
+{
+	return bOnJunctionCurve || bOnParkingCurve || bOnDepartureCurve;
+}
+
+// ============================================================================
+//  IsDepartureLaneClear — scan backward along the source edge spline for cars
+//  approaching from behind the merge point. Only vehicles count; traffic signal
+//  colliders are ignored (we don't want to misread an opposing signal as traffic).
+// ============================================================================
+bool URoadPathFollowerComponent::IsDepartureLaneClear() const
+{
+	if (!SourceParkingLot.IsValid()) return true;
+	AParkingLotActor* Lot = SourceParkingLot.Get();
+	if (!Lot) return true;
+
+	UWorld* World = GetWorld();
+	if (!World) return true;
+
+	URoadNetworkSubsystem* Sub = World->GetSubsystem<URoadNetworkSubsystem>();
+	if (!Sub) return true;
+
+	const FRoadGraphEdge* Edge = Sub->GetGraphEdgeById(Lot->BoundEdgeId);
+	if (!Edge || !Edge->InputSpline) return true;
+
+	USplineComponent* S = Edge->InputSpline;
+	const FVector& ProjPt = Lot->BoundProjectionPoint;
+	const float ProjKey = S->FindInputKeyClosestToWorldLocation(ProjPt);
+	const float ProjDist = S->GetDistanceAlongSplineAtSplineInputKey(ProjKey);
+
+	// Determine the spot's facing relative to spline — "backward" on our lane
+	// is the direction cars come FROM when they'd hit us merging in.
+	const FVector SpotFwd = Lot->GetSpotWorldForward(SourceSpotIndex);
+	const FVector SpotFwd2D = FVector(SpotFwd.X, SpotFwd.Y, 0).GetSafeNormal();
+	const FVector SplineDir = S->GetDirectionAtDistanceAlongSpline(
+		ProjDist, ESplineCoordinateSpace::World).GetSafeNormal2D();
+	const bool bForwardAlongSpline = (FVector::DotProduct(SpotFwd2D, SplineDir) >= 0.0f);
+	const float BackStep = bForwardAlongSpline ? -1.0f : 1.0f;  // backward rel. departure
+	const float FwdStep  = -BackStep;                            // forward rel. departure
+	const float SplineLen = S->GetSplineLength();
+
+	FCollisionQueryParams Params;
+	if (AActor* Owner = GetOwner()) Params.AddIgnoredActor(Owner);
+
+	// Scan both directions on our lane:
+	//  * BEHIND the merge point for approaching cars (cars would hit us)
+	//  * AHEAD of the merge point for queued / stopped cars (we'd hit them)
+	// Both windows use DepartureLaneCheckDistance; ahead uses half that so we
+	// don't refuse to depart just because downstream traffic is normal-spaced.
+	auto ScanDirection = [&](float Direction, float Distance) -> bool
+	{
+		const int32 NumSamples = FMath::Max(2, FMath::CeilToInt(Distance / 250.0f));
+		for (int32 i = 1; i <= NumSamples; ++i)
+		{
+			const float Offset = (Distance * i) / NumSamples;
+			const float SampleDist = FMath::Clamp(ProjDist + Direction * Offset, 0.0f, SplineLen);
+			const FVector P = S->GetLocationAtDistanceAlongSpline(
+				SampleDist, ESplineCoordinateSpace::World)
+				+ FVector(0, 0, ObstacleTraceZOffset);
+
+			FHitResult Hit;
+			const bool bHit = World->SweepSingleByChannel(
+				Hit, P, P + FVector(0, 0, 1), FQuat::Identity,
+				ECC_ObstacleDetect,
+				FCollisionShape::MakeSphere(DepartureLaneTraceRadius),
+				Params);
+
+			if (bHit)
+			{
+				AActor* A = Hit.GetActor();
+				if (A && A->FindComponentByClass<URoadPathFollowerComponent>())
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	};
+
+	// Behind: full window for approaching traffic.
+	if (!ScanDirection(BackStep, DepartureLaneCheckDistance)) return false;
+	// Ahead: shorter window — just enough to avoid merging into the back of a queue.
+	if (!ScanDirection(FwdStep, DepartureLaneCheckDistance * 0.5f)) return false;
+	return true;
+}
+
+// ============================================================================
+//  IsLeftTurnOncomingClear — 左轉前檢查對向直行車
+//  Before a LEFT-turn junction curve, scan the oncoming lane of NextSeg looking
+//  for straight-through vehicles. "Oncoming" = along NextSeg's spline in the
+//  REVERSE of our driving direction, offset to the lane that crosses the same
+//  junction space we'd sweep through.
+// ============================================================================
+bool URoadPathFollowerComponent::IsLeftTurnOncomingClear(
+	const FPathSegmentInternal& NextSeg,
+	AActor*& OutBlockingActor,
+	float& OutDistance) const
+{
+	OutBlockingActor = nullptr;
+	OutDistance = -1.0f;
+
+	if (LeftTurnOncomingScanDistance <= 0.0f) return true;  // disabled
+	if (!NextSeg.Spline) return true;
+
+	UWorld* World = GetWorld();
+	if (!World) return true;
+
+	AActor* Owner = GetOwner();
+	if (!Owner) return true;
+
+	USplineComponent* S = NextSeg.Spline;
+	const float SplineLen = S->GetSplineLength();
+
+	// Oncoming traffic travels in the OPPOSITE direction along the same spline.
+	// We sample starting at NextSeg.StartDist (junction entry point) and walk
+	// AGAINST our driving direction, because cars coming head-on are approaching
+	// us from "further along the spline in the other direction".
+	//
+	// NextSeg.Direction is our travel direction (±1). Oncoming step = -Direction.
+	// We also offset laterally into the opposing lane (OPPOSITE side of spline).
+	const float OncomingStep = -NextSeg.Direction;
+	const float StartDist = NextSeg.StartDist;
+
+	// Opposing lane offset: mirror our next-seg lane across the spline centerline.
+	// Use innermost opposing lane (lane 0 on the other side) — that's the one a
+	// straight-through oncoming car would be in just before the junction.
+	const float OpposingLaneOffset = -ComputeLaneOffsetCm(
+		NextSeg.bTwoRoads, NextSeg.TwoRoadsGapM, NextSeg.RoadType,
+		0,
+		NextSeg.AutoLaneWidthCm, NextSeg.AutoMedianCm,
+		TwoRoadsMedianAdjustCm, TwoRoadsLaneWidthAdjustCm,
+		SharedRoadMedianAdjustCm, SharedRoadLaneWidthAdjustCm);
+
+	FCollisionQueryParams Params;
+	Params.AddIgnoredActor(Owner);
+
+	const int32 NumSamples = FMath::Max(3, FMath::CeilToInt(LeftTurnOncomingScanDistance / 250.0f));
+	for (int32 i = 1; i <= NumSamples; ++i)
+	{
+		const float Offset = (LeftTurnOncomingScanDistance * i) / NumSamples;
+		const float SampleAbs = FMath::Clamp(StartDist + OncomingStep * Offset, 0.0f, SplineLen);
+
+		// Lateral offset along the opposing lane
+		FVector SampleCenter, SampleDir, SampleRight;
+		SampleSplineAtDist(NextSeg, SampleAbs, OpposingLaneOffset,
+			SampleCenter, SampleDir, SampleRight);
+
+		const FVector P = SampleCenter + FVector(0, 0, ObstacleTraceZOffset);
+
+		FHitResult Hit;
+		const bool bHit = World->SweepSingleByChannel(
+			Hit, P, P + FVector(0, 0, 1), FQuat::Identity,
+			ECC_ObstacleDetect,
+			FCollisionShape::MakeSphere(LeftTurnOncomingScanRadius),
+			Params);
+
+		if (bHit)
+		{
+			AActor* A = Hit.GetActor();
+			if (A && A != Owner)
+			{
+				URoadPathFollowerComponent* OtherPF =
+					A->FindComponentByClass<URoadPathFollowerComponent>();
+				if (OtherPF)
+				{
+					// Only yield to moving / non-reversing oncoming cars. If the
+					// oncoming car is itself stopped & stuck, we'll deadlock
+					// head-on; the LeftTurnYieldMaxSec timeout breaks that.
+					OutBlockingActor = A;
+					OutDistance = Offset;
+					return false;
+				}
+			}
+		}
+	}
+	return true;
+}
+
+// ============================================================================
 //  IsSourceLotReadyForDeparture — 檢查鏈上所有較低 index 的 spot 是否都已清空
 //  All spots with index < SourceSpotIndex must be either empty (occupant drove
 //  off) or occupied by a car that itself has already departed from its spot.
@@ -829,7 +1077,9 @@ void URoadPathFollowerComponent::TryDepartPoll()
 		return;
 	}
 
-	const bool bReady = IsSourceLotReadyForDeparture();
+	const bool bOrderReady = IsSourceLotReadyForDeparture();
+	const bool bLaneClear = IsDepartureLaneClear();
+	const bool bReady = bOrderReady && bLaneClear;
 	const bool bTimedOut = (DepartureWaitAccum >= DepartureMaxWaitTime);
 
 	if (bReady || bTimedOut)
@@ -837,11 +1087,17 @@ void URoadPathFollowerComponent::TryDepartPoll()
 		World->GetTimerManager().ClearTimer(DepartureCheckTimerHandle);
 
 		UE_LOG(LogTemp, Warning,
-			TEXT("[DEPART] %s: GO (reason=%s, waited=%.1fs, spot=%d)"),
+			TEXT("[DEPART] %s: GO (reason=%s, order=%s, lane=%s, waited=%.1fs, spot=%d)"),
 			*Owner->GetName(),
 			bReady ? TEXT("ready") : TEXT("timeout"),
+			bOrderReady ? TEXT("Y") : TEXT("N"),
+			bLaneClear ? TEXT("Y") : TEXT("N"),
 			DepartureWaitAccum,
 			SourceSpotIndex);
+		LogEvent(FString::Printf(TEXT("DEPART GO (order=%s lane=%s waited=%.1fs)"),
+			bOrderReady ? TEXT("Y") : TEXT("N"),
+			bLaneClear ? TEXT("Y") : TEXT("N"),
+			DepartureWaitAccum));
 
 		AParkingLotActor* Dest = PendingDestLot.Get();
 		const int32 DestSpot = PendingDestSpotIndex;
@@ -854,6 +1110,15 @@ void URoadPathFollowerComponent::TryDepartPoll()
 
 	// 還沒輪到 → 排下一次 poll
 	DepartureWaitAccum += DepartureCheckInterval;
+
+	// Log the wait reason every ~2s so it's visible in the M-panel.
+	if (FMath::Fmod(DepartureWaitAccum, 2.0f) < DepartureCheckInterval)
+	{
+		LogEvent(FString::Printf(TEXT("DEPART WAIT order=%s lane=%s (%.1fs)"),
+			bOrderReady ? TEXT("Y") : TEXT("N"),
+			bLaneClear ? TEXT("Y") : TEXT("N"),
+			DepartureWaitAccum));
+	}
 
 	World->GetTimerManager().SetTimer(
 		DepartureCheckTimerHandle,
@@ -2551,6 +2816,8 @@ void URoadPathFollowerComponent::TickComponent(
 		const bool bWasUTurn = bIsUTurnCurve;
 		const FVector UTurnFinalCarPos = Owner->GetActorLocation();  // for reprojection
 
+		LogEvent(FString::Printf(TEXT("JUNCTION EXIT %s"), bWasUTurn ? TEXT("(U-turn)") : TEXT("")));
+
 		bOnJunctionCurve = false;
 		bIsUTurnCurve = false;
 		bIsGapBridgeCurve = false;
@@ -2562,11 +2829,13 @@ void URoadPathFollowerComponent::TickComponent(
 			CurrentSpeed = 0.0f;
 			NavState = ENavState::Parked;
 			CurrentTurnSignal = ETurnSignal::None;
+			LogEvent(TEXT("PATH COMPLETE (after junction curve)"));
 			OnPathComplete.Broadcast(true);
 			return;
 		}
 
 		Seg = PathSegments[CurrentSegmentIndex];
+		HandleEnteredNewSegment();
 
 		// ================================================================
 		// U-turn special: reproject the car's actual position onto the new
@@ -2747,6 +3016,8 @@ void URoadPathFollowerComponent::TickComponent(
 		CurrentLaneIndex = TargetLaneIndex;
 		CurrentTurnSignal = ETurnSignal::None;
 
+		HandleEnteredNewSegment();
+
 		// ----------------------------------------------------------------
 		// 位置連續性重投影（Step B：用新段 right 向量把 OffsetCorrection 算出）
 		// Part 2: on the NEW segment, compute how much lateral offset we need
@@ -2869,6 +3140,59 @@ void URoadPathFollowerComponent::TickComponent(
 		}
 		else
 		{
+			// ----------------------------------------------------------
+			// LEFT-TURN YIELD: sphere-trace the oncoming lane of NextSeg
+			// for straight-through traffic. If any, stop & wait this
+			// frame; next Tick re-checks. LeftTurnYieldMaxSec caps the
+			// wait so two head-on stopped cars can't freeze forever.
+			// ----------------------------------------------------------
+			if (CurrentTurnSignal == ETurnSignal::Left && !Seg.bUTurnAtEnd)
+			{
+				AActor* OncomingBlocker = nullptr;
+				float   OncomingDist = -1.0f;
+				const bool bOncomingClear = IsLeftTurnOncomingClear(NextSeg, OncomingBlocker, OncomingDist);
+
+				if (!bOncomingClear)
+				{
+					LeftTurnYieldAccum += DeltaTime;
+
+					if (LeftTurnYieldAccum < LeftTurnYieldMaxSec)
+					{
+						// Yield: zero speed, log (throttled), return without building curve
+						CurrentSpeed = 0.0f;
+
+						const float NowT = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+						const FString YStr = TEXT("left-turn oncoming");
+						if (YStr != LastYieldReason || (NowT - LastYieldLogTime) >= 3.0f)
+						{
+							LastYieldReason = YStr;
+							LastYieldLogTime = NowT;
+							LogEvent(FString::Printf(
+								TEXT("YIELD L-TURN: oncoming=%s @ %.0fcm (waited %.1fs)"),
+								OncomingBlocker ? *OncomingBlocker->GetName() : TEXT("?"),
+								OncomingDist,
+								LeftTurnYieldAccum));
+						}
+						return;
+					}
+					else
+					{
+						// Timeout — force commit, log once
+						LogEvent(FString::Printf(
+							TEXT("L-TURN FORCED (yield timeout %.1fs, oncoming=%s)"),
+							LeftTurnYieldAccum,
+							OncomingBlocker ? *OncomingBlocker->GetName() : TEXT("?")));
+						LeftTurnYieldAccum = 0.0f;
+						// fall through: build curve
+					}
+				}
+				else
+				{
+					// Oncoming clear — reset accumulator
+					LeftTurnYieldAccum = 0.0f;
+				}
+			}
+
 
 		// Curve end: normal turns go EffectiveBlendDist into next seg; U-turn stays near start
 		const bool bUpcomingUTurn = Seg.bUTurnAtEnd;
@@ -3018,6 +3342,10 @@ void URoadPathFollowerComponent::TickComponent(
 		JCurveNextRefDist = NextSampleDist;
 
 		bOnJunctionCurve = true;
+		LogEvent(FString::Printf(TEXT("JUNCTION ENTER %s%s len=%.0f"),
+			bIsUTurnCurve ? TEXT("U-TURN ") : TEXT(""),
+			bIsGapBridgeCurve ? TEXT("GAP ") : TEXT(""),
+			JCurveLength));
 
 
 		// No "first-step SetActorLocationAndRotation" — P0 is already the car's current
@@ -3258,6 +3586,35 @@ void URoadPathFollowerComponent::UpdateObstacleDetection()
 			const FString HitComp = Hit.GetComponent() ? Hit.GetComponent()->GetName() : TEXT("?");
 		}
 	}
+
+	// During maneuvers (junction / parking / departure) be extra cautious about
+	// OTHER VEHICLES only. Wider + longer sweep, then filter out non-PathFollower
+	// hits so we don't falsely balloon the hitbox against red-light / signal colliders.
+	if (IsPerformingManeuver())
+	{
+		const float VehRadius = ObstacleTraceRadius * ManeuverVehicleTraceRadiusMult;
+		const float VehDist = ObstacleSlowdownDistance * ManeuverVehicleTraceDistanceMult;
+		const FVector VehEnd = Start + Forward * VehDist;
+
+		TArray<FHitResult> VehHits;
+		World->SweepMultiByChannel(
+			VehHits, Start, VehEnd, FQuat::Identity,
+			ECC_ObstacleDetect,
+			FCollisionShape::MakeSphere(VehRadius),
+			Params);
+
+		for (const FHitResult& VH : VehHits)
+		{
+			AActor* A = VH.GetActor();
+			if (!A || A == Owner) continue;
+			if (!A->FindComponentByClass<URoadPathFollowerComponent>()) continue;
+			if (ObstacleDistance < 0.0f || VH.Distance < ObstacleDistance)
+			{
+				ObstacleDistance = VH.Distance;
+				ObstacleActor = A;
+			}
+		}
+	}
 }
 
 // ============================================================================
@@ -3291,6 +3648,251 @@ float URoadPathFollowerComponent::ComputeObstacleSpeedLimit() const
 	const float Alpha = (ObstacleDistance - ObstacleStopDistance)
 		/ (ObstacleSlowdownDistance - ObstacleStopDistance);
 	return MaxSpeed * FMath::Sqrt(Alpha);
+}
+
+// ============================================================================
+//  Front obstacle classification — uses ObstacleActor + TrafficSignal tag
+// ============================================================================
+EFrontObstacleType URoadPathFollowerComponent::ClassifyFrontObstacle() const
+{
+	if (!ObstacleActor.IsValid()) return EFrontObstacleType::None;
+	AActor* Act = ObstacleActor.Get();
+	if (!Act) return EFrontObstacleType::None;
+
+	if (Act->FindComponentByClass<URoadPathFollowerComponent>())
+	{
+		return EFrontObstacleType::Vehicle;
+	}
+	if (Act->Tags.Contains(FName(TrafficSignalTagName)))
+	{
+		return EFrontObstacleType::TrafficSignal;
+	}
+	return EFrontObstacleType::Static;
+}
+
+// ============================================================================
+//  Rear clearance — sphere-trace behind car for another vehicle.
+//  Returns true if safe (no vehicle within RearClearDistance).
+// ============================================================================
+bool URoadPathFollowerComponent::IsRearClearOfVehicles(AActor*& OutRearVehicle) const
+{
+	OutRearVehicle = nullptr;
+	UWorld* World = GetWorld();
+	AActor* Owner = GetOwner();
+	if (!World || !Owner) return true;
+
+	const FVector Start = Owner->GetActorLocation() + FVector(0, 0, ObstacleTraceZOffset);
+	const FVector Back = -Owner->GetActorForwardVector();
+	const FVector End = Start + Back * RearClearDistance;
+
+	FHitResult Hit;
+	FCollisionQueryParams Params;
+	Params.AddIgnoredActor(Owner);
+
+	const bool bHit = World->SweepSingleByChannel(
+		Hit, Start, End, FQuat::Identity, ECC_ObstacleDetect,
+		FCollisionShape::MakeSphere(RearTraceRadius), Params);
+
+	if (bHit)
+	{
+		AActor* HitActor = Hit.GetActor();
+		if (HitActor && HitActor->FindComponentByClass<URoadPathFollowerComponent>())
+		{
+			OutRearVehicle = HitActor;
+			return false;
+		}
+	}
+	return true;
+}
+
+// ============================================================================
+//  Walk forward along the stuck chain via each vehicle's ObstacleActor link.
+//  OutChain is filled tail→head (index 0 = me, last = leader).
+// ============================================================================
+bool URoadPathFollowerComponent::BuildStuckChainForward(
+	TArray<URoadPathFollowerComponent*>& OutChain) const
+{
+	OutChain.Reset();
+	TSet<const URoadPathFollowerComponent*> Visited;
+
+	const URoadPathFollowerComponent* Cur = this;
+	for (int32 Depth = 0; Depth < MaxChainWalkDepth; ++Depth)
+	{
+		if (!Cur || Visited.Contains(Cur)) return false;
+		Visited.Add(Cur);
+		OutChain.Add(const_cast<URoadPathFollowerComponent*>(Cur));
+
+		if (!Cur->ObstacleActor.IsValid()) return true;
+		AActor* FrontAct = Cur->ObstacleActor.Get();
+		if (!FrontAct) return true;
+
+		URoadPathFollowerComponent* FrontPF =
+			FrontAct->FindComponentByClass<URoadPathFollowerComponent>();
+		if (!FrontPF) return true;  // front is non-vehicle → current is leader
+
+		// Front vehicle must also be stuck-stopped for the chain to continue.
+		const bool bFrontStopped = (FrontPF->GetCurrentSpeed() < 5.0f);
+		if (!bFrontStopped) return true;
+
+		Cur = FrontPF;
+	}
+	return false;  // depth exhausted
+}
+
+// ============================================================================
+//  IsChainLeader — walk forward along the stuck chain and decide.
+//  Unlike the single-hop version, this handles cycles (crossing-deadlock at
+//  intersections) by picking the FName-smallest member of the cycle as leader.
+// ============================================================================
+bool URoadPathFollowerComponent::IsChainLeader() const
+{
+	TSet<const URoadPathFollowerComponent*> Visited;
+	TArray<const URoadPathFollowerComponent*> Chain;
+
+	const URoadPathFollowerComponent* Cur = this;
+	for (int32 Depth = 0; Depth < MaxChainWalkDepth; ++Depth)
+	{
+		if (!Cur) return (Depth == 0);
+
+		// Cycle detected → leader = FName-smallest car in the cycle (self-decided,
+		// every car reaches the same conclusion so exactly one reverses).
+		if (Visited.Contains(Cur))
+		{
+			const AActor* MyOwner = GetOwner();
+			if (!MyOwner) return false;
+			const FString MyName = MyOwner->GetName();
+			for (const URoadPathFollowerComponent* C : Chain)
+			{
+				if (!C || C == this) continue;
+				const AActor* O = C->GetOwner();
+				if (!O) continue;
+				if (O->GetName().Compare(MyName) < 0) return false;  // someone smaller exists
+			}
+			return true;
+		}
+		Visited.Add(Cur);
+		Chain.Add(Cur);
+
+		// Terminal: no front obstacle → Cur is chain head. I'm leader iff Cur == me.
+		if (!Cur->ObstacleActor.IsValid()) return (Cur == this);
+		AActor* FrontAct = Cur->ObstacleActor.Get();
+		if (!FrontAct) return (Cur == this);
+
+		URoadPathFollowerComponent* FrontPF =
+			FrontAct->FindComponentByClass<URoadPathFollowerComponent>();
+		if (!FrontPF) return (Cur == this);                 // static / traffic → Cur is head
+		if (FrontPF->GetCurrentSpeed() >= 5.0f) return (Cur == this);  // front moving → done
+
+		Cur = FrontPF;
+	}
+	// Depth exhausted — conservatively say no (prevents runaway).
+	return false;
+}
+
+// ============================================================================
+//  GetManeuverLabel — 短標籤描述目前動作，用在 mutual-stuck log
+// ============================================================================
+FString URoadPathFollowerComponent::GetManeuverLabel() const
+{
+	if (bOnDepartureCurve) return TEXT("DEPART");
+	if (bOnParkingCurve)   return TEXT("PARKING");
+	if (bOnJunctionCurve)
+	{
+		if (bIsUTurnCurve)                              return TEXT("U-TURN");
+		if (CurrentTurnSignal == ETurnSignal::Left)     return TEXT("LEFT");
+		if (CurrentTurnSignal == ETurnSignal::Right)    return TEXT("RIGHT");
+		return TEXT("STRAIGHT-GAP");
+	}
+	if (CurrentTurnSignal == ETurnSignal::Left)         return TEXT("APPR-LEFT");
+	if (CurrentTurnSignal == ETurnSignal::Right)        return TEXT("APPR-RIGHT");
+	return TEXT("STRAIGHT");
+}
+
+// ============================================================================
+//  CountStoppedRearChain — BFS walk backward: find every stopped PathFollower
+//  that transitively points at me as its ObstacleActor.
+// ============================================================================
+int32 URoadPathFollowerComponent::CountStoppedRearChain(
+	TArray<URoadPathFollowerComponent*>& OutChain) const
+{
+	OutChain.Reset();
+	UWorld* W = GetWorld();
+	if (!W) return 0;
+
+	TSet<const URoadPathFollowerComponent*> Visited;
+	Visited.Add(this);
+
+	TArray<const URoadPathFollowerComponent*> Frontier;
+	Frontier.Add(this);
+
+	const int32 MaxRearDepth = FMath::Max(MaxChainWalkDepth, 10);
+	int32 Depth = 0;
+
+	while (Frontier.Num() > 0 && Depth < MaxRearDepth)
+	{
+		TArray<const URoadPathFollowerComponent*> NextFrontier;
+		for (const URoadPathFollowerComponent* Cur : Frontier)
+		{
+			if (!Cur) continue;
+			AActor* CurActor = Cur->GetOwner();
+			if (!CurActor) continue;
+
+			for (TObjectIterator<URoadPathFollowerComponent> It; It; ++It)
+			{
+				URoadPathFollowerComponent* Other = *It;
+				if (!Other || Other == Cur) continue;
+				if (Visited.Contains(Other)) continue;
+				if (Other->GetWorld() != W) continue;
+				if (!Other->ObstacleActor.IsValid()) continue;
+				if (Other->ObstacleActor.Get() != CurActor) continue;
+				if (Other->GetCurrentSpeed() >= 5.0f) continue;  // only stopped cars count
+
+				Visited.Add(Other);
+				OutChain.Add(Other);
+				NextFrontier.Add(Other);
+			}
+		}
+		Frontier = MoveTemp(NextFrontier);
+		Depth++;
+	}
+	return OutChain.Num();
+}
+
+// ============================================================================
+//  TriggerStuckReverse — 共用的「觸發後退」入口（mutual-stuck 串連呼叫）
+// ============================================================================
+void URoadPathFollowerComponent::TriggerStuckReverse(
+	float OverrideReverseDistance,
+	const TCHAR* Reason)
+{
+	AActor* Owner = GetOwner();
+	if (!Owner) return;
+	if (bIsStuckReversing) return;   // already reversing
+
+	if (TimeSinceLastStuck < ConsecutiveStuckWindow)
+		ConsecutiveStuckCount++;
+	else
+		ConsecutiveStuckCount = 1;
+	TimeSinceLastStuck = 0.0f;
+
+	CurrentStuckReverseTarget = (OverrideReverseDistance > 0.0f)
+		? OverrideReverseDistance
+		: StuckReverseDistance * (1.0f + (ConsecutiveStuckCount - 1) * 0.5f);
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("[STUCK] %s: TriggerStuckReverse reason=%s dist=%.0f consec=#%d"),
+		*Owner->GetName(), Reason ? Reason : TEXT(""),
+		CurrentStuckReverseTarget, ConsecutiveStuckCount);
+	LogEvent(FString::Printf(TEXT("REVERSE %.0fcm reason=%s consec=#%d"),
+		CurrentStuckReverseTarget,
+		Reason ? Reason : TEXT(""),
+		ConsecutiveStuckCount));
+
+	bIsStuckReversing = true;
+	StuckReversedSoFar = 0.0f;
+	CurrentSpeed = 0.0f;
+	StuckTimer = 0.0f;
+	bMutualStuckResolved = false;
 }
 
 // ============================================================================
@@ -3351,6 +3953,33 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 	// ================================================================
 	if (bIsStuckReversing)
 	{
+		// Rear-clear gate — only reverse if no vehicle is right behind.
+		// Cascades tail-first naturally: the car with no one behind moves first.
+		// Safety valve: if we've been blocked too long (both chains stuck), reverse anyway.
+		AActor* RearVehicle = nullptr;
+		if (!IsRearClearOfVehicles(RearVehicle))
+		{
+			RearWaitAccum += DeltaTime;
+			if (RearWaitAccum < RearWaitMaxSec)
+			{
+				CurrentSpeed = 0.0f;
+				if (RearWaitAccum - DeltaTime <= 0.05f)  // first frame blocked
+				{
+					LogEvent(FString::Printf(TEXT("REVERSE BLOCKED by rear=%s (waiting...)"),
+						RearVehicle ? *RearVehicle->GetName() : TEXT("?")));
+				}
+				return;
+			}
+			// Timeout → force through. Log once.
+			LogEvent(FString::Printf(TEXT("REVERSE FORCED (rear-wait %.1fs timeout, rear=%s)"),
+				RearWaitAccum,
+				RearVehicle ? *RearVehicle->GetName() : TEXT("?")));
+		}
+		else
+		{
+			RearWaitAccum = 0.0f;
+		}
+
 		const float ReverseDelta = StuckReverseSpeed * DeltaTime;
 		StuckReversedSoFar += ReverseDelta;
 
@@ -3382,6 +4011,8 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 
 			UE_LOG(LogTemp, Warning, TEXT("[STUCK] %s: Reverse complete (%.0f cm), cooldown=%.1fs, consecutive=%d"),
 				*Owner->GetName(), CurrentStuckReverseTarget, StuckCooldownDuration, ConsecutiveStuckCount);
+			LogEvent(FString::Printf(TEXT("STUCK reverse COMPLETE (%.0fcm, consec=%d)"),
+				CurrentStuckReverseTarget, ConsecutiveStuckCount));
 
 			// 連續卡住太多次 → 換個目的地
 			// Too many consecutive stucks → switch destination
@@ -3451,31 +4082,154 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 	// Phase 1：偵測卡住 / Detect stuck condition
 	// ================================================================
 	const bool bAmStopped = (CurrentSpeed < 5.0f);
-	const bool bObstacleVeryClose = (ObstacleDistance >= 0.0f
-		&& ObstacleDistance < OverlapDetectionDistance);
+	const float EffectiveStuckDist = FMath::Max(StuckDetectDistance, OverlapDetectionDistance);
+	const bool bObstacleInStuckRange = (ObstacleDistance >= 0.0f
+		&& ObstacleDistance < EffectiveStuckDist);
 
-	if (bAmStopped && bObstacleVeryClose && ObstacleActor.IsValid())
+	// Pre-filter: front must be a VEHICLE. Static/mesh/None blockers don't go
+	// through the stuck chain/mutual logic at all (they get the dedicated
+	// "fall-through reverse" path far below, after StuckRecoveryDelay*3).
+	const EFrontObstacleType FrontTypeEarly = bObstacleInStuckRange
+		? ClassifyFrontObstacle() : EFrontObstacleType::None;
+	const bool bFrontIsVehicle = (FrontTypeEarly == EFrontObstacleType::Vehicle);
+
+	if (bAmStopped && bObstacleInStuckRange && ObstacleActor.IsValid() && bFrontIsVehicle)
 	{
+		const float PrevTimer = StuckTimer;
 		StuckTimer += DeltaTime;
+
+		// STUCK-ACCUM start event (vehicle-only — no static spam)
+		if (PrevTimer < 0.1f && StuckTimer >= 0.1f)
+		{
+			LogEvent(FString::Printf(
+				TEXT("STUCK-ACCUM start: blocked by %s @ %.0fcm"),
+				*ObstacleActor->GetName(), ObstacleDistance));
+		}
+
+		// ============================================================
+		// MUTUAL-STUCK fast-path — fires IMMEDIATELY (no delay wait)
+		// when A.front = B AND B.front = A. This is the only case that
+		// *must* be resolved this update. Chooses reverser by rear-chain
+		// length — shorter side reverses (dragging its whole chain).
+		// ============================================================
+		AActor* FA_Early = ObstacleActor.Get();
+		URoadPathFollowerComponent* FPF_Early = FA_Early
+			? FA_Early->FindComponentByClass<URoadPathFollowerComponent>() : nullptr;
+
+		const bool bFrontAlsoStopped_Early = FPF_Early && (FPF_Early->GetCurrentSpeed() < 5.0f);
+		const bool bMutualPair =
+			FPF_Early
+			&& bFrontAlsoStopped_Early
+			&& FPF_Early->ObstacleActor.IsValid()
+			&& FPF_Early->ObstacleActor.Get() == Owner;
+
+		if (bMutualPair && !bMutualStuckResolved && !FPF_Early->bMutualStuckResolved
+			&& !bIsStuckReversing && !FPF_Early->IsStuckReversing())
+		{
+			// Both sides mark themselves resolved so the resolver only runs once.
+			bMutualStuckResolved = true;
+			FPF_Early->bMutualStuckResolved = true;
+
+			// Rear chain counts on each side
+			TArray<URoadPathFollowerComponent*> MyRear, FrontRear;
+			const int32 MyRearN   = CountStoppedRearChain(MyRear);
+			const int32 FrontRearN = FPF_Early->CountStoppedRearChain(FrontRear);
+
+			// Labels for log
+			const FString MyMan    = GetManeuverLabel();
+			const FString FrontMan = FPF_Early->GetManeuverLabel();
+
+			// Decide reverser: shorter rear wins. Tie → FName for stability.
+			const bool bIReverse = (MyRearN < FrontRearN)
+				|| (MyRearN == FrontRearN
+					&& Owner->GetName().Compare(FA_Early->GetName()) < 0);
+
+			URoadPathFollowerComponent* Reverser = bIReverse ? this : FPF_Early;
+			TArray<URoadPathFollowerComponent*>& ReverserChain = bIReverse ? MyRear : FrontRear;
+			const int32 ReverserRear = bIReverse ? MyRearN : FrontRearN;
+
+			// One giant log with every piece of info you asked for
+			UE_LOG(LogTemp, Warning,
+				TEXT("[STUCK] MUTUAL-STUCK: %s [%s, rearN=%d] <-> %s [%s, rearN=%d] "
+					 "=> %s reverses (shorter rear)"),
+				*Owner->GetName(),    *MyMan,    MyRearN,
+				*FA_Early->GetName(), *FrontMan, FrontRearN,
+				*Reverser->GetOwner()->GetName());
+
+			LogEvent(FString::Printf(
+				TEXT("MUTUAL: me=%s[%s,r=%d] vs %s[%s,r=%d] → %s reverses"),
+				*Owner->GetName(), *MyMan, MyRearN,
+				*FA_Early->GetName(), *FrontMan, FrontRearN,
+				*Reverser->GetOwner()->GetName()));
+
+			// Kick the winner and its whole rear chain.
+			Reverser->TriggerStuckReverse(-1.0f, TEXT("mutual-shorter-rear"));
+			for (URoadPathFollowerComponent* RC : ReverserChain)
+			{
+				if (RC && !RC->IsStuckReversing())
+				{
+					RC->TriggerStuckReverse(-1.0f, TEXT("mutual-rear-cascade"));
+				}
+			}
+			return;
+		}
 
 		if (StuckTimer >= StuckRecoveryDelay)
 		{
-			// 確認前方是車輛還是靜態物 / Check if obstacle is a vehicle or static
-			URoadPathFollowerComponent* FrontPF =
-				ObstacleActor->FindComponentByClass<URoadPathFollowerComponent>();
-
-			if (!FrontPF)
+			// Chain-aware classification:
+			// Only the chain leader decides whether reversing is the right move.
+			// Non-leaders wait (they'll reverse later via the rear-clear cascade
+			// once the leader reverses and the cars behind him do too).
+			auto ThrottledYieldLog = [&](const TCHAR* Reason)
 			{
-				// 靜態障礙物（紅綠燈、路障）→ 等 3× 延遲才觸發
-				// Static obstacle (traffic light, barrier) → wait 3× delay
+				const float NowT = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+				const FString RStr(Reason);
+				if (RStr != LastYieldReason || (NowT - LastYieldLogTime) >= 3.0f)
+				{
+					LastYieldReason = RStr;
+					LastYieldLogTime = NowT;
+					LogEvent(FString::Printf(TEXT("YIELD: %s (front=%s)"),
+						Reason,
+						ObstacleActor.IsValid() ? *ObstacleActor->GetName() : TEXT("?")));
+				}
+			};
+
+			if (!IsChainLeader())
+			{
+				// I'm mid-chain — yield to the leader. Don't drain the timer
+				// completely so I'm still primed once the front clears.
+				ThrottledYieldLog(TEXT("not chain leader"));
+				StuckTimer = FMath::Min(StuckTimer, StuckRecoveryDelay);
+				return;
+			}
+
+			const EFrontObstacleType FrontType = ClassifyFrontObstacle();
+
+			// Traffic signal (red light) → NEVER reverse, just wait it out.
+			if (FrontType == EFrontObstacleType::TrafficSignal)
+			{
+				ThrottledYieldLog(TEXT("traffic signal"));
+				StuckTimer = 0.0f;
+				return;
+			}
+
+			URoadPathFollowerComponent* FrontPF =
+				(FrontType == EFrontObstacleType::Vehicle && ObstacleActor.IsValid())
+				? ObstacleActor->FindComponentByClass<URoadPathFollowerComponent>()
+				: nullptr;
+
+			if (FrontType == EFrontObstacleType::Static || FrontType == EFrontObstacleType::None)
+			{
+				// Static obstacle (wall, barrier) → leader reverses itself to escape.
+				// Extra delay before committing so we don't react to transient hits.
 				if (StuckTimer < StuckRecoveryDelay * 3.0f)
 				{
+					ThrottledYieldLog(TEXT("static obstacle (waiting 3× delay)"));
 					return;
 				}
-				// 超過 3× 延遲 → 觸發倒退+重新導航
-				// Exceeded 3× delay → trigger reverse + re-navigate
+				// Fall through to reverse-trigger.
 			}
-			else
+			else if (FrontPF)
 			{
 				// ========================================================
 				// 前方是車輛 — 四層優先級判斷
@@ -3488,6 +4242,7 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 				// (Critical fix: prevent both cars triggering reverse in same frame)
 				if (FrontPF->IsStuckReversing())
 				{
+					ThrottledYieldLog(TEXT("front car reversing"));
 					StuckTimer = 0.0f;  // 重置讓我不會立刻再累積 / reset so I don't re-accumulate
 					return;
 				}
@@ -3497,6 +4252,7 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 				const bool bFrontAlsoStopped = (FrontPF->GetCurrentSpeed() < 5.0f);
 				if (!bFrontAlsoStopped)
 				{
+					ThrottledYieldLog(TEXT("front moving"));
 					return;
 				}
 
@@ -3504,68 +4260,38 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 				// --- Tier 3: front in cooldown → it just reversed, I yield ---
 				if (FrontPF->StuckCooldownTimer > 0.0f)
 				{
+					ThrottledYieldLog(TEXT("front in cooldown"));
 					StuckTimer = 0.0f;
 					return;
 				}
 
-				// --- Tier 4: 兩車都停且都卡住 → FName 比較決定誰退 ---
-				// --- Tier 4: both stopped and stuck → FName tiebreak ---
-				const bool bFrontIsAlsoStuck = (FrontPF->GetStuckTimer() >= StuckRecoveryDelay * 0.5f);
-
-				if (bFrontIsAlsoStuck)
-				{
-					// 用 FName 比較（穩定、每次都相同）— 字母序較小的讓路
-					// FName comparison (stable, deterministic) — alphabetically smaller yields
-					const FString MyName = Owner->GetName();
-					const FString FrontName = ObstacleActor->GetName();
-					const int32 Cmp = MyName.Compare(FrontName);
-
-					if (Cmp < 0)
-					{
-						// 我的名字排在前面 → 我讓路
-						// My name comes first alphabetically → I yield
-						UE_LOG(LogTemp, Verbose,
-							TEXT("[STUCK] %s yielding to %s (FName tiebreak)"),
-							*MyName, *FrontName);
-						StuckTimer = 0.0f;
-						return;
-					}
-					// Cmp == 0 永不發生（Actor 名字唯一）/ Cmp==0 can't happen (names unique)
-				}
+				// --- Tier 4 removed: mutual-stuck (A↔B) is handled by the
+				// fast-path resolver above (rear-chain length picks reverser).
+				// For longer chains, IsChainLeader already decided I'm the
+				// head; just commit to reversing. No more FName tiebreak
+				// contradiction with the chain-leader walk.
 			}
 
 			// ============================================================
 			// 觸發後退 / Trigger reverse
 			// ============================================================
 
-			// 更新連續卡住計數 / Update consecutive stuck count
-			if (TimeSinceLastStuck < ConsecutiveStuckWindow)
+			// Chain leader committing to reverse (3+ car chains — 2-car mutual
+			// is already handled by the fast-path resolver above). Delegate to
+			// the shared TriggerStuckReverse helper; also attempt to drag our
+			// rear chain along so the whole stuck queue clears together.
+			TArray<URoadPathFollowerComponent*> MyRear;
+			const int32 MyRearN = CountStoppedRearChain(MyRear);
+			const FString ReasonStr = FString::Printf(
+				TEXT("chain-leader [%s] rearN=%d"), *GetManeuverLabel(), MyRearN);
+			TriggerStuckReverse(-1.0f, *ReasonStr);
+			for (URoadPathFollowerComponent* RC : MyRear)
 			{
-				ConsecutiveStuckCount++;
+				if (RC && !RC->IsStuckReversing())
+				{
+					RC->TriggerStuckReverse(-1.0f, TEXT("leader-cascade"));
+				}
 			}
-			else
-			{
-				ConsecutiveStuckCount = 1;  // 重新開始計數 / fresh count
-			}
-			TimeSinceLastStuck = 0.0f;
-
-			// 倒退距離隨連續次數升級（第1次=600, 第2次=900, 第3次=1200...）
-			// Reverse distance escalates with consecutive count
-			CurrentStuckReverseTarget = StuckReverseDistance
-				* (1.0f + (ConsecutiveStuckCount - 1) * 0.5f);
-
-			UE_LOG(LogTemp, Warning,
-				TEXT("[STUCK] %s: Stuck with %s (dist=%.0f, timer=%.1fs, consecutive=#%d) → REVERSING %.0f cm"),
-				*Owner->GetName(),
-				*ObstacleActor->GetName(),
-				ObstacleDistance,
-				StuckTimer,
-				ConsecutiveStuckCount,
-				CurrentStuckReverseTarget);
-
-			bIsStuckReversing = true;
-			StuckReversedSoFar = 0.0f;
-			CurrentSpeed = 0.0f;
 		}
 	}
 	else
@@ -3576,6 +4302,35 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 		{
 			StuckTimer = FMath::Max(StuckTimer - DeltaTime * 2.0f, 0.0f);  // 緩降 / decay
 		}
+		// Car is moving again (or no vehicle front) — clear mutual-stuck flag
+		// so a future A↔B lock can trigger the resolver again.
+		if (CurrentSpeed >= 5.0f)
+		{
+			bMutualStuckResolved = false;
+		}
+	}
+
+	// ================================================================
+	// Static-obstacle silent escape: stopped against a wall/mesh for a
+	// long time → reverse. No Recent-Events spam for this path.
+	// ================================================================
+	if (bAmStopped && bObstacleInStuckRange && ObstacleActor.IsValid()
+		&& FrontTypeEarly == EFrontObstacleType::Static
+		&& !bIsStuckReversing)
+	{
+		StaticStuckTimer += DeltaTime;
+		if (StaticStuckTimer >= StuckRecoveryDelay * 3.0f)
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[STUCK] %s: Static-obstacle escape after %.1fs"),
+				*GetOwner()->GetName(), StaticStuckTimer);
+			TriggerStuckReverse(-1.0f, TEXT("static-escape"));
+			StaticStuckTimer = 0.0f;
+		}
+	}
+	else if (StaticStuckTimer > 0.0f)
+	{
+		StaticStuckTimer = FMath::Max(StaticStuckTimer - DeltaTime * 2.0f, 0.0f);
 	}
 }
 
@@ -3695,6 +4450,20 @@ void URoadPathFollowerComponent::UpdateOvertakeLogic()
 {
 	if (CurrentSegmentIndex >= PathSegments.Num()) return;
 
+	// Never attempt overtake on the final (bound-edge) segment — we must
+	// be lined up on the outer lane to pull into the parking lot.
+	if (bIsFinalEdge)
+	{
+		if (OvertakeState != EOvertakeState::None)
+		{
+			OvertakeState = EOvertakeState::None;
+			OvertakeTargetActor = nullptr;
+			OvertakeReturnConfirmTimer = 0.0f;
+			LogEvent(TEXT("OVERTAKE CANCELLED (final edge)"));
+		}
+		return;
+	}
+
 	const FPathSegmentInternal& Seg = PathSegments[CurrentSegmentIndex];
 	const float DistToJunction = GetDistanceToNextJunction();
 
@@ -3757,6 +4526,8 @@ void URoadPathFollowerComponent::UpdateOvertakeLogic()
 		UE_LOG(LogTemp, Warning,
 			TEXT("PathFollower: OVERTAKE START — Lane %d → %d | FrontSpeed=%.0f MyMax=%.0f"),
 			PreOvertakeLaneIndex, PassingLane, FrontPF->GetCurrentSpeed(), MaxSpeed);
+		LogEvent(FString::Printf(TEXT("OVERTAKE START lane %d→%d (frontSpd=%.0f)"),
+			PreOvertakeLaneIndex, PassingLane, FrontPF->GetCurrentSpeed()));
 		break;
 	}
 
@@ -3834,6 +4605,7 @@ void URoadPathFollowerComponent::UpdateOvertakeLogic()
 				bTargetPast ? TEXT("Y") : TEXT("N"),
 				bOrigLaneClear ? TEXT("Y") : TEXT("N"),
 				bReadyByFallback ? TEXT("Y") : TEXT("N"));
+			LogEvent(FString::Printf(TEXT("OVERTAKE PASSED → return lane=%d"), PreOvertakeLaneIndex));
 		}
 		break;
 	}
@@ -3852,6 +4624,7 @@ void URoadPathFollowerComponent::UpdateOvertakeLogic()
 
 			UE_LOG(LogTemp, Warning,
 				TEXT("PathFollower: OVERTAKE COMPLETE — back in Lane %d"), CurrentLaneIndex);
+			LogEvent(FString::Printf(TEXT("OVERTAKE COMPLETE lane=%d"), CurrentLaneIndex));
 		}
 		break;
 	}

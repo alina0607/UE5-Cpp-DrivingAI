@@ -97,6 +97,16 @@ enum class EOvertakeState : uint8
 	Returning  UMETA(DisplayName = "Returning"),   // Returning to original lane
 };
 
+/// 前方障礙物分類 / Classification of what's blocking us in front
+UENUM(BlueprintType)
+enum class EFrontObstacleType : uint8
+{
+	None          UMETA(DisplayName = "None"),           // No obstacle
+	Vehicle       UMETA(DisplayName = "Vehicle"),         // Another PathFollower car
+	TrafficSignal UMETA(DisplayName = "Traffic Signal"),  // Red-light collider (tagged)
+	Static        UMETA(DisplayName = "Static"),          // Wall / barrier / unknown
+};
+
 /// <summary>
 /// Destination type
 /// </summary>
@@ -369,6 +379,12 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "10"))
 	float OverlapDetectionDistance = 150.0f;
 
+	/// Looser distance for "stopped behind someone" stuck detection (cm).
+	/// A car stopped with any obstacle within this range for StuckRecoveryDelay
+	/// seconds counts as stuck. Must be >= OverlapDetectionDistance.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "50"))
+	float StuckDetectDistance = 600.0f;
+
 	/// How long vehicles must be stuck (speed≈0, obstacle ahead) before triggering recovery (seconds)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "0.5"))
 	float StuckRecoveryDelay = 1.5f;
@@ -399,6 +415,28 @@ public:
 	/// 連續卡住幾次後就換個隨機目的地
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "2"))
 	int32 MaxConsecutiveStucksBeforeSwitch = 3;
+
+	/// Backward check distance before each reverse step (cm) — if a vehicle is within
+	/// this distance behind us, the reverse step is skipped this frame (cascade gate).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "100"))
+	float RearClearDistance = 400.0f;
+
+	/// Sphere radius for backward vehicle trace
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "20"))
+	float RearTraceRadius = 80.0f;
+
+	/// Max chain length to walk forward before giving up (loop / cycle guard)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "2"))
+	int32 MaxChainWalkDepth = 10;
+
+	/// Max seconds to wait for rear to clear before reversing anyway (safety valve
+	/// against two queues stuck bumper-to-bumper). Set high enough that normal
+	/// tail-first cascade usually wins; low enough to break full gridlock.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "1.0"))
+	float RearWaitMaxSec = 4.0f;
+
+	/// Name of the actor tag ColliderSwitcher stamps on red-light blockers
+	static constexpr const TCHAR* TrafficSignalTagName = TEXT("TrafficSignal");
 
 	// ================================================================
 	//  Sequential Departure (源停車場出場順序)
@@ -435,6 +473,45 @@ public:
 	/// Safety check distance for passing lane (cm)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Overtaking", meta = (ClampMin = "500"))
 	float OvertakeLateralCheckDistance = 2000.0f;
+
+	// ================================================================
+	//  Maneuver Caution (U-turn / L-turn / R-turn / parking exit)
+	//  During these maneuvers, vehicle detection uses a wider / longer
+	//  sweep than normal. Traffic-signal colliders are NOT affected —
+	//  their normal trace size is preserved to avoid hitting signal
+	//  signs on the oncoming side.
+	// ================================================================
+
+	/// Extra radius multiplier for vehicle-only trace during maneuvers
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Maneuver", meta = (ClampMin = "1.0", ClampMax = "3.0"))
+	float ManeuverVehicleTraceRadiusMult = 1.5f;
+
+	/// Extra distance multiplier for vehicle-only trace during maneuvers
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Maneuver", meta = (ClampMin = "1.0", ClampMax = "3.0"))
+	float ManeuverVehicleTraceDistanceMult = 1.3f;
+
+	/// Spline distance behind parking-lot merge point to scan for oncoming cars (cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Maneuver", meta = (ClampMin = "100"))
+	float DepartureLaneCheckDistance = 1000.0f;
+
+	/// Sphere radius used for the departure lane rear scan (cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Maneuver", meta = (ClampMin = "20"))
+	float DepartureLaneTraceRadius = 100.0f;
+
+	/// Before starting a LEFT-turn junction curve, sphere-trace this far along
+	/// the oncoming lane of NextSeg looking for straight-through traffic.
+	/// 0 disables the check.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Maneuver", meta = (ClampMin = "0"))
+	float LeftTurnOncomingScanDistance = 1500.0f;
+
+	/// Sphere radius for the left-turn oncoming scan (cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Maneuver", meta = (ClampMin = "20"))
+	float LeftTurnOncomingScanRadius = 150.0f;
+
+	/// Max seconds to yield to oncoming traffic before forcing commit
+	/// (prevents forever-wait when both sides are stopped)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Maneuver", meta = (ClampMin = "0"))
+	float LeftTurnYieldMaxSec = 5.0f;
 
 	// ---- Lane Offset Adjustments ----
 
@@ -745,6 +822,25 @@ private:
 	/// SphereTrace forward obstacle detection (unified: vehicles, red light blockers, any obstacle)
 	void UpdateObstacleDetection();
 
+	/// True when the car is in a maneuver state (junction curve, parking curve,
+	/// departure curve). Vehicle-only obstacle detection widens in these cases.
+	bool IsPerformingManeuver() const;
+
+	/// Sphere-trace along the source lot's bound edge spline (backward from the
+	/// merge point by DepartureLaneCheckDistance) for vehicles. Returns true if
+	/// no PathFollower-bearing actor is within the scan window.
+	bool IsDepartureLaneClear() const;
+
+	/// Before committing to a LEFT-turn junction curve, scan the oncoming lane
+	/// of NextSeg for straight-through traffic. Returns true if clear (safe to turn).
+	/// @param NextSeg next path segment (the one we're turning INTO)
+	/// @param OutBlockingActor receives the blocking vehicle (nullptr if clear)
+	/// @param OutDistance receives distance to the blocker (>=0 if found)
+	bool IsLeftTurnOncomingClear(
+		const struct FPathSegmentInternal& NextSeg,
+		AActor*& OutBlockingActor,
+		float& OutDistance) const;
+
 	/// Compute speed limit from obstacle distance
 	float ComputeObstacleSpeedLimit() const;
 
@@ -771,8 +867,61 @@ private:
 	/// Time since last stuck recovery triggered (for consecutive-count window)
 	float TimeSinceLastStuck = 999.0f;
 
+	/// Accumulated wait-for-rear-clear time during Phase 2 reversing
+	float RearWaitAccum = 0.0f;
+
+	/// Last-logged yield reason (to avoid spamming the event ring buffer)
+	FString LastYieldReason;
+	float LastYieldLogTime = -999.0f;
+
+	/// Accumulated time yielding to oncoming traffic at a left-turn junction;
+	/// forces commit once it exceeds LeftTurnYieldMaxSec so two head-on stopped
+	/// queues can't deadlock each other forever.
+	float LeftTurnYieldAccum = 0.0f;
+
 	/// Update stuck/overlap recovery logic (called in Tick)
 	void UpdateStuckRecovery(float DeltaTime);
+
+	/// Classify what's blocking us in front (uses ObstacleActor + tags)
+	EFrontObstacleType ClassifyFrontObstacle() const;
+
+	/// Sphere-trace directly behind the car looking for another vehicle.
+	/// @param OutRearVehicle receives the found vehicle (nullptr if clear)
+	/// @return true if no vehicle within RearClearDistance (safe to reverse)
+	bool IsRearClearOfVehicles(AActor*& OutRearVehicle) const;
+
+	/// Walk forward along (ObstacleActor→PF) links until the chain terminates
+	/// (no front, front is not stuck, or depth exceeded). Fills OutChain from
+	/// tail (me) to head (leader). Returns true if the walk terminated cleanly.
+	bool BuildStuckChainForward(TArray<URoadPathFollowerComponent*>& OutChain) const;
+
+	/// Am I at the head of the stuck chain? i.e. my front obstacle is not a
+	/// vehicle, OR the front vehicle is not itself stuck-stopped.
+	bool IsChainLeader() const;
+
+	/// Short label for the current maneuver — "STRAIGHT", "LEFT", "RIGHT",
+	/// "U-TURN", "DEPART", "PARKING", or "APPROACH-L/R" (pre-curve).
+	FString GetManeuverLabel() const;
+
+	/// Walk BACKWARDS: find every stopped PathFollower whose ObstacleActor
+	/// (transitively) points at me. OutChain is filled newest-to-oldest but
+	/// order doesn't matter for triggering. Returns count.
+	int32 CountStoppedRearChain(TArray<URoadPathFollowerComponent*>& OutChain) const;
+
+	/// Trigger a reverse on this car — same bookkeeping as Phase 1 normally does.
+	/// Called by the mutual-stuck resolver to cascade reverse down a chain.
+	void TriggerStuckReverse(float OverrideReverseDistance = -1.0f, const TCHAR* Reason = TEXT(""));
+
+	/// Mutual-stuck resolver one-shot flag. Cleared when we move again.
+	bool bMutualStuckResolved = false;
+
+	/// Second throttle for mutual-stuck logging
+	float LastMutualStuckLogTime = -999.0f;
+
+	/// Separate stuck timer for static-obstacle (wall/mesh) escape path.
+	/// Kept out of the main StuckTimer so its long 3× delay doesn't
+	/// interfere with vehicle-vs-vehicle logic.
+	float StaticStuckTimer = 0.0f;
 
 	/// Pick a new random parking lot destination (different from current) — called on repeated stuck
 	void SwitchToNewRandomDestination();
@@ -846,6 +995,33 @@ private:
 
 	/// Overtake logic update (called in Tick)
 	void UpdateOvertakeLogic();
+
+public:
+	/// Max recent events retained per vehicle (ring buffer size)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Debug", meta = (ClampMin = "4", ClampMax = "60"))
+	int32 MaxRecentEvents = 24;
+
+	/// True once the car enters the last (bound-edge) segment — overtake disabled,
+	/// forced lane change to outermost lane for smooth pull-over.
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path")
+	bool IsOnFinalEdge() const { return bIsFinalEdge; }
+
+	/// Read-only access to the recent-events ring buffer (for map debug panel).
+	/// Each entry is a pre-formatted "[t=123.4s] event description" string.
+	const TArray<FString>& GetRecentEvents() const { return RecentEvents; }
+
+private:
+	/// True once we've entered the last segment of the path (bound edge).
+	bool bIsFinalEdge = false;
+
+	/// Called right after CurrentSegmentIndex is advanced — handles final-edge prep.
+	void HandleEnteredNewSegment();
+
+	/// Push a tagged event into the ring buffer (also UE_LOGs with [TRACE] prefix).
+	void LogEvent(const FString& EventText);
+
+	/// Debug ring buffer of recent navigation / stuck events (pre-formatted strings).
+	TArray<FString> RecentEvents;
 
 	/// Check if passing lane is clear (SphereTrace in target lane direction)
 	bool IsPassingLaneClear(int32 PassingLaneIndex) const;

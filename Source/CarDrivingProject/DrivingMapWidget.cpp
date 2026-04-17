@@ -14,6 +14,7 @@
 #include "Blueprint/WidgetBlueprintLibrary.h"
 #include "Components/SplineComponent.h"
 #include "Rendering/DrawElements.h"
+#include "DrawDebugHelpers.h"
 
 // ================================================================
 //  生命週期 / Lifecycle
@@ -95,6 +96,77 @@ void UDrivingMapWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTim
 					BoomRot.Yaw += DeltaX * OrbitSensitivity;
 					BoomRot.Pitch = FMath::Clamp(BoomRot.Pitch + DeltaY * OrbitSensitivity, -80.0f, -5.0f);
 					Boom->SetRelativeRotation(BoomRot);
+				}
+			}
+		}
+	}
+
+	// ================================================================
+	//  In-viewport vehicle arrows + click-to-select (minimap mode only)
+	//  Draws a 3D arrow above every vehicle and lets the user click any
+	//  vehicle to lock camera + show info panel — WITHOUT opening the
+	//  fullscreen map.
+	// ================================================================
+#if ENABLE_DRAW_DEBUG
+	if (!bIsFullscreen)
+	{
+		UWorld* World = GetWorld();
+		if (World)
+		{
+			for (const FMapVehicleCache& V : CachedVehicles)
+			{
+				AActor* A = V.Actor.Get();
+				if (!A) continue;
+
+				const bool bSel = (SelectedVehiclePtr.Get() == A);
+				const FColor ArrowColor = bSel
+					? FColor(255, 220, 0)       // yellow for selected
+					: FColor(40, 255, 90);      // green for unselected
+
+				const FVector Base = V.WorldLocation + FVector(0, 0, 380.0f);
+				const FVector Tip  = Base + V.ForwardVector * 250.0f;
+
+				DrawDebugDirectionalArrow(
+					World, Base, Tip,
+					120.0f,                     // arrow-head size
+					ArrowColor,
+					false,                      // bPersistent
+					-1.0f,                      // lifetime (single frame)
+					0,                          // depth priority
+					bSel ? 6.0f : 4.0f);        // thickness
+			}
+		}
+	}
+#endif
+
+	// Click-to-select without opening the big map.
+	// The widget is HitTestInvisible in minimap mode, so we poll the PC directly.
+	if (!bIsFullscreen)
+	{
+		if (APlayerController* PC = GetOwningPlayer())
+		{
+			if (PC->WasInputKeyJustPressed(EKeys::LeftMouseButton))
+			{
+				FHitResult ClickHit;
+				if (PC->GetHitResultUnderCursor(ECC_Visibility, true, ClickHit))
+				{
+					if (AActor* HitActor = ClickHit.GetActor())
+					{
+						// Walk up to find an actor that carries a PathFollower
+						AActor* VehicleActor = HitActor;
+						while (VehicleActor && !VehicleActor->FindComponentByClass<URoadPathFollowerComponent>())
+						{
+							VehicleActor = VehicleActor->GetOwner();
+						}
+						if (VehicleActor)
+						{
+							UE_LOG(LogTemp, Warning,
+								TEXT("[VIEWPORT-CLICK] Selected vehicle %s"),
+								*VehicleActor->GetName());
+							SelectVehicle(VehicleActor);
+							// NOTE: do NOT ToggleMapSize here — stay in minimap mode
+						}
+					}
 				}
 			}
 		}
@@ -311,7 +383,9 @@ int32 UDrivingMapWidget::NativePaint(
 	}
 
 	//      Right info panel — far right, semi-transparent bg, scaled font
-	if (bIsFullscreen && SelectedVehiclePtr.IsValid())
+	//  Show whenever a vehicle is selected (fullscreen OR minimap mode), so
+	//  picking a car in the viewport immediately reveals its detail panel.
+	if (SelectedVehiclePtr.IsValid())
 	{
 		URoadPathFollowerComponent* PF =
 			SelectedVehiclePtr->FindComponentByClass<URoadPathFollowerComponent>();
@@ -451,6 +525,30 @@ int32 UDrivingMapWidget::NativePaint(
 					{
 						DrawPanelLine(FString::Printf(TEXT("  Spot: #%d"), SpotIdx), DestColor);
 					}
+				}
+			}
+
+			// ---- Recent events (stuck / overtake / depart / segment) ----
+			TextY += LineH * 0.8f;
+			DrawPanelLine(TEXT("--- Recent Events ---"), TitleColor);
+			TextY += LineH * 0.2f;
+			{
+				const TArray<FString>& Events = PF->GetRecentEvents();
+				// Smaller font for log entries so more history fits.
+				FSlateFontInfo LogFont = FAppStyle::GetFontStyle("NormalFont");
+				LogFont.Size = FMath::Max(8, static_cast<int32>(8.0f * InfoPanelFontScale));
+				const float LogLineH = 16.0f * InfoPanelFontScale;
+				const FLinearColor LogColor(0.85f, 0.9f, 1.0f, 0.95f);
+				// Draw newest first — iterate backwards.
+				for (int32 i = Events.Num() - 1; i >= 0; --i)
+				{
+					FSlateDrawElement::MakeText(OutDrawElements, LayerId + 2,
+						AllottedGeometry.ToPaintGeometry(
+							FVector2f(PanelWidth - 30.0f, LogLineH),
+							FSlateLayoutTransform(FVector2f(TextX, TextY))),
+						Events[i], LogFont, ESlateDrawEffect::None, LogColor);
+					TextY += LogLineH;
+					if (TextY > PanelTopY + PanelHeight - LogLineH) break;
 				}
 			}
 
