@@ -7,6 +7,7 @@
 #include "Components/SplineComponent.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "TimerManager.h"
 
 // ============================================================================
 //  ComputeLaneOffsetCm — 靜態工具函式（跟之前一樣，不變）
@@ -91,6 +92,15 @@ void URoadPathFollowerComponent::ResetFollowingState()
 	ObstacleActor = nullptr;
 	OvertakeState = EOvertakeState::None;
 	OvertakePassedDistAccum = 0.0f;
+	OvertakeTargetActor = nullptr;
+	OvertakeReturnConfirmTimer = 0.0f;
+	StuckTimer = 0.0f;
+	bIsStuckReversing = false;
+	StuckReversedSoFar = 0.0f;
+	CurrentStuckReverseTarget = StuckReverseDistance;
+	StuckCooldownTimer = 0.0f;
+	ConsecutiveStuckCount = 0;
+	TimeSinceLastStuck = 999.0f;
 
 	// 注意：停車格的釋放與目的地清除不在這裡做。
 	// ResetFollowingState 會在 NavigateTo* 設定完 Target* 之後（OccupySpot 之後）才呼叫，
@@ -661,6 +671,228 @@ void URoadPathFollowerComponent::StartFollowing()
 	AParkingLotActor* Lot = Lots[Pick];
 	UE_LOG(LogTemp, Warning, TEXT("[PARK-NAV] [START] Auto-navigate to ParkingLot '%s'"), *Lot->ParkingLotName);
 	NavigateToParkingLot(Lot);
+}
+
+// ============================================================================
+//  SwitchToNewRandomDestination — 卡住太多次時改換目的地逃離死鎖
+//  Called when a car is stuck repeatedly; picks a different parking lot
+//  (excluding the current one) so the A* path diverges from the congested zone.
+// ============================================================================
+void URoadPathFollowerComponent::SwitchToNewRandomDestination()
+{
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	AActor* Owner = GetOwner();
+	const FString OwnerName = Owner ? Owner->GetName() : TEXT("?");
+
+	AParkingLotActor* CurrentLot = TargetParkingLot.Get();
+
+	// 蒐集所有有空位、且不等於目前目的地的停車場
+	// Collect all parking lots with free spots, excluding the current target
+	TArray<AParkingLotActor*> Candidates;
+	for (TActorIterator<AParkingLotActor> It(World); It; ++It)
+	{
+		AParkingLotActor* Lot = *It;
+		if (!Lot) continue;
+		if (Lot == CurrentLot) continue;
+		if (Lot->FindAvailableSpot() == INDEX_NONE) continue;
+		Candidates.Add(Lot);
+	}
+
+	if (Candidates.Num() == 0)
+	{
+		// 連一個替代停車場都沒有 → 保底回到原目的地重新導航
+		// No alternative available → fall back to re-navigating to the same dest.
+		UE_LOG(LogTemp, Warning,
+			TEXT("[STUCK-SWITCH] %s: No alternative parking lot found — falling back to current dest"),
+			*OwnerName);
+		if (DestinationNodeId != INDEX_NONE)
+		{
+			NavigateToNode(DestinationNodeId);
+		}
+		return;
+	}
+
+	const int32 Pick = FMath::RandRange(0, Candidates.Num() - 1);
+	AParkingLotActor* NewLot = Candidates[Pick];
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("[STUCK-SWITCH] %s: Switching destination from '%s' → '%s' (%d candidates)"),
+		*OwnerName,
+		CurrentLot ? *CurrentLot->ParkingLotName : TEXT("<none>"),
+		*NewLot->ParkingLotName,
+		Candidates.Num());
+
+	// 釋放目前停車格（如果有預約）/ Release currently reserved spot if any
+	if (CurrentLot && TargetParkingSpotIndex != INDEX_NONE)
+	{
+		CurrentLot->ReleaseSpot(TargetParkingSpotIndex);
+		TargetParkingSpotIndex = INDEX_NONE;
+	}
+
+	NavigateToParkingLot(NewLot);
+}
+
+// ============================================================================
+//  SetDepartureContext — 標記這台車原本停在哪個停車場的哪一格
+//  Must be called at spawn BEFORE the first NavigateTo*.
+// ============================================================================
+void URoadPathFollowerComponent::SetDepartureContext(AParkingLotActor* SourceLot, int32 SpotIdx)
+{
+	AActor* Owner = GetOwner();
+	if (!Owner) return;
+
+	SourceParkingLot = SourceLot;
+	SourceSpotIndex = SpotIdx;
+	SourceSpawnLocation = Owner->GetActorLocation();
+	bHasDepartedFromSource = false;
+	DepartureWaitAccum = 0.0f;
+
+	// Also mark the source lot's bookkeeping so other cars see this spot occupied
+	if (SourceLot && SpotIdx != INDEX_NONE)
+	{
+		SourceLot->OccupySpot(SpotIdx, Owner);
+		UE_LOG(LogTemp, Warning,
+			TEXT("[DEPART-CTX] %s: Source='%s' Spot=%d"),
+			*Owner->GetName(), *SourceLot->ParkingLotName, SpotIdx);
+	}
+}
+
+// ============================================================================
+//  IsSourceLotReadyForDeparture — 檢查鏈上所有較低 index 的 spot 是否都已清空
+//  All spots with index < SourceSpotIndex must be either empty (occupant drove
+//  off) or occupied by a car that itself has already departed from its spot.
+// ============================================================================
+bool URoadPathFollowerComponent::IsSourceLotReadyForDeparture() const
+{
+	// 無來源脈絡 → 無須等待
+	if (!SourceParkingLot.IsValid() || SourceSpotIndex == INDEX_NONE) return true;
+	if (SourceSpotIndex == 0) return true;  // 第一台本來就可以走
+
+	AParkingLotActor* Lot = SourceParkingLot.Get();
+	for (int32 i = 0; i < SourceSpotIndex; ++i)
+	{
+		AActor* Occupant = Lot->GetSpotOccupant(i);
+		if (!Occupant) continue;  // 這個 spot 已經釋放 → 算清空
+
+		// Occupant 是另一台車：看它是否已離開原位
+		URoadPathFollowerComponent* OtherPF =
+			Occupant->FindComponentByClass<URoadPathFollowerComponent>();
+		if (OtherPF && OtherPF->HasDepartedFromSource()) continue;
+
+		// 還沒走 → 這台車要等
+		return false;
+	}
+	return true;
+}
+
+// ============================================================================
+//  RequestDepartToParkingLot — 帶順序控管的出場導航
+//  如果來源停車場前面還有車沒走 → 每 DepartureCheckInterval 秒輪詢一次；
+//  否則直接呼叫 NavigateToParkingLot。
+// ============================================================================
+void URoadPathFollowerComponent::RequestDepartToParkingLot(AParkingLotActor* DestLot, int32 DestSpotIdx)
+{
+	AActor* Owner = GetOwner();
+	if (!Owner) return;
+
+	// 無源脈絡：直接導航，不做 gating
+	if (!SourceParkingLot.IsValid() || SourceSpotIndex == INDEX_NONE)
+	{
+		NavigateToParkingLot(DestLot, DestSpotIdx);
+		return;
+	}
+
+	// 記住目的地，開始 poll
+	PendingDestLot = DestLot;
+	PendingDestSpotIndex = DestSpotIdx;
+	DepartureWaitAccum = 0.0f;
+
+	// 先立刻檢查一次；沒過再排 timer
+	TryDepartPoll();
+}
+
+// ============================================================================
+//  TryDepartPoll — 輪詢檢查是否輪到我出場
+// ============================================================================
+void URoadPathFollowerComponent::TryDepartPoll()
+{
+	UWorld* World = GetWorld();
+	AActor* Owner = GetOwner();
+	if (!World || !Owner) return;
+
+	// 目的地可能在等待期間消失（被拆掉等）→ 放棄
+	if (!PendingDestLot.IsValid())
+	{
+		World->GetTimerManager().ClearTimer(DepartureCheckTimerHandle);
+		return;
+	}
+
+	const bool bReady = IsSourceLotReadyForDeparture();
+	const bool bTimedOut = (DepartureWaitAccum >= DepartureMaxWaitTime);
+
+	if (bReady || bTimedOut)
+	{
+		World->GetTimerManager().ClearTimer(DepartureCheckTimerHandle);
+
+		UE_LOG(LogTemp, Warning,
+			TEXT("[DEPART] %s: GO (reason=%s, waited=%.1fs, spot=%d)"),
+			*Owner->GetName(),
+			bReady ? TEXT("ready") : TEXT("timeout"),
+			DepartureWaitAccum,
+			SourceSpotIndex);
+
+		AParkingLotActor* Dest = PendingDestLot.Get();
+		const int32 DestSpot = PendingDestSpotIndex;
+		PendingDestLot = nullptr;
+		PendingDestSpotIndex = INDEX_NONE;
+
+		NavigateToParkingLot(Dest, DestSpot);
+		return;
+	}
+
+	// 還沒輪到 → 排下一次 poll
+	DepartureWaitAccum += DepartureCheckInterval;
+
+	World->GetTimerManager().SetTimer(
+		DepartureCheckTimerHandle,
+		FTimerDelegate::CreateUObject(this, &URoadPathFollowerComponent::TryDepartPoll),
+		DepartureCheckInterval,
+		false);
+}
+
+// ============================================================================
+//  UpdateDepartureProgress — 每 tick 檢查是否已離開原 spot 夠遠
+//  Called once per tick while bHasDepartedFromSource is false.
+// ============================================================================
+void URoadPathFollowerComponent::UpdateDepartureProgress()
+{
+	if (bHasDepartedFromSource) return;
+	if (SourceSpotIndex == INDEX_NONE) return;
+
+	AActor* Owner = GetOwner();
+	if (!Owner) return;
+
+	const float DistSq = FVector::DistSquared2D(Owner->GetActorLocation(), SourceSpawnLocation);
+	const float ThreshSq = DepartureClearDistance * DepartureClearDistance;
+	if (DistSq < ThreshSq) return;
+
+	// 離原 spot 夠遠 → 標記已離場並釋放 spot
+	bHasDepartedFromSource = true;
+
+	AParkingLotActor* Lot = SourceParkingLot.Get();
+	if (Lot && SourceSpotIndex != INDEX_NONE)
+	{
+		// 只在仍然是自己佔著時釋放（以免誤放別人）
+		if (Lot->GetSpotOccupant(SourceSpotIndex) == Owner)
+		{
+			Lot->ReleaseSpot(SourceSpotIndex);
+			UE_LOG(LogTemp, Warning,
+				TEXT("[DEPART] %s: Cleared source spot %d at '%s'"),
+				*Owner->GetName(), SourceSpotIndex, *Lot->ParkingLotName);
+		}
+	}
 }
 
 // ============================================================================
@@ -1633,7 +1865,10 @@ void URoadPathFollowerComponent::SampleSplineAtDist(
 	const FPathSegmentInternal& Seg, float Dist, float LateralOffset,
 	FVector& OutPosition, FVector& OutTravelDir, FVector& OutTravelRight) const
 {
-	if (!Seg.Spline)
+	// IsValid catches both null AND pending-kill/stale UObject pointers — the latter
+	// can happen if a road actor gets destroyed while a PathFollower still references
+	// its spline. A raw `!Seg.Spline` check passes stale-but-non-null through.
+	if (!IsValid(Seg.Spline))
 	{
 		OutPosition = FVector::ZeroVector;
 		OutTravelDir = FVector::ForwardVector;
@@ -1811,7 +2046,16 @@ float URoadPathFollowerComponent::GetDistanceToNextJunction() const
 // ============================================================================
 float URoadPathFollowerComponent::ComputeDesiredSpeed() const
 {
-	float Desired = MaxSpeed;
+	// 超車期間提速：Passing 時全力加速超越慢車；Returning 時先維持再讓 lane change 結束
+	// Boost speed during overtake so the pass actually completes
+	float EffectiveMaxSpeed = MaxSpeed;
+	if (OvertakeState == EOvertakeState::Passing
+		|| OvertakeState == EOvertakeState::Returning)
+	{
+		EffectiveMaxSpeed = MaxSpeed * OvertakeSpeedBoost;
+	}
+
+	float Desired = EffectiveMaxSpeed;
 
 	// ---- 彎道減速（spline 曲率）/ Curve speed reduction ----
 	const float Curvature = GetCurrentCurvature();
@@ -1928,6 +2172,51 @@ int32 URoadPathFollowerComponent::GetTargetSpotIndex() const
 	return INDEX_NONE;
 }
 
+FString URoadPathFollowerComponent::GetObstacleActorName() const
+{
+	if (ObstacleActor.IsValid())
+	{
+		return ObstacleActor->GetName();
+	}
+	return FString();
+}
+
+FString URoadPathFollowerComponent::GetObstacleTypeString() const
+{
+	if (!ObstacleActor.IsValid())
+	{
+		return TEXT("None");
+	}
+
+	// 有 PathFollowerComponent → 車輛 / Has PathFollowerComponent → Vehicle
+	if (ObstacleActor->FindComponentByClass<URoadPathFollowerComponent>())
+	{
+		return TEXT("Vehicle");
+	}
+
+	// 檢查是否為交通控制物（紅綠燈阻擋器等）
+	// Check if it's a traffic control object (red light blocker, etc.)
+	const FString ClassName = ObstacleActor->GetClass()->GetName();
+	if (ClassName.Contains(TEXT("Traffic")) || ClassName.Contains(TEXT("Light"))
+		|| ClassName.Contains(TEXT("Signal")) || ClassName.Contains(TEXT("Blocker")))
+	{
+		return TEXT("Traffic");
+	}
+
+	return TEXT("Static");
+}
+
+FVector URoadPathFollowerComponent::GetDestinationDisplayLocation() const
+{
+	// 停車場目的地 → 回傳停車場本身的位置（不是路上的投影點）
+	// Parking lot destination → return parking lot actor location (not road projection)
+	if (DestinationType == EDestinationType::ParkingLot && TargetParkingLot.IsValid())
+	{
+		return TargetParkingLot->GetActorLocation();
+	}
+	return DestinationWorldLocation;
+}
+
 void URoadPathFollowerComponent::GetRouteWorldPoints(TArray<FVector>& OutPoints, int32 SamplesPerSegment) const
 {
 	OutPoints.Empty();
@@ -1986,6 +2275,10 @@ void URoadPathFollowerComponent::TickComponent(
 
 	AActor* Owner = GetOwner();
 	if (!Owner) return;
+
+	// 更新「已離開原 spot」狀態 — 釋放 spot，讓後面的車可以出場
+	// Update departure progress so subsequent spot cars see this one as cleared
+	UpdateDepartureProgress();
 
 	FPathSegmentInternal& Seg = PathSegments[CurrentSegmentIndex];
 	if (!Seg.Spline)
@@ -2116,28 +2409,51 @@ void URoadPathFollowerComponent::TickComponent(
 	UpdateObstacleDetection();
 
 	// ================================================================
-	//      Overtaking logic (slow car → pass → return)
+	//      Stuck recovery — detect overlapping/stuck vehicles and unstick
 	// ================================================================
-	UpdateOvertakeLogic();
+	UpdateStuckRecovery(DeltaTime);
 
-	// ================================================================
-	//     Speed control: accelerate toward desired or brake
-	// ================================================================
-	const float DesiredSpeed = ComputeDesiredSpeed();
-
-	if (CurrentSpeed < DesiredSpeed)
+	// If actively reversing to unstick, skip normal speed control / overtaking
+	if (!bIsStuckReversing)
 	{
-		// Accelerate using Acceleration param, capped at DesiredSpeed
-		CurrentSpeed = FMath::Min(CurrentSpeed + Acceleration * DeltaTime, DesiredSpeed);
-	}
-	else
-	{
-		// Brake with BrakeDeceleration, floored at DesiredSpeed
-		CurrentSpeed = FMath::Max(CurrentSpeed - BrakeDeceleration * DeltaTime, DesiredSpeed);
-	}
+		// ================================================================
+		//      Overtaking logic (slow car → pass → return)
+		// ================================================================
+		UpdateOvertakeLogic();
 
-	// Ensure non-negative
-	CurrentSpeed = FMath::Max(CurrentSpeed, 0.0f);
+		// ================================================================
+		//     Speed control: accelerate toward desired or brake
+		// ================================================================
+		const float DesiredSpeed = ComputeDesiredSpeed();
+
+		if (CurrentSpeed < DesiredSpeed)
+		{
+			// Accelerate using Acceleration param, capped at DesiredSpeed
+			CurrentSpeed = FMath::Min(CurrentSpeed + Acceleration * DeltaTime, DesiredSpeed);
+		}
+		else
+		{
+			// 判斷是否在緊急煞車區 — 距離過近時用更強的煞車力
+			// Emergency brake zone — apply stronger braking when too close
+			const float EmergencyZoneDist = ObstacleSlowdownDistance * EmergencyBrakeZoneFraction;
+			const bool bEmergencyBrake = (ObstacleDistance >= 0.0f && ObstacleDistance < EmergencyZoneDist);
+			const float EffectiveBrakeDecel = bEmergencyBrake
+				? BrakeDeceleration * EmergencyBrakeMultiplier
+				: BrakeDeceleration;
+
+			CurrentSpeed = FMath::Max(CurrentSpeed - EffectiveBrakeDecel * DeltaTime, DesiredSpeed);
+		}
+
+		// 如果障礙物在 StopDistance 內 → 直接歸零，不等減速
+		// If obstacle within StopDistance → immediate zero, don't wait for decel
+		if (ObstacleDistance >= 0.0f && ObstacleDistance <= ObstacleStopDistance)
+		{
+			CurrentSpeed = 0.0f;
+		}
+
+		// Ensure non-negative
+		CurrentSpeed = FMath::Max(CurrentSpeed, 0.0f);
+	} // end if (!bIsOverlapReversing)
 
 	// ================================================================
 	//      Departure curve: smoothly merge from parking spot onto road
@@ -2407,7 +2723,22 @@ void URoadPathFollowerComponent::TickComponent(
 			? (ReferenceDistance - CurSeg.EndDist)
 			: (CurSeg.EndDist - ReferenceDistance);
 
+		// ----------------------------------------------------------------
+		// 位置連續性重投影（Step A：在切段 **前** 取舊段末端世界位置）
+		// Position-continuity reprojection — PART 1: sample OLD seg's end
+		// BEFORE we overwrite CurSeg's underlying slot via `Seg = ...`.
+		//
+		// 註：Seg 是 C++ reference，`Seg = PathSegments[new_idx]` 會把 new
+		// 資料 copy-assign 進舊 slot，導致 CurSeg 後續讀到的是新資料 — 先在
+		// 這裡把需要的舊資料抓下來存成 local，避免事後誤讀。
+		// ----------------------------------------------------------------
+		FVector OldEndPosSaved, OldEndDirSaved, OldEndRightSaved;
+		SampleSplineAtDist(CurSeg, CurSeg.EndDist, CurrentLateralOffset,
+			OldEndPosSaved, OldEndDirSaved, OldEndRightSaved);
+
 		CurrentSegmentIndex++;
+		// Re-read new segment data into Seg via operator= (Seg is a C++ reference
+		// to the original slot; this copies new fields into that slot).
 		Seg = PathSegments[CurrentSegmentIndex];
 		ReferenceDistance = Seg.StartDist + Overshoot * Seg.Direction;
 
@@ -2416,6 +2747,38 @@ void URoadPathFollowerComponent::TickComponent(
 		CurrentLaneIndex = TargetLaneIndex;
 		CurrentTurnSignal = ETurnSignal::None;
 
+		// ----------------------------------------------------------------
+		// 位置連續性重投影（Step B：用新段 right 向量把 OffsetCorrection 算出）
+		// Part 2: on the NEW segment, compute how much lateral offset we need
+		// to add so world position stays continuous. Uses PathSegments[CurrentSegmentIndex]
+		// directly (not the potentially-confusing Seg reference) to be explicit.
+		// ----------------------------------------------------------------
+		if (PathSegments.IsValidIndex(CurrentSegmentIndex)
+			&& PathSegments[CurrentSegmentIndex].Spline)
+		{
+			const FPathSegmentInternal& NewSegRef = PathSegments[CurrentSegmentIndex];
+
+			FVector NewSamplePos, NewSampleDir, NewSampleRight;
+			SampleSplineAtDist(NewSegRef, ReferenceDistance, CurrentLateralOffset,
+				NewSamplePos, NewSampleDir, NewSampleRight);
+
+			FVector Delta = OldEndPosSaved - NewSamplePos;
+			Delta.Z = 0.0f;
+			FVector NewRight2D = NewSampleRight; NewRight2D.Z = 0.0f;
+			NewRight2D = NewRight2D.GetSafeNormal();
+
+			if (!NewRight2D.IsNearlyZero())
+			{
+				const float OffsetCorrection = FVector::DotProduct(Delta, NewRight2D);
+
+				// 防呆：修正量太大（> 一個車道寬的 2 倍）代表 spline 走向差太多
+				const float MaxCorrection = FMath::Max(NewSegRef.AutoLaneWidthCm, 200.0f) * 2.0f;
+				if (FMath::Abs(OffsetCorrection) <= MaxCorrection)
+				{
+					CurrentLateralOffset += OffsetCorrection;
+				}
+			}
+		}
 	}
 
 	// ================================================================
@@ -2819,9 +3182,42 @@ void URoadPathFollowerComponent::TickComponent(
 
 // ============================================================================
 // SphereTrace forward obstacle detection (unified: vehicles, red light blockers, any obstacle)
+// 當車輛被擋住靜止時，節流偵測頻率以省效能
+// When vehicle is blocked and stopped, throttle detection rate to save performance
 // ============================================================================
 void URoadPathFollowerComponent::UpdateObstacleDetection()
 {
+	// ---- 節流：被擋住且速度≈0 時不需要每幀偵測 ----
+	// ---- Throttle: when blocked and speed≈0, don't need per-frame detection ----
+	if (ObstacleThrottleInterval > 0.0f
+		&& CurrentSpeed < 5.0f
+		&& ObstacleDistance >= 0.0f)  // 上一幀有偵測到障礙物 / had obstacle last frame
+	{
+		// 如果上次偵測到的障礙物 Actor 已不存在 → 立即清除、重新偵測
+		// If last obstacle actor is no longer valid → clear immediately, re-detect
+		if (!ObstacleActor.IsValid())
+		{
+			ObstacleDistance = -1.0f;
+			ObstacleThrottleTimer = 0.0f;
+			// 不 return，繼續做完整偵測 / don't return, proceed to full detection
+		}
+		else
+		{
+			ObstacleThrottleTimer += GetWorld()->GetDeltaSeconds();
+			if (ObstacleThrottleTimer < ObstacleThrottleInterval)
+			{
+				// 保留上一幀的結果，跳過本幀偵測
+				// Keep last frame's result, skip this frame's detection
+				return;
+			}
+			ObstacleThrottleTimer = 0.0f;  // 時間到了 → 做一次偵測 / time's up → detect once
+		}
+	}
+	else
+	{
+		ObstacleThrottleTimer = 0.0f;  // 正常行駛 → 每幀偵測 / normal driving → detect every frame
+	}
+
 	ObstacleDistance = -1.0f;
 	ObstacleActor = nullptr;
 
@@ -2865,7 +3261,8 @@ void URoadPathFollowerComponent::UpdateObstacleDetection()
 }
 
 // ============================================================================
-//  Two-stage obstacle speed limit (N slowdown, M full stop)
+//  Obstacle speed limit — sqrt curve for more aggressive early braking
+//  遠距離就開始明顯減速，避免來不及煞車導致車輛重疊
 // ============================================================================
 float URoadPathFollowerComponent::ComputeObstacleSpeedLimit() const
 {
@@ -2877,7 +3274,7 @@ float URoadPathFollowerComponent::ComputeObstacleSpeedLimit() const
 
 	if (ObstacleDistance <= ObstacleStopDistance)
 	{
-		// Too close , full stop
+		// Too close → full stop
 		return 0.0f;
 	}
 
@@ -2887,10 +3284,299 @@ float URoadPathFollowerComponent::ComputeObstacleSpeedLimit() const
 		return MaxSpeed;
 	}
 
-	// Linear deceleration between N and M
+	// sqrt curve: speed ∝ √(distance) — brakes much harder at close range
+	// compared to linear, this gives ~70% speed at 50% distance (linear would give 50%)
+	// but ~45% speed at 20% distance (linear would give 20%), making close-range braking
+	// much more aggressive while keeping far-range braking smooth
 	const float Alpha = (ObstacleDistance - ObstacleStopDistance)
 		/ (ObstacleSlowdownDistance - ObstacleStopDistance);
-	return MaxSpeed * Alpha;
+	return MaxSpeed * FMath::Sqrt(Alpha);
+}
+
+// ============================================================================
+//  Stuck / Overlap Recovery — 卡住 / 重疊恢復（強化版）
+//
+//  偵測流程：
+//  1. Cooldown 階段：倒退剛完成後，冷卻期內不觸發（避免立刻又觸發）
+//  2. 正在倒退中：持續後退直到目標距離
+//  3. 偵測卡住：我停+前方很近的車/物 → 累計 StuckTimer
+//  4. 觸發條件（依序檢查）：
+//     a. 前車已在倒退 → 我讓路，重置我的 timer
+//     b. 前車還在動（>5 cm/s） → 只是暫時擋住，等它走
+//     c. 前車也停且卡住（timer 也過半）→ FName 比較決定誰退（字母序較小的退）
+//     d. 靜態障礙物（紅燈、路障）→ 等 3× 延遲才觸發
+//  5. 倒退完成後：
+//     a. 增加 ConsecutiveStuckCount
+//     b. 若連續卡 N 次 → 換個隨機停車場目的地
+//     c. 否則重新導航到原目的地
+//     d. 設 StuckCooldownTimer 冷卻期
+//
+//  Detection flow:
+//  1. Cooldown: right after reverse complete, blocked for cooldown period
+//  2. Currently reversing: keep moving back until target distance
+//  3. Detect stuck: my speed≈0 + vehicle/obstacle very close → accumulate StuckTimer
+//  4. Trigger (checked in order):
+//     a. Front already reversing → I yield, reset my timer
+//     b. Front still moving (>5 cm/s) → just temporarily blocked, wait
+//     c. Front also stuck → FName tiebreak (alphabetically smaller yields)
+//     d. Static obstacle (red light, barrier) → wait 3× delay before trigger
+//  5. After reverse:
+//     a. Increment ConsecutiveStuckCount
+//     b. If stuck N times in a row → switch to random parking destination
+//     c. Otherwise re-route to same destination
+//     d. Set StuckCooldownTimer
+// ============================================================================
+void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
+{
+	AActor* Owner = GetOwner();
+	if (!Owner) return;
+
+	// 更新「距離上次卡住的時間」
+	// Update "time since last stuck"
+	TimeSinceLastStuck += DeltaTime;
+
+	// ================================================================
+	// Phase 0：冷卻期 / Cooldown period after reverse
+	// 倒退剛完成後，幾秒內不偵測（讓車子有時間實際移動出去）
+	// ================================================================
+	if (StuckCooldownTimer > 0.0f)
+	{
+		StuckCooldownTimer -= DeltaTime;
+		StuckTimer = 0.0f;  // 冷卻期間不累計 / don't accumulate during cooldown
+		return;
+	}
+
+	// ================================================================
+	// Phase 2：正在倒退中 / Currently reversing
+	// ================================================================
+	if (bIsStuckReversing)
+	{
+		const float ReverseDelta = StuckReverseSpeed * DeltaTime;
+		StuckReversedSoFar += ReverseDelta;
+
+		// 沿車輛後方移動 / Move backward along vehicle facing
+		const FVector BackDir = -Owner->GetActorForwardVector();
+		Owner->SetActorLocation(Owner->GetActorLocation() + BackDir * ReverseDelta);
+
+		// 同時在 spline 上倒退 ReferenceDistance
+		// Also reverse ReferenceDistance on spline
+		if (PathSegments.IsValidIndex(CurrentSegmentIndex))
+		{
+			const FPathSegmentInternal& Seg = PathSegments[CurrentSegmentIndex];
+			ReferenceDistance -= Seg.Direction * ReverseDelta;
+			const float SegLo = FMath::Min(Seg.StartDist, Seg.EndDist);
+			const float SegHi = FMath::Max(Seg.StartDist, Seg.EndDist);
+			ReferenceDistance = FMath::Clamp(ReferenceDistance, SegLo, SegHi);
+		}
+
+		// 倒退完成？ / Reverse complete?
+		if (StuckReversedSoFar >= CurrentStuckReverseTarget)
+		{
+			bIsStuckReversing = false;
+			StuckReversedSoFar = 0.0f;
+			StuckTimer = 0.0f;
+			CurrentSpeed = 0.0f;
+
+			// 設冷卻期 / Set cooldown
+			StuckCooldownTimer = StuckCooldownDuration;
+
+			UE_LOG(LogTemp, Warning, TEXT("[STUCK] %s: Reverse complete (%.0f cm), cooldown=%.1fs, consecutive=%d"),
+				*Owner->GetName(), CurrentStuckReverseTarget, StuckCooldownDuration, ConsecutiveStuckCount);
+
+			// 連續卡住太多次 → 換個目的地
+			// Too many consecutive stucks → switch destination
+			if (ConsecutiveStuckCount >= MaxConsecutiveStucksBeforeSwitch)
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("[STUCK] %s: %d consecutive stucks → SWITCHING to random destination"),
+					*Owner->GetName(), ConsecutiveStuckCount);
+				ConsecutiveStuckCount = 0;
+				CurrentStuckReverseTarget = StuckReverseDistance;  // reset escalation
+				SwitchToNewRandomDestination();
+				return;
+			}
+
+			// ---- 重新導航到相同目的地 / Re-navigate to same destination ----
+			// 車仍在 Driving 狀態（bIsFollowing=true, NavState=Driving），
+			// 所以 NavigateToNode 會直接走 RerouteToNode 路徑 — 最安全。
+			// 停車場目的地要再補 AppendBoundEdgeFinalSegment（跟原始 NavigateToParkingLot 一樣）
+			//
+			// Car is still in Driving state, so NavigateToNode will take the RerouteToNode path.
+			// For parking lot destinations, also re-append the BoundEdge final segment.
+			if (bRerouteAfterStuckRecovery && DestinationNodeId != INDEX_NONE)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[STUCK] %s: Re-navigating to node %d (dest='%s')"),
+					*Owner->GetName(), DestinationNodeId,
+					TargetParkingLot.IsValid() ? *TargetParkingLot->ParkingLotName : TEXT("node"));
+
+				NavigateToNode(DestinationNodeId);
+
+				// 停車場目的地：補上 BoundEdge 最後一段
+				// Parking lot destination: re-append BoundEdge final segment
+				if (TargetParkingLot.IsValid() && DestinationType == EDestinationType::ParkingLot)
+				{
+					UWorld* World = GetWorld();
+					URoadNetworkSubsystem* Sub = World ? World->GetSubsystem<URoadNetworkSubsystem>() : nullptr;
+					if (Sub)
+					{
+						const FRoadGraphEdge* BoundEdge = Sub->GetGraphEdgeById(TargetParkingLot->BoundEdgeId);
+						if (BoundEdge && BoundEdge->InputSpline)
+						{
+							// 計算方向和投影距離（跟 NavigateToParkingLot 相同邏輯）
+							// Compute direction and projection distance (same logic as NavigateToParkingLot)
+							const FVector AnchorFwd = TargetParkingLot->GetAnchorArrowForward();
+							const FVector AnchorFwd2D = FVector(AnchorFwd.X, AnchorFwd.Y, 0.0f).GetSafeNormal();
+							const FVector& ProjPt = TargetParkingLot->BoundProjectionPoint;
+							const float ProjKey = BoundEdge->InputSpline->FindInputKeyClosestToWorldLocation(ProjPt);
+							const float ProjDistAbs = BoundEdge->InputSpline->GetDistanceAlongSplineAtSplineInputKey(ProjKey);
+							const FVector SplineDir = BoundEdge->InputSpline->GetDirectionAtDistanceAlongSpline(
+								ProjDistAbs, ESplineCoordinateSpace::World).GetSafeNormal2D();
+							const bool bForwardDrive = (FVector::DotProduct(AnchorFwd2D, SplineDir) >= 0.0f);
+
+							AppendBoundEdgeFinalSegment(*BoundEdge, bForwardDrive, ProjDistAbs);
+
+							UE_LOG(LogTemp, Warning,
+								TEXT("[STUCK] %s: Re-appended BoundEdge %d (fwd=%s, projDist=%.0f)"),
+								*Owner->GetName(), BoundEdge->EdgeId,
+								bForwardDrive ? TEXT("Y") : TEXT("N"), ProjDistAbs);
+						}
+					}
+				}
+			}
+		}
+		return;
+	}
+
+	// ================================================================
+	// Phase 1：偵測卡住 / Detect stuck condition
+	// ================================================================
+	const bool bAmStopped = (CurrentSpeed < 5.0f);
+	const bool bObstacleVeryClose = (ObstacleDistance >= 0.0f
+		&& ObstacleDistance < OverlapDetectionDistance);
+
+	if (bAmStopped && bObstacleVeryClose && ObstacleActor.IsValid())
+	{
+		StuckTimer += DeltaTime;
+
+		if (StuckTimer >= StuckRecoveryDelay)
+		{
+			// 確認前方是車輛還是靜態物 / Check if obstacle is a vehicle or static
+			URoadPathFollowerComponent* FrontPF =
+				ObstacleActor->FindComponentByClass<URoadPathFollowerComponent>();
+
+			if (!FrontPF)
+			{
+				// 靜態障礙物（紅綠燈、路障）→ 等 3× 延遲才觸發
+				// Static obstacle (traffic light, barrier) → wait 3× delay
+				if (StuckTimer < StuckRecoveryDelay * 3.0f)
+				{
+					return;
+				}
+				// 超過 3× 延遲 → 觸發倒退+重新導航
+				// Exceeded 3× delay → trigger reverse + re-navigate
+			}
+			else
+			{
+				// ========================================================
+				// 前方是車輛 — 四層優先級判斷
+				// Front obstacle is a vehicle — 4-tier priority check
+				// ========================================================
+
+				// --- Tier 1: 前車已在倒退 → 我絕對不退，等它退完 ---
+				// --- Tier 1: front car already reversing → I absolutely yield ---
+				// （這是最重要的修正：避免同一幀兩車都觸發倒退）
+				// (Critical fix: prevent both cars triggering reverse in same frame)
+				if (FrontPF->IsStuckReversing())
+				{
+					StuckTimer = 0.0f;  // 重置讓我不會立刻再累積 / reset so I don't re-accumulate
+					return;
+				}
+
+				// --- Tier 2: 前車還在動 → 只是暫時擋住 ---
+				// --- Tier 2: front car still moving → just temporarily blocked ---
+				const bool bFrontAlsoStopped = (FrontPF->GetCurrentSpeed() < 5.0f);
+				if (!bFrontAlsoStopped)
+				{
+					return;
+				}
+
+				// --- Tier 3: 前車在冷卻期 → 它剛倒退完，我讓路 ---
+				// --- Tier 3: front in cooldown → it just reversed, I yield ---
+				if (FrontPF->StuckCooldownTimer > 0.0f)
+				{
+					StuckTimer = 0.0f;
+					return;
+				}
+
+				// --- Tier 4: 兩車都停且都卡住 → FName 比較決定誰退 ---
+				// --- Tier 4: both stopped and stuck → FName tiebreak ---
+				const bool bFrontIsAlsoStuck = (FrontPF->GetStuckTimer() >= StuckRecoveryDelay * 0.5f);
+
+				if (bFrontIsAlsoStuck)
+				{
+					// 用 FName 比較（穩定、每次都相同）— 字母序較小的讓路
+					// FName comparison (stable, deterministic) — alphabetically smaller yields
+					const FString MyName = Owner->GetName();
+					const FString FrontName = ObstacleActor->GetName();
+					const int32 Cmp = MyName.Compare(FrontName);
+
+					if (Cmp < 0)
+					{
+						// 我的名字排在前面 → 我讓路
+						// My name comes first alphabetically → I yield
+						UE_LOG(LogTemp, Verbose,
+							TEXT("[STUCK] %s yielding to %s (FName tiebreak)"),
+							*MyName, *FrontName);
+						StuckTimer = 0.0f;
+						return;
+					}
+					// Cmp == 0 永不發生（Actor 名字唯一）/ Cmp==0 can't happen (names unique)
+				}
+			}
+
+			// ============================================================
+			// 觸發後退 / Trigger reverse
+			// ============================================================
+
+			// 更新連續卡住計數 / Update consecutive stuck count
+			if (TimeSinceLastStuck < ConsecutiveStuckWindow)
+			{
+				ConsecutiveStuckCount++;
+			}
+			else
+			{
+				ConsecutiveStuckCount = 1;  // 重新開始計數 / fresh count
+			}
+			TimeSinceLastStuck = 0.0f;
+
+			// 倒退距離隨連續次數升級（第1次=600, 第2次=900, 第3次=1200...）
+			// Reverse distance escalates with consecutive count
+			CurrentStuckReverseTarget = StuckReverseDistance
+				* (1.0f + (ConsecutiveStuckCount - 1) * 0.5f);
+
+			UE_LOG(LogTemp, Warning,
+				TEXT("[STUCK] %s: Stuck with %s (dist=%.0f, timer=%.1fs, consecutive=#%d) → REVERSING %.0f cm"),
+				*Owner->GetName(),
+				*ObstacleActor->GetName(),
+				ObstacleDistance,
+				StuckTimer,
+				ConsecutiveStuckCount,
+				CurrentStuckReverseTarget);
+
+			bIsStuckReversing = true;
+			StuckReversedSoFar = 0.0f;
+			CurrentSpeed = 0.0f;
+		}
+	}
+	else
+	{
+		// 沒有卡住條件 → 重置計時器
+		// Not stuck → reset timer
+		if (StuckTimer > 0.0f)
+		{
+			StuckTimer = FMath::Max(StuckTimer - DeltaTime * 2.0f, 0.0f);  // 緩降 / decay
+		}
+	}
 }
 
 // ============================================================================
@@ -2931,6 +3617,75 @@ bool URoadPathFollowerComponent::IsPassingLaneClear(int32 PassingLaneIndex) cons
 		Params);
 
 	return !bHit;
+}
+
+// ============================================================================
+//  IsOriginalLaneClear — 檢查原車道前方是否淨空（切回前的最後確認）
+//  Sphere-traces forward *in the original lane* (at its lateral offset) to
+//  verify no other vehicle is there before committing to return.
+// ============================================================================
+bool URoadPathFollowerComponent::IsOriginalLaneClear(int32 OriginalLaneIndex, float CheckDistance) const
+{
+	UWorld* World = GetWorld();
+	if (!World) return false;
+
+	AActor* Owner = GetOwner();
+	if (!Owner) return false;
+
+	if (CurrentSegmentIndex >= PathSegments.Num()) return false;
+
+	const FPathSegmentInternal& Seg = PathSegments[CurrentSegmentIndex];
+	const float OrigOffset = ComputeTargetLaneOffset(OriginalLaneIndex);
+
+	// Sample point in the original lane at the car's current longitudinal distance
+	FVector RefPos, RefDir, RefRight;
+	SampleSplineAtDist(Seg, ReferenceDistance, OrigOffset, RefPos, RefDir, RefRight);
+
+	// Forward direction = spline direction at that point (so trace follows curvature)
+	FVector Fwd = RefDir.GetSafeNormal2D();
+	if (Seg.Direction < 0.0f) Fwd = -Fwd;
+	if (Fwd.IsNearlyZero()) Fwd = Owner->GetActorForwardVector();
+
+	const FVector End = RefPos + Fwd * CheckDistance;
+
+	FHitResult Hit;
+	FCollisionQueryParams Params;
+	Params.AddIgnoredActor(Owner);
+
+	const bool bHit = World->SweepSingleByChannel(
+		Hit,
+		RefPos, End,
+		FQuat::Identity,
+		ECC_ObstacleDetect,
+		FCollisionShape::MakeSphere(ObstacleTraceRadius),
+		Params);
+
+	return !bHit;
+}
+
+// ============================================================================
+//  IsTargetVehiclePast — 被超車是否已在我後方 > MinPastDistance
+//  Uses world-space longitudinal projection on the car's forward axis.
+// ============================================================================
+bool URoadPathFollowerComponent::IsTargetVehiclePast(float MinPastDistance) const
+{
+	if (!OvertakeTargetActor.IsValid()) return false;
+
+	const AActor* Owner = GetOwner();
+	if (!Owner) return false;
+
+	const FVector MyPos = Owner->GetActorLocation();
+	const FVector MyFwd = Owner->GetActorForwardVector().GetSafeNormal2D();
+	const FVector TgtPos = OvertakeTargetActor->GetActorLocation();
+
+	FVector Delta = TgtPos - MyPos;
+	Delta.Z = 0.0f;
+
+	// Positive = target is ahead; Negative = target is behind
+	const float LongitudinalDot = FVector::DotProduct(Delta, MyFwd);
+
+	// Target is behind by at least MinPastDistance
+	return (LongitudinalDot <= -MinPastDistance);
 }
 
 // ============================================================================
@@ -2991,6 +3746,8 @@ void URoadPathFollowerComponent::UpdateOvertakeLogic()
 		// Initiate overtake
 		PreOvertakeLaneIndex = CurrentLaneIndex;
 		OvertakePassedDistAccum = 0.0f;
+		OvertakeReturnConfirmTimer = 0.0f;
+		OvertakeTargetActor = ObstacleActor;  // remember WHICH car we're passing
 		RequestLaneChange(PassingLane);
 		OvertakeState = EOvertakeState::Passing;
 
@@ -3017,33 +3774,66 @@ void URoadPathFollowerComponent::UpdateOvertakeLogic()
 			break;
 		}
 
-		// Check if passed the front vehicle
-		// Front SphereTrace no longer detects original obstacle , passed
-		bool bPassed = !ObstacleActor.IsValid() || (ObstacleDistance < 0.0f);
+		// ---------------------------------------------------------------
+		// 判斷何時可以切回原車道 / When is it safe to return?
+		//
+		// 舊邏輯用 "前方 SphereTrace 掃不到 ObstacleActor" 當作「已超車」—
+		// 但切到內側道後，慢車已不在正前方，SphereTrace 自然掃不到 → 誤判超車。
+		//
+		// 新邏輯必須同時滿足三件事：
+		//   (1) 被超車 (OvertakeTargetActor) 真的在我後方 > OvertakeMinPassDistance
+		//   (2) 原車道前方 OvertakeSafeDistance 內沒有其他車
+		//   (3) 條件 (1)+(2) 持續 OvertakeReturnConfirmTime 秒（防抖動）
+		//
+		// New logic requires ALL three:
+		//   (1) Target vehicle is actually behind us by > OvertakeMinPassDistance
+		//   (2) Original lane ahead is clear for OvertakeSafeDistance
+		//   (3) Both conditions hold for OvertakeReturnConfirmTime seconds (debounce)
+		// ---------------------------------------------------------------
+		const float DT = GetWorld()->GetDeltaSeconds();
 
-		// May detect a different vehicle → also counts as passed original
-		if (ObstacleActor.IsValid() && ObstacleActor->FindComponentByClass<URoadPathFollowerComponent>())
+		const bool bTargetPast = IsTargetVehiclePast(OvertakeMinPassDistance);
+		const bool bOrigLaneClear = IsOriginalLaneClear(PreOvertakeLaneIndex, OvertakeSafeDistance);
+
+		// 如果被超車已消失（destroyed / too far / gone）— 退回 fallback：
+		// 以純距離累積 OvertakeSafeDistance 當作已超過。
+		// Fallback when target is gone: accumulate pure distance.
+		const bool bTargetLost = !OvertakeTargetActor.IsValid();
+
+		if (bTargetLost)
 		{
-			// 如果偵測到的是不同車，也算超過了
-			// 但如果是同一台，還沒超過
+			OvertakePassedDistAccum += CurrentSpeed * DT;
+		}
+		else
+		{
+			OvertakePassedDistAccum = 0.0f;  // only counts when target lost
 		}
 
-		if (bPassed)
+		const bool bReadyByTarget = (bTargetPast && bOrigLaneClear);
+		const bool bReadyByFallback = (bTargetLost && OvertakePassedDistAccum >= OvertakeSafeDistance && bOrigLaneClear);
+
+		if (bReadyByTarget || bReadyByFallback)
 		{
-			// Accumulate safe distance
-			OvertakePassedDistAccum += CurrentSpeed * GetWorld()->GetDeltaSeconds();
+			OvertakeReturnConfirmTimer += DT;
+		}
+		else
+		{
+			OvertakeReturnConfirmTimer = 0.0f;  // reset on any failure (debounce)
+		}
 
-			if (OvertakePassedDistAccum >= OvertakeSafeDistance)
-			{
-				// Return to original lane
-				RequestLaneChange(PreOvertakeLaneIndex);
-				OvertakeState = EOvertakeState::Returning;
-				CurrentTurnSignal = ETurnSignal::Right;
+		if (OvertakeReturnConfirmTimer >= OvertakeReturnConfirmTime)
+		{
+			// Confirmed safe → return to original lane
+			RequestLaneChange(PreOvertakeLaneIndex);
+			OvertakeState = EOvertakeState::Returning;
+			CurrentTurnSignal = ETurnSignal::Right;
 
-				UE_LOG(LogTemp, Warning,
-					TEXT("PathFollower: OVERTAKE PASSED — returning to Lane %d after %.0f cm"),
-					PreOvertakeLaneIndex, OvertakePassedDistAccum);
-			}
+			UE_LOG(LogTemp, Warning,
+				TEXT("PathFollower: OVERTAKE PASSED — returning to Lane %d (targetPast=%s origClear=%s fallback=%s)"),
+				PreOvertakeLaneIndex,
+				bTargetPast ? TEXT("Y") : TEXT("N"),
+				bOrigLaneClear ? TEXT("Y") : TEXT("N"),
+				bReadyByFallback ? TEXT("Y") : TEXT("N"));
 		}
 		break;
 	}
@@ -3054,6 +3844,9 @@ void URoadPathFollowerComponent::UpdateOvertakeLogic()
 		if (!bIsChangingLane)
 		{
 			OvertakeState = EOvertakeState::None;
+			OvertakeTargetActor = nullptr;
+			OvertakeReturnConfirmTimer = 0.0f;
+			OvertakePassedDistAccum = 0.0f;
 			// Turn signal handled by Step 0
 			CurrentTurnSignal = ETurnSignal::None;
 

@@ -121,6 +121,12 @@ bool AParkingLotActor::IsSpotOccupied(int32 SpotIndex) const
 	return SpotOccupied[SpotIndex];
 }
 
+AActor* AParkingLotActor::GetSpotOccupant(int32 SpotIndex) const
+{
+	if (!SpotVehicles.IsValidIndex(SpotIndex)) return nullptr;
+	return SpotVehicles[SpotIndex].Get();
+}
+
 int32 AParkingLotActor::GetSpotEdgeId(int32 SpotIndex) const
 {
 	if (!SpotEdgeIds.IsValidIndex(SpotIndex)) return INDEX_NONE;

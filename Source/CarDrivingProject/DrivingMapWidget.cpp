@@ -218,12 +218,33 @@ int32 UDrivingMapWidget::NativePaint(
 				}
 			}
 
-			// Destination marker
-			if (!SelectedDestinationWorldPos.IsNearlyZero())
+			// Destination marker — 動態從 PF 即時讀取，自動導航換目的地時也反映
+			// Dynamically read from PF so auto-nav destination changes are shown immediately
+			// NativePaint is const so we only READ here; SelectVehicle() caches the value for non-const use
 			{
-				FVector2D DestMapPos = WorldToMap(SelectedDestinationWorldPos, MapOrigin, MapSize);
-				DrawCircle(Context, DestMapPos, bIsFullscreen ? 8.0f : 5.0f,
-					DestinationColor, 2.5f);
+				FVector DestDisplayPos = SelectedDestinationWorldPos;
+				// 如果選中的車有 PF，優先用即時值（自動導航可能換了目的地）
+				// If selected vehicle has PF, prefer live value (auto-nav may have changed dest)
+				AActor* SelVeh = SelectedVehiclePtr.Get();
+				if (SelVeh)
+				{
+					URoadPathFollowerComponent* SelPF = SelVeh->FindComponentByClass<URoadPathFollowerComponent>();
+					if (SelPF)
+					{
+						const FVector LiveDest = SelPF->GetDestinationDisplayLocation();
+						if (!LiveDest.IsNearlyZero())
+						{
+							DestDisplayPos = LiveDest;
+						}
+					}
+				}
+
+				if (!DestDisplayPos.IsNearlyZero())
+				{
+					FVector2D DestMapPos = WorldToMap(DestDisplayPos, MapOrigin, MapSize);
+					DrawCircle(Context, DestMapPos, bIsFullscreen ? 8.0f : 5.0f,
+						DestinationColor, 2.5f);
+				}
 			}
 		}
 	}
@@ -368,10 +389,29 @@ int32 UDrivingMapWidget::NativePaint(
 			// Lane
 			DrawPanelLine(FString::Printf(TEXT("Lane: %d"), PF->CurrentLaneIndex), InfoColor);
 
-			// Obstacle
-			const float ObDist = PF->GetObstacleDistance();
-			FString ObStr = (ObDist < 0.0f) ? TEXT("None") : FString::Printf(TEXT("%.0f cm"), ObDist);
-			DrawPanelLine(FString::Printf(TEXT("Obstacle: %s"), *ObStr), InfoColor);
+			// Obstacle — show distance, type, and name
+			{
+				const float ObDist = PF->GetObstacleDistance();
+				if (ObDist < 0.0f)
+				{
+					DrawPanelLine(TEXT("Obstacle: None"), DimColor);
+				}
+				else
+				{
+					const FString ObType = PF->GetObstacleTypeString();
+					const FString ObName = PF->GetObstacleActorName();
+					FLinearColor ObColor = InfoColor;
+					if (ObType == TEXT("Vehicle"))       ObColor = FLinearColor(1.0f, 0.6f, 0.2f, 1.0f); // orange
+					else if (ObType == TEXT("Traffic"))   ObColor = FLinearColor(1.0f, 0.3f, 0.3f, 1.0f); // red
+					else                                  ObColor = FLinearColor(0.7f, 0.7f, 0.7f, 1.0f); // grey
+
+					DrawPanelLine(FString::Printf(TEXT("Obstacle: %.0f cm [%s]"), ObDist, *ObType), ObColor);
+					if (!ObName.IsEmpty())
+					{
+						DrawPanelLine(FString::Printf(TEXT("  → %s"), *ObName), DimColor);
+					}
+				}
+			}
 
 			// Overtake
 			FString OvtStr;
@@ -611,9 +651,9 @@ void UDrivingMapWidget::SelectVehicle(AActor* Vehicle)
 	URoadPathFollowerComponent* PF = Vehicle->FindComponentByClass<URoadPathFollowerComponent>();
 	if (PF)
 	{
-		SelectedDestinationWorldPos = PF->GetDestinationLocation();
-		// 目的地 actor 無法從 PF 直接取得，僅記錄位置
-		// Destination actor can't be retrieved from PF directly, just record position
+		// 用 DisplayLocation — 停車場時回傳停車場位置（不是路上投影點）
+		// Use DisplayLocation — for parking lots returns the lot position (not road projection)
+		SelectedDestinationWorldPos = PF->GetDestinationDisplayLocation();
 		if (!SelectedDestinationWorldPos.IsNearlyZero())
 		{
 			SelectedDestinationActor = nullptr; // 已有位置就足夠畫標記 / Position is enough for marker

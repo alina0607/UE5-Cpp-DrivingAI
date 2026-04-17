@@ -334,6 +334,15 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Obstacle", meta = (ClampMin = "50"))
 	float ObstacleStopDistance = 300.0f;
 
+	/// Emergency brake multiplier — when obstacle closer than this fraction of SlowdownDistance,
+	/// apply BrakeDeceleration × this multiplier for harder braking (default 3×)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Obstacle", meta = (ClampMin = "1.0", ClampMax = "10.0"))
+	float EmergencyBrakeMultiplier = 3.0f;
+
+	/// Distance threshold for emergency brake zone, as fraction of ObstacleSlowdownDistance
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Obstacle", meta = (ClampMin = "0.1", ClampMax = "0.8"))
+	float EmergencyBrakeZoneFraction = 0.35f;
+
 	/// SphereTrace radius (cm)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Obstacle", meta = (ClampMin = "10"))
 	float ObstacleTraceRadius = 120.0f;
@@ -345,6 +354,67 @@ public:
 	/// Enable obstacle detection debug logging (which vehicle blocked by what)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Obstacle")
 	bool bDebugObstacleTrace = false;
+
+	/// When blocked (speed≈0 with obstacle ahead), throttle detection to this interval (seconds).
+	/// Saves performance when many cars are stopped. Set 0 to always detect every frame.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Obstacle", meta = (ClampMin = "0", ClampMax = "2.0"))
+	float ObstacleThrottleInterval = 0.5f;
+
+	// ================================================================
+	//  Stuck / Overlap Recovery
+	//  卡住 / 重疊恢復：偵測完全停止 → 倒退分離 → 重新導航
+	// ================================================================
+
+	/// If obstacle distance < this, consider vehicles overlapping (cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "10"))
+	float OverlapDetectionDistance = 150.0f;
+
+	/// How long vehicles must be stuck (speed≈0, obstacle ahead) before triggering recovery (seconds)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "0.5"))
+	float StuckRecoveryDelay = 1.5f;
+
+	/// Speed at which the vehicle reverses to create separation (cm/s)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "50"))
+	float StuckReverseSpeed = 300.0f;
+
+	/// Base distance to reverse when unsticking (cm) — escalates on consecutive stucks
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "100"))
+	float StuckReverseDistance = 600.0f;
+
+	/// After reversing, should reroute to current destination instead of just resuming forward
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery")
+	bool bRerouteAfterStuckRecovery = true;
+
+	/// Cooldown after a reverse completes — stuck detection disabled for this long (seconds)
+	/// 倒退完成後的冷卻時間，避免立刻又觸發
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "0.5"))
+	float StuckCooldownDuration = 3.0f;
+
+	/// Window to count consecutive stucks (seconds) — resets if no stuck within this time
+	/// 判斷「連續卡住」的時窗
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "5.0"))
+	float ConsecutiveStuckWindow = 15.0f;
+
+	/// After N consecutive stucks, switch to a new random destination (parking lot)
+	/// 連續卡住幾次後就換個隨機目的地
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "2"))
+	int32 MaxConsecutiveStucksBeforeSwitch = 3;
+
+	// ================================================================
+	//  Sequential Departure (源停車場出場順序)
+	// ================================================================
+
+	/// Poll interval when waiting for the previous spot's car to clear (seconds)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Departure", meta = (ClampMin = "0.1"))
+	float DepartureCheckInterval = 0.5f;
+
+	/// Distance (cm) the previous-spot car must have moved before this car may depart
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Departure", meta = (ClampMin = "100"))
+	float DepartureClearDistance = 800.0f;
+
+	/// Max time to wait for a lower-indexed spot to clear — depart anyway after this (seconds)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Departure", meta = (ClampMin = "1.0"))
+	float DepartureMaxWaitTime = 30.0f;
 
 	// ================================================================
 	//  Overtaking
@@ -404,6 +474,23 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Road Path|Navigation")
 	void NavigateToParkingLot(AParkingLotActor* ParkingLot, int32 SpotIndex = -1);
 
+	/// Register where this vehicle originally spawned — enables spot-order gated departure.
+	/// Call at spawn BEFORE the first NavigateTo*. SourceLot->OccupySpot(SourceSpotIndex, Owner)
+	/// is invoked automatically.
+	UFUNCTION(BlueprintCallable, Category = "Road Path|Navigation")
+	void SetDepartureContext(AParkingLotActor* SourceLot, int32 SourceSpotIndex);
+
+	/// Gated departure: wait until all lower-indexed spots at SourceLot have cleared
+	/// (their occupants have driven at least DepartureClearDistance away), then call
+	/// NavigateToParkingLot(DestLot, DestSpotIndex). Safe to call without SetDepartureContext
+	/// — it falls through to NavigateToParkingLot immediately if no source context set.
+	UFUNCTION(BlueprintCallable, Category = "Road Path|Navigation")
+	void RequestDepartToParkingLot(AParkingLotActor* DestLot, int32 DestSpotIndex = -1);
+
+	/// True once this vehicle has physically cleared its spawn spot (moved >= DepartureClearDistance).
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path|Navigation")
+	bool HasDepartedFromSource() const { return bHasDepartedFromSource; }
+
 	/// Get destination type
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path|Navigation")
 	EDestinationType GetDestinationType() const { return DestinationType; }
@@ -438,6 +525,12 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path")
 	float GetCurrentSpeed() const { return CurrentSpeed; }
 
+	/// Get how long this vehicle has been stuck (for chain detection by other vehicles)
+	float GetStuckTimer() const { return StuckTimer; }
+
+	/// Is this vehicle currently reversing from a stuck situation?
+	bool IsStuckReversing() const { return bIsStuckReversing; }
+
 	/// Is a lane change in progress?
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path")
 	bool IsChangingLane() const { return bIsChangingLane; }
@@ -453,6 +546,16 @@ public:
 	/// Get obstacle distance ahead (-1 = none)
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Road Path")
 	float GetObstacleDistance() const { return ObstacleDistance; }
+
+	/// Get obstacle actor name (empty if none)
+	FString GetObstacleActorName() const;
+
+	/// Get obstacle type string: "Vehicle", "Traffic", or "Static"
+	FString GetObstacleTypeString() const;
+
+	/// Get destination display location — for map marker, uses parking lot position
+	/// instead of road projection point
+	FVector GetDestinationDisplayLocation() const;
 
 	/// Get current route world positions (from current pos to end, for map rendering)
 	void GetRouteWorldPoints(TArray<FVector>& OutPoints, int32 SamplesPerSegment = 10) const;
@@ -632,6 +735,9 @@ private:
 	/// Distance to obstacle ahead (-1 = none)
 	float ObstacleDistance = -1.0f;
 
+	/// Timer for throttled obstacle detection when blocked
+	float ObstacleThrottleTimer = 0.0f;
+
 	/// Front obstacle actor (for overtaking: distinguish vehicle vs traffic light)
 	UPROPERTY()
 	TWeakObjectPtr<AActor> ObstacleActor;
@@ -641,6 +747,70 @@ private:
 
 	/// Compute speed limit from obstacle distance
 	float ComputeObstacleSpeedLimit() const;
+
+	// ---- Stuck / Overlap Recovery State ----
+
+	/// Accumulated time this vehicle has been stuck (speed≈0 with obstacle ahead)
+	float StuckTimer = 0.0f;
+
+	/// Whether the vehicle is currently reversing to unstick
+	bool bIsStuckReversing = false;
+
+	/// Distance already reversed during stuck recovery
+	float StuckReversedSoFar = 0.0f;
+
+	/// Current reverse distance target (may escalate on repeated stuck)
+	float CurrentStuckReverseTarget = 600.0f;
+
+	/// Cooldown timer: stuck detection disabled while > 0
+	float StuckCooldownTimer = 0.0f;
+
+	/// How many consecutive stucks (within ConsecutiveStuckWindow) happened recently
+	int32 ConsecutiveStuckCount = 0;
+
+	/// Time since last stuck recovery triggered (for consecutive-count window)
+	float TimeSinceLastStuck = 999.0f;
+
+	/// Update stuck/overlap recovery logic (called in Tick)
+	void UpdateStuckRecovery(float DeltaTime);
+
+	/// Pick a new random parking lot destination (different from current) — called on repeated stuck
+	void SwitchToNewRandomDestination();
+
+	// ---- Departure gating (source parking lot) ----
+
+	/// Lot this car originally spawned at (set via SetDepartureContext)
+	TWeakObjectPtr<AParkingLotActor> SourceParkingLot;
+
+	/// Spot index at SourceParkingLot (INDEX_NONE = no gating)
+	int32 SourceSpotIndex = INDEX_NONE;
+
+	/// World location this car spawned at — used to detect "departed" via distance
+	FVector SourceSpawnLocation = FVector::ZeroVector;
+
+	/// Set true once this car has moved DepartureClearDistance from SourceSpawnLocation
+	bool bHasDepartedFromSource = false;
+
+	/// Accumulated seconds spent waiting for lower-indexed spot to clear (fallback safety)
+	float DepartureWaitAccum = 0.0f;
+
+	/// Timer handle for polling departure readiness
+	FTimerHandle DepartureCheckTimerHandle;
+
+	/// Cached target for the deferred departure (set by RequestDepartToParkingLot)
+	TWeakObjectPtr<AParkingLotActor> PendingDestLot;
+	int32 PendingDestSpotIndex = INDEX_NONE;
+
+	/// Returns true if every spot with index < SourceSpotIndex at SourceParkingLot is
+	/// either unoccupied or whose occupant has cleared (bHasDepartedFromSource / moved away).
+	bool IsSourceLotReadyForDeparture() const;
+
+	/// Poll handler invoked on DepartureCheckTimerHandle
+	void TryDepartPoll();
+
+	/// Tick helper: detect when this car has moved far enough to be considered departed,
+	/// flip bHasDepartedFromSource and release the source spot.
+	void UpdateDepartureProgress();
 
 	/// Distance to next junction (for slowdown calculation)
 	float GetDistanceToNextJunction() const;
@@ -656,11 +826,35 @@ private:
 	/// Distance counter after passing (cm)
 	float OvertakePassedDistAccum = 0.0f;
 
+	/// The specific slow vehicle that triggered this overtake (tracked until actually past)
+	TWeakObjectPtr<AActor> OvertakeTargetActor;
+
+	/// Distance the car must be past the target vehicle before attempting to return (cm)
+	UPROPERTY(EditAnywhere, Category = "Overtaking", meta = (ClampMin = "100.0"))
+	float OvertakeMinPassDistance = 600.0f;
+
+	/// Extra speed boost during overtake (multiplier on MaxSpeed)
+	UPROPERTY(EditAnywhere, Category = "Overtaking", meta = (ClampMin = "1.0", ClampMax = "2.0"))
+	float OvertakeSpeedBoost = 1.25f;
+
+	/// How long the original lane must read clear before we commit to returning (seconds)
+	UPROPERTY(EditAnywhere, Category = "Overtaking", meta = (ClampMin = "0.0"))
+	float OvertakeReturnConfirmTime = 0.5f;
+
+	/// Rolling timer — counts up while original lane is confirmed clear
+	float OvertakeReturnConfirmTimer = 0.0f;
+
 	/// Overtake logic update (called in Tick)
 	void UpdateOvertakeLogic();
 
 	/// Check if passing lane is clear (SphereTrace in target lane direction)
 	bool IsPassingLaneClear(int32 PassingLaneIndex) const;
+
+	/// Check if the original lane ahead is clear — used before returning from overtake
+	bool IsOriginalLaneClear(int32 OriginalLaneIndex, float CheckDistance) const;
+
+	/// Is the target vehicle now behind us by at least MinPastDistance on our forward axis?
+	bool IsTargetVehiclePast(float MinPastDistance) const;
 
 	// ---- Mid-drive re-routing ----
 

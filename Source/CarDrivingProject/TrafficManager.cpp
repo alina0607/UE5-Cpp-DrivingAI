@@ -71,11 +71,14 @@ void ATrafficManager::SpawnAllVehicles()
 
 	if (VehicleConfigs.Num() == 0) return;
 
-	// Build spawn point list
+	// Build spawn point list — now tracks source lot + spot so departure order can
+	// be enforced (spot 0 leaves before spot 1, etc.)
 	struct FSpawnPoint
 	{
 		FVector Position;
 		FRotator Rotation;
+		AParkingLotActor* SourceLot = nullptr;
+		int32 SpotIndex = INDEX_NONE;
 		bool bUsed = false;
 	};
 
@@ -90,11 +93,14 @@ void ATrafficManager::SpawnAllVehicles()
 			FSpawnPoint SP;
 			SP.Position = Lot->GetSpotWorldPosition(i) + FVector(0, 0, 30.0f);
 			SP.Rotation = Lot->GetSpotWorldForward(i).Rotation();
+			SP.SourceLot = Lot;
+			SP.SpotIndex = i;
 			SpawnPoints.Add(SP);
 		}
 	}
 
-	// Shuffle spawn points
+	// Shuffle spawn points (which physical spots we choose is still random,
+	// but each spawn keeps its lot/spot context — ordering enforced by PathFollower)
 	for (int32 i = SpawnPoints.Num() - 1; i > 0; --i)
 	{
 		const int32 j = FMath::RandRange(0, i);
@@ -146,6 +152,9 @@ void ATrafficManager::SpawnAllVehicles()
 				PF->bAutoStart = false;
 				PF->ParkingMode = EParkingMode::RoadsideStop;
 
+				// Register source-lot context so sequential-departure gating works
+				PF->SetDepartureContext(SP.SourceLot, SP.SpotIndex);
+
 				PF->OnPathComplete.AddDynamic(this, &ATrafficManager::OnVehiclePathComplete);
 			}
 
@@ -191,6 +200,21 @@ void ATrafficManager::AssignRandomDestination(ADrivingVehiclePawn* Vehicle)
 		return;
 	}
 
+	// 初次出場用 RequestDepartToParkingLot（會做 spot 順序控管）；
+	// 若 HasDepartedFromSource 已為 true（已離開原 spot），後續重新導航就直接呼叫
+	// NavigateToParkingLot — gating 只對出場的那一次有意義。
+	auto DispatchNavigate = [&](AParkingLotActor* DestLot, int32 DestSpot)
+	{
+		if (PF->HasDepartedFromSource())
+		{
+			PF->NavigateToParkingLot(DestLot, DestSpot);
+		}
+		else
+		{
+			PF->RequestDepartToParkingLot(DestLot, DestSpot);
+		}
+	};
+
 	//Pick random parking lot
 	const int32 RandIdx = FMath::RandRange(0, TotalLots - 1);
 	AParkingLotActor* Lot = AllParkingLots[RandIdx];
@@ -202,7 +226,7 @@ void ATrafficManager::AssignRandomDestination(ADrivingVehiclePawn* Vehicle)
 			UE_LOG(LogTemp, Warning,
 				TEXT("TrafficManager: Vehicle → ParkingLot '%s' spot=%d"),
 				*Lot->ParkingLotName, AvailableSpot);
-			PF->NavigateToParkingLot(Lot, AvailableSpot);
+			DispatchNavigate(Lot, AvailableSpot);
 			return;
 		}
 	}
@@ -214,7 +238,7 @@ void ATrafficManager::AssignRandomDestination(ADrivingVehiclePawn* Vehicle)
 		const int32 Spot = OtherLot->FindAvailableSpot();
 		if (Spot != INDEX_NONE)
 		{
-			PF->NavigateToParkingLot(OtherLot, Spot);
+			DispatchNavigate(OtherLot, Spot);
 			return;
 		}
 	}

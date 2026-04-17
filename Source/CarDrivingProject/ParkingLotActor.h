@@ -84,6 +84,10 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Parking Lot")
 	bool IsSpotOccupied(int32 SpotIndex) const;
 
+	/// Get the actor currently occupying a spot (nullptr if empty / released)
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Parking Lot")
+	AActor* GetSpotOccupant(int32 SpotIndex) const;
+
 	/// Get the Graph EdgeId for a spot (set by BindParkingActorsToEdges)
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Parking Lot")
 	int32 GetSpotEdgeId(int32 SpotIndex) const;
