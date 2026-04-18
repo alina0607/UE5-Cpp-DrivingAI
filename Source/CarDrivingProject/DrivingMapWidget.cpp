@@ -100,7 +100,7 @@ void UDrivingMapWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTim
 			}
 		}
 	}
-
+	/*
 	// ================================================================
 	//  In-viewport vehicle arrows + click-to-select (minimap mode only)
 	//  Draws a 3D arrow above every vehicle and lets the user click any
@@ -139,6 +139,7 @@ void UDrivingMapWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTim
 	}
 #endif
 
+	*/
 	// Click-to-select without opening the big map.
 	// The widget is HitTestInvisible in minimap mode, so we poll the PC directly.
 	if (!bIsFullscreen)
@@ -290,12 +291,10 @@ int32 UDrivingMapWidget::NativePaint(
 				}
 			}
 
-			// Destination marker — 動態從 PF 即時讀取，自動導航換目的地時也反映
 			// Dynamically read from PF so auto-nav destination changes are shown immediately
 			// NativePaint is const so we only READ here; SelectVehicle() caches the value for non-const use
 			{
 				FVector DestDisplayPos = SelectedDestinationWorldPos;
-				// 如果選中的車有 PF，優先用即時值（自動導航可能換了目的地）
 				// If selected vehicle has PF, prefer live value (auto-nav may have changed dest)
 				AActor* SelVeh = SelectedVehiclePtr.Get();
 				if (SelVeh)

@@ -99,7 +99,7 @@ void URoadNetworkSubsystem::BuildRoadCache()
             continue;
         }
 
-        if (!RoadActor->GetActorLabel().Contains(TEXT("BP_DriveRoad")))
+        if (!RoadActor->ActorHasTag(TEXT("DriveRoad")))
         {
             continue;
         }
@@ -653,10 +653,6 @@ void URoadNetworkSubsystem::BuildGraphNodes()
 // ============================================================================
 void URoadNetworkSubsystem::BindParkingActorsToEdges()
 {
-#if WITH_EDITOR
-    // GetActorLabel only meaningful in editor; packaged builds return internal name
-#endif
-
     UWorld* World = GetWorld();
     if (!World) return;
 
@@ -756,9 +752,9 @@ void URoadNetworkSubsystem::BindParkingActorsToEdges()
         {
             if (!E.RoadActor || !E.InputSpline) continue;
 #if WITH_EDITOR
-            const bool bMatch = E.RoadActor->GetActorLabel().Contains(TargetLabel);
+            const bool bMatch = E.RoadActor->ActorHasTag(TEXT("DriveRoad"));
 #else
-            const bool bMatch = E.RoadActor->GetName().Contains(TargetLabel);
+            const bool bMatch = E.RoadActor->ActorHasTag(TEXT("DriveRoad"));
 #endif
             if (bMatch) CandidateEdgeIds.Add(E.EdgeId);
         }

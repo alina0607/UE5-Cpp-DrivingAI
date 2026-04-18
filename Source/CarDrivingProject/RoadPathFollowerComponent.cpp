@@ -111,17 +111,21 @@ void URoadPathFollowerComponent::HandleEnteredNewSegment()
 			OvertakeReturnConfirmTimer = 0.0f;
 		}
 
-		// Snap to outermost forward lane for pull-over alignment.
+		// Snap to outermost forward lane for pull-over alignment. Don't
+		// commit the lane change immediately — defer to the per-tick
+		// safety check so we don't cut in front of a car behind us in
+		// the outer lane. Timeout after FinalEdgeLaneForceMaxWait seconds.
 		const int32 ForwardLanes = FMath::Max(1, Seg.DrivingRule.ForwardLaneCount);
 		const int32 OuterLane = ForwardLanes - 1;
 		if (TargetLaneIndex != OuterLane)
 		{
-			TargetLaneIndex = OuterLane;
-			bIsChangingLane = true;
+			bPendingFinalEdgeForce = true;
+			PendingFinalEdgeTargetLane = OuterLane;
+			FinalEdgeLaneForceWait = 0.0f;
 			CurrentTurnSignal = (OuterLane > CurrentLaneIndex) ? ETurnSignal::Right : CurrentTurnSignal;
 		}
 
-		LogEvent(FString::Printf(TEXT("ENTER FINAL EDGE seg=%d edge=%d forceLane=%d"),
+		LogEvent(FString::Printf(TEXT("ENTER FINAL EDGE seg=%d edge=%d pendingLane=%d"),
 			CurrentSegmentIndex, Seg.EdgeId, OuterLane));
 	}
 	else
@@ -2553,6 +2557,45 @@ void URoadPathFollowerComponent::TickComponent(
 	}
 
 	// ================================================================
+	//  0a. Pending final-edge lane force — we marked an outer-lane snap
+	//  request at segment-entry and now try to apply it once the rear is
+	//  clear. Timeout after FinalEdgeLaneForceMaxWait so we don't sit on
+	//  the inner lane forever when traffic keeps tailing us.
+	// ================================================================
+	if (bPendingFinalEdgeForce && bIsFinalEdge)
+	{
+		const int32 DesiredLane = PendingFinalEdgeTargetLane;
+		const bool bAlreadyAtTarget = (TargetLaneIndex == DesiredLane);
+
+		if (bAlreadyAtTarget)
+		{
+			bPendingFinalEdgeForce = false;
+			FinalEdgeLaneForceWait = 0.0f;
+		}
+		else
+		{
+			const bool bRearSafe = IsLaneChangeRearSafe(DesiredLane, LaneChangeRearCheckDistance);
+			FinalEdgeLaneForceWait += DeltaTime;
+			const bool bTimedOut = (FinalEdgeLaneForceWait >= FinalEdgeLaneForceMaxWait);
+
+			if (bRearSafe || bTimedOut)
+			{
+				TargetLaneIndex = DesiredLane;
+				bIsChangingLane = true;
+				bPendingFinalEdgeForce = false;
+
+				LogEvent(FString::Printf(
+					TEXT("FINAL-EDGE LANE apply (lane=%d, %s, wait=%.1fs)"),
+					DesiredLane,
+					bRearSafe ? TEXT("rear-safe") : TEXT("TIMEOUT-FORCED"),
+					FinalEdgeLaneForceWait));
+
+				FinalEdgeLaneForceWait = 0.0f;
+			}
+		}
+	}
+
+	// ================================================================
 	//  0. 方向燈 + 自動換道（預計算，不依賴距離門檻）
 	//     Turn signal + auto lane change (precomputed, no distance threshold)
 	// ================================================================
@@ -2599,12 +2642,36 @@ void URoadPathFollowerComponent::TickComponent(
 
 			if (DesiredLane != TargetLaneIndex && CurLaneCount > 1)
 			{
-				RequestLaneChange(DesiredLane);
-				UE_LOG(LogTemp, Warning,
-					TEXT("PathFollower: Auto lane change → Lane %d for %s turn (junction in %.0f cm)"),
-					DesiredLane,
-					(UpcomingTurn == ETurnSignal::Left) ? TEXT("LEFT") : TEXT("RIGHT"),
-					DistToJunction);
+				// Rear safety gate: don't cut in front of a car behind us in
+				// the target lane. When the junction is close enough we have
+				// to commit anyway (else we'll miss the turn), so the distance
+				// also acts as a "forced" window.
+				const float ForceCommitDist = AutoLaneChangeDistance * 0.4f;
+				const bool bRearSafe = IsLaneChangeRearSafe(DesiredLane, LaneChangeRearCheckDistance);
+				const bool bMustCommit = (DistToJunction < ForceCommitDist);
+
+				if (bRearSafe || bMustCommit)
+				{
+					RequestLaneChange(DesiredLane);
+					UE_LOG(LogTemp, Warning,
+						TEXT("PathFollower: Auto lane change → Lane %d for %s turn (junction in %.0f cm, %s)"),
+						DesiredLane,
+						(UpcomingTurn == ETurnSignal::Left) ? TEXT("LEFT") : TEXT("RIGHT"),
+						DistToJunction,
+						bRearSafe ? TEXT("rear-safe") : TEXT("FORCED-near-junction"));
+				}
+				else
+				{
+					// Throttled log so we don't spam while patiently waiting.
+					const float NowT = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+					if (NowT - LastAutoLaneRearBlockLogTime > 2.0f)
+					{
+						LastAutoLaneRearBlockLogTime = NowT;
+						LogEvent(FString::Printf(
+							TEXT("LANE-CHANGE WAIT: rear traffic in lane %d (junction %.0fm)"),
+							DesiredLane, DistToJunction * 0.01f));
+					}
+				}
 			}
 		}
 	}
@@ -3706,6 +3773,75 @@ bool URoadPathFollowerComponent::IsRearClearOfVehicles(AActor*& OutRearVehicle) 
 }
 
 // ============================================================================
+//  IsLaneChangeRearSafe — sphere-sweep BACKWARD in the target lane to check
+//  whether a vehicle is approaching us from behind in that lane. Called
+//  before every lane change (overtake start, overtake return, final-edge
+//  force, departure-curve exit) so we don't cut in front of another car.
+//
+//  Implementation: sample the current segment's spline at
+//  (ReferenceDistance - CheckDistance) using the TARGET lane's lateral
+//  offset, then sweep a sphere FROM there TO our current spline point
+//  (also in the target lane). If the sweep hits another PathFollower,
+//  the rear is not safe. Self is ignored.
+// ============================================================================
+bool URoadPathFollowerComponent::IsLaneChangeRearSafe(
+	int32 InTargetLaneIndex, float CheckDistance) const
+{
+	UWorld* World = GetWorld();
+	AActor* Owner = GetOwner();
+	if (!World || !Owner) return true;
+	if (!PathSegments.IsValidIndex(CurrentSegmentIndex)) return true;
+
+	const FPathSegmentInternal& Seg = PathSegments[CurrentSegmentIndex];
+	if (!IsValid(Seg.Spline)) return true;
+
+	const float TargetOffset = ComputeTargetLaneOffset(InTargetLaneIndex);
+
+	// Spline distance "behind" me, respecting segment direction (+1 / -1).
+	const float SegLo = FMath::Min(Seg.StartDist, Seg.EndDist);
+	const float SegHi = FMath::Max(Seg.StartDist, Seg.EndDist);
+	float BehindAbs = ReferenceDistance - Seg.Direction * CheckDistance;
+	BehindAbs = FMath::Clamp(BehindAbs, SegLo, SegHi);
+
+	FVector BehindPos, BehindDir, BehindRight;
+	SampleSplineAtDist(Seg, BehindAbs, TargetOffset,
+		BehindPos, BehindDir, BehindRight);
+
+	FVector CurPos, CurDir, CurRight;
+	SampleSplineAtDist(Seg, ReferenceDistance, TargetOffset,
+		CurPos, CurDir, CurRight);
+
+	const FVector Start = BehindPos + FVector(0.0f, 0.0f, ObstacleTraceZOffset);
+	const FVector End   = CurPos   + FVector(0.0f, 0.0f, ObstacleTraceZOffset);
+
+	// Degenerate sweep (segment too short to project CheckDistance back) →
+	// not enough info, treat as safe so we don't block forever on a tiny
+	// final edge.
+	if (FVector::DistSquared(Start, End) < 1.0f) return true;
+
+	TArray<FHitResult> Hits;
+	FCollisionQueryParams Params;
+	Params.AddIgnoredActor(Owner);
+
+	World->SweepMultiByChannel(Hits, Start, End, FQuat::Identity,
+		ECC_ObstacleDetect,
+		FCollisionShape::MakeSphere(LaneChangeRearCheckRadius), Params);
+
+	for (const FHitResult& H : Hits)
+	{
+		AActor* A = H.GetActor();
+		if (!A || A == Owner) continue;
+		// Only other vehicles block us. Static geometry, signals etc. are
+		// irrelevant for rear-lane safety.
+		if (A->FindComponentByClass<URoadPathFollowerComponent>())
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+// ============================================================================
 //  Walk forward along the stuck chain via each vehicle's ObstacleActor link.
 //  OutChain is filled tail→head (index 0 = me, last = leader).
 // ============================================================================
@@ -3787,6 +3923,141 @@ bool URoadPathFollowerComponent::IsChainLeader() const
 	}
 	// Depth exhausted — conservatively say no (prevents runaway).
 	return false;
+}
+
+// ============================================================================
+//  FindChainReverser — walk forward along the stuck chain and decide who
+//  should reverse to break the deadlock.
+//
+//  Why this exists (vs. IsChainLeader):
+//    IsChainLeader returns bool "am I the leader". It gates each car's
+//    decision to reverse, but it has two blind spots:
+//      (a) 3+ car CYCLES at a junction are a bool-true for exactly one car
+//          (the FName-smallest), but the OTHER two cars only yield. They
+//          depend on the leader reversing + its rear-chain cascade covering
+//          them. That mostly works, BUT cascade only kicks in AFTER the
+//          leader crosses StuckRecoveryDelay — at junctions they can sit
+//          longer than that because IsChainLeader's walk may terminate
+//          early (e.g., a link breaks because one car briefly moved >5cm/s).
+//      (b) "Zombie head" chains: the chain terminates at a stopped car
+//          whose FORWARD has no vehicle (lost path, failed junction gap,
+//          etc.). That head never enters Phase 1 because the Phase 1 gate
+//          requires bFrontIsVehicle. Followers walk to it, see "head has
+//          no obstacle", IsChainLeader returns false-for-them, and
+//          EVERYONE yields forever.
+//
+//  This function returns the car that should actually reverse, OR nullptr
+//  if the situation is self-resolving (front is moving, waiting for red
+//  light, etc.). Callers are expected to trigger the returned reverser +
+//  cascade its rear chain.
+// ============================================================================
+URoadPathFollowerComponent* URoadPathFollowerComponent::FindChainReverser(
+	TArray<URoadPathFollowerComponent*>& OutChainGroup,
+	FString& OutReason) const
+{
+	OutChainGroup.Reset();
+	OutReason.Reset();
+
+	TSet<URoadPathFollowerComponent*> Visited;
+	URoadPathFollowerComponent* Cur = const_cast<URoadPathFollowerComponent*>(this);
+
+	for (int32 Depth = 0; Depth < MaxChainWalkDepth; ++Depth)
+	{
+		if (!Cur)
+		{
+			OutReason = TEXT("null-cur");
+			return nullptr;
+		}
+
+		// ---- Cycle detected ----
+		if (Visited.Contains(Cur))
+		{
+			URoadPathFollowerComponent* Smallest = nullptr;
+			FString SmallestName;
+			for (URoadPathFollowerComponent* C : OutChainGroup)
+			{
+				if (!C || !C->GetOwner()) continue;
+				const FString N = C->GetOwner()->GetName();
+				if (!Smallest || N.Compare(SmallestName) < 0)
+				{
+					Smallest = C;
+					SmallestName = N;
+				}
+			}
+			OutReason = FString::Printf(TEXT("cycle-N=%d"), OutChainGroup.Num());
+			return Smallest;
+		}
+		Visited.Add(Cur);
+		OutChainGroup.Add(Cur);
+
+		// ---- Terminal: no ObstacleActor ----
+		// Head car has nothing in front. Either legitimately waiting
+		// (red light ahead, approaching junction, etc.) or zombie-stuck.
+		if (!Cur->ObstacleActor.IsValid())
+		{
+			const bool bCurStopped = (Cur->GetCurrentSpeed() < 5.0f);
+			const bool bBusy = Cur->IsStuckReversing() || Cur->StuckCooldownTimer > 0.0f;
+			if (bCurStopped && !bBusy)
+			{
+				// Zombie head — nothing visibly blocks it, but it's frozen.
+				// If this is the ONLY car (Depth==0, self-loop), don't
+				// trigger (I'd reverse myself for no reason). Only trigger
+				// when there's at least one follower (me) behind it.
+				if (Cur == this)
+				{
+					OutReason = TEXT("self-zombie");
+					return nullptr;  // Phase 1 gate already excludes me
+				}
+				OutReason = TEXT("zombie-head-no-obstacle");
+				return Cur;
+			}
+			OutReason = bBusy ? TEXT("head-reversing-or-cooldown") : TEXT("head-moving");
+			return nullptr;
+		}
+
+		AActor* FrontAct = Cur->ObstacleActor.Get();
+		URoadPathFollowerComponent* FrontPF = FrontAct
+			? FrontAct->FindComponentByClass<URoadPathFollowerComponent>()
+			: nullptr;
+
+		// ---- Terminal: non-vehicle obstacle (static / signal) ----
+		if (!FrontPF)
+		{
+			const EFrontObstacleType FT = Cur->ClassifyFrontObstacle();
+			const bool bCurStopped = (Cur->GetCurrentSpeed() < 5.0f);
+			const bool bBusy = Cur->IsStuckReversing() || Cur->StuckCooldownTimer > 0.0f;
+
+			if (FT == EFrontObstacleType::TrafficSignal)
+			{
+				OutReason = TEXT("head-at-traffic-signal");
+				return nullptr;  // legit wait
+			}
+			if (FT == EFrontObstacleType::Static && bCurStopped && !bBusy)
+			{
+				if (Cur == this)
+				{
+					OutReason = TEXT("self-static");
+					return nullptr;  // let the static-escape path handle me
+				}
+				OutReason = TEXT("zombie-head-static");
+				return Cur;
+			}
+			OutReason = TEXT("head-misc");
+			return nullptr;
+		}
+
+		// ---- Front vehicle is moving → chain will clear on its own ----
+		if (FrontPF->GetCurrentSpeed() >= 5.0f)
+		{
+			OutReason = TEXT("front-moving");
+			return nullptr;
+		}
+
+		Cur = FrontPF;
+	}
+
+	OutReason = TEXT("depth-exhausted");
+	return nullptr;
 }
 
 // ============================================================================
@@ -3959,21 +4230,26 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 		AActor* RearVehicle = nullptr;
 		if (!IsRearClearOfVehicles(RearVehicle))
 		{
+			const float PrevAccum = RearWaitAccum;
 			RearWaitAccum += DeltaTime;
 			if (RearWaitAccum < RearWaitMaxSec)
 			{
 				CurrentSpeed = 0.0f;
-				if (RearWaitAccum - DeltaTime <= 0.05f)  // first frame blocked
+				if (PrevAccum <= 0.05f)  // first frame blocked
 				{
 					LogEvent(FString::Printf(TEXT("REVERSE BLOCKED by rear=%s (waiting...)"),
 						RearVehicle ? *RearVehicle->GetName() : TEXT("?")));
 				}
 				return;
 			}
-			// Timeout → force through. Log once.
-			LogEvent(FString::Printf(TEXT("REVERSE FORCED (rear-wait %.1fs timeout, rear=%s)"),
-				RearWaitAccum,
-				RearVehicle ? *RearVehicle->GetName() : TEXT("?")));
+			// Timeout → force through. Log ONCE (first frame we cross the
+			// timeout boundary), not every frame while still blocked.
+			if (PrevAccum < RearWaitMaxSec)
+			{
+				LogEvent(FString::Printf(TEXT("REVERSE FORCED (rear-wait %.1fs timeout, rear=%s)"),
+					RearWaitAccum,
+					RearVehicle ? *RearVehicle->GetName() : TEXT("?")));
+			}
 		}
 		else
 		{
@@ -4106,6 +4382,59 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 				*ObstacleActor->GetName(), ObstacleDistance));
 		}
 
+		// ================================================================
+		// TOP PRIORITY — EMERGENCY OVERLAP (Obstacle: 0 cm against Vehicle).
+		// Physically touching another car is the most severe stuck state.
+		// Fires IMMEDIATELY, bypassing mutual / cycle / chain-leader / delay.
+		// Typical cause: a car cut lanes right in front, so we hit its
+		// rear bumper with 0 separation.
+		// Only deferrals:
+		//   * Already reversing / in cooldown → skip (we're handling it).
+		//   * Front car already reversing → let it separate us first.
+		// Otherwise: reverse NOW + cascade my rear chain so we unpack
+		// cleanly.
+		// ================================================================
+		if (!bIsStuckReversing && StuckCooldownTimer <= 0.0f
+			&& ObstacleDistance < EmergencyOverlapDistance)
+		{
+			AActor* FA_Emerg = ObstacleActor.Get();
+			URoadPathFollowerComponent* FPF_Emerg = FA_Emerg
+				? FA_Emerg->FindComponentByClass<URoadPathFollowerComponent>() : nullptr;
+
+			const bool bFrontAlreadyHandling = FPF_Emerg
+				&& (FPF_Emerg->IsStuckReversing() || FPF_Emerg->StuckCooldownTimer > 0.0f);
+
+			if (!bFrontAlreadyHandling)
+			{
+				// Drag my rear chain along so we all separate together.
+				TArray<URoadPathFollowerComponent*> MyRear;
+				const int32 MyRearN = CountStoppedRearChain(MyRear);
+
+				UE_LOG(LogTemp, Warning,
+					TEXT("[STUCK] OVERLAP-EMERGENCY: %s [%s] touching %s @ %.0fcm (rearN=%d) → reverse NOW"),
+					*Owner->GetName(), *GetManeuverLabel(),
+					FA_Emerg ? *FA_Emerg->GetName() : TEXT("?"),
+					ObstacleDistance, MyRearN);
+				LogEvent(FString::Printf(
+					TEXT("OVERLAP-EMERGENCY: me[%s] @ %.0fcm vs %s (rearN=%d) → reverse"),
+					*GetManeuverLabel(), ObstacleDistance,
+					FA_Emerg ? *FA_Emerg->GetName() : TEXT("?"),
+					MyRearN));
+
+				// Mark resolved so MUTUAL / N-CYCLE don't double-fire on us.
+				bMutualStuckResolved = true;
+				TriggerStuckReverse(-1.0f, TEXT("overlap-emergency-0cm"));
+				for (URoadPathFollowerComponent* RC : MyRear)
+				{
+					if (RC && !RC->IsStuckReversing())
+					{
+						RC->TriggerStuckReverse(-1.0f, TEXT("overlap-emergency-cascade"));
+					}
+				}
+				return;
+			}
+		}
+
 		// ============================================================
 		// MUTUAL-STUCK fast-path — fires IMMEDIATELY (no delay wait)
 		// when A.front = B AND B.front = A. This is the only case that
@@ -4174,6 +4503,80 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 			return;
 		}
 
+		// ============================================================
+		// N-CYCLE fast-path — 3+ cars going A→B→C→A round-and-round at
+		// a junction. MUTUAL above only catches the 2-car case. We detect
+		// the cycle here and fire the same single-resolver pattern.
+		// Condition: my forward walk returns to me (cycle), every member
+		// is stopped, and no one in the cycle is already reversing.
+		// ============================================================
+		if (!bIsStuckReversing && !bMutualStuckResolved)
+		{
+			TArray<URoadPathFollowerComponent*> CycleGroup;
+			FString CycleReason;
+			URoadPathFollowerComponent* CycleRev = FindChainReverser(CycleGroup, CycleReason);
+
+			const bool bIsCycle = CycleReason.StartsWith(TEXT("cycle-N="))
+				&& CycleGroup.Num() >= 3 && CycleRev;
+
+			if (bIsCycle)
+			{
+				// Verify entire cycle is inert (stopped, not reversing, not cooling).
+				bool bAllInert = true;
+				for (URoadPathFollowerComponent* C : CycleGroup)
+				{
+					if (!C) { bAllInert = false; break; }
+					if (C->GetCurrentSpeed() >= 5.0f) { bAllInert = false; break; }
+					if (C->IsStuckReversing())       { bAllInert = false; break; }
+					if (C->StuckCooldownTimer > 0.0f){ bAllInert = false; break; }
+					if (C->bMutualStuckResolved)     { bAllInert = false; break; }
+				}
+
+				if (bAllInert)
+				{
+					// Mark every cycle member resolved so the resolver runs once.
+					for (URoadPathFollowerComponent* C : CycleGroup)
+					{
+						if (C) C->bMutualStuckResolved = true;
+					}
+
+					// Rear chain for the chosen reverser (drag followers with it).
+					TArray<URoadPathFollowerComponent*> RevRear;
+					const int32 RevRearN = CycleRev->CountStoppedRearChain(RevRear);
+
+					// Build a compact member-list for the log (maneuver labels).
+					FString Members;
+					for (int32 i = 0; i < CycleGroup.Num(); ++i)
+					{
+						if (i > 0) Members += TEXT(" → ");
+						Members += FString::Printf(TEXT("%s[%s]"),
+							*CycleGroup[i]->GetOwner()->GetName(),
+							*CycleGroup[i]->GetManeuverLabel());
+					}
+
+					UE_LOG(LogTemp, Warning,
+						TEXT("[STUCK] N-CYCLE N=%d: %s => %s reverses (rearN=%d)"),
+						CycleGroup.Num(), *Members,
+						*CycleRev->GetOwner()->GetName(), RevRearN);
+
+					LogEvent(FString::Printf(
+						TEXT("N-CYCLE(%d): %s → %s reverses"),
+						CycleGroup.Num(), *Members,
+						*CycleRev->GetOwner()->GetName()));
+
+					CycleRev->TriggerStuckReverse(-1.0f, TEXT("n-cycle-smallest-name"));
+					for (URoadPathFollowerComponent* RC : RevRear)
+					{
+						if (RC && !RC->IsStuckReversing())
+						{
+							RC->TriggerStuckReverse(-1.0f, TEXT("n-cycle-rear-cascade"));
+						}
+					}
+					return;
+				}
+			}
+		}
+
 		if (StuckTimer >= StuckRecoveryDelay)
 		{
 			// Chain-aware classification:
@@ -4194,14 +4597,85 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 				}
 			};
 
-			if (!IsChainLeader())
+			// ============================================================
+			// Chain resolver: walk forward, find the car that should reverse.
+			// FindChainReverser handles:
+			//   * Pure cycles (N≥3) — but those are typically caught earlier
+			//     by the N-CYCLE fast-path. If they reach here it's because
+			//     the cycle wasn't inert (someone moved briefly) — re-check.
+			//   * Zombie-head chains — head has no ObstacleActor itself (so
+			//     Phase 1 never runs for IT), but is stopped. Followers must
+			//     trigger it externally.
+			//   * Moving front / red-light — returns nullptr (we yield).
+			// ============================================================
+			TArray<URoadPathFollowerComponent*> ChainGroup;
+			FString ChainReason;
+			URoadPathFollowerComponent* Reverser = FindChainReverser(ChainGroup, ChainReason);
+
+			if (!Reverser)
 			{
-				// I'm mid-chain — yield to the leader. Don't drain the timer
-				// completely so I'm still primed once the front clears.
-				ThrottledYieldLog(TEXT("not chain leader"));
+				// Legitimate wait — front moving, red light, someone already
+				// reversing, etc. Keep the timer primed so we react quickly
+				// once the situation resolves.
+				ThrottledYieldLog(*FString::Printf(TEXT("no-reverser (%s)"), *ChainReason));
 				StuckTimer = FMath::Min(StuckTimer, StuckRecoveryDelay);
 				return;
 			}
+
+			if (Reverser != this)
+			{
+				// Someone else in the chain is the designated reverser. Two
+				// subcases:
+				//   (A) Reverser is in Phase 1 itself → it will trigger on
+				//       its own timer. I just yield and wait for the cascade.
+				//   (B) Reverser is a "zombie head" that can't self-trigger
+				//       (no ObstacleActor, or front is static). Its own
+				//       Phase 1 gate rejects it, so I must trigger it from
+				//       HERE and cascade its rear chain (which includes me).
+				// ChainReason tells us which branch.
+				const bool bZombie = ChainReason.StartsWith(TEXT("zombie-head-"));
+
+				if (bZombie && !Reverser->IsStuckReversing()
+					&& Reverser->StuckCooldownTimer <= 0.0f)
+				{
+					TArray<URoadPathFollowerComponent*> RevRear;
+					const int32 RevRearN = Reverser->CountStoppedRearChain(RevRear);
+
+					UE_LOG(LogTemp, Warning,
+						TEXT("[STUCK] ZOMBIE-HEAD trigger: %s triggers %s [%s, rearN=%d] reason=%s"),
+						*Owner->GetName(),
+						*Reverser->GetOwner()->GetName(),
+						*Reverser->GetManeuverLabel(),
+						RevRearN,
+						*ChainReason);
+					LogEvent(FString::Printf(
+						TEXT("ZOMBIE-HEAD: %s → %s [%s,r=%d] (%s)"),
+						*Owner->GetName(),
+						*Reverser->GetOwner()->GetName(),
+						*Reverser->GetManeuverLabel(),
+						RevRearN,
+						*ChainReason));
+
+					Reverser->TriggerStuckReverse(-1.0f, TEXT("zombie-head-ext-trigger"));
+					for (URoadPathFollowerComponent* RC : RevRear)
+					{
+						if (RC && !RC->IsStuckReversing())
+						{
+							RC->TriggerStuckReverse(-1.0f, TEXT("zombie-head-cascade"));
+						}
+					}
+					return;
+				}
+
+				// (A) Reverser will handle itself — just yield.
+				ThrottledYieldLog(*FString::Printf(
+					TEXT("yield to reverser=%s (%s)"),
+					*Reverser->GetOwner()->GetName(), *ChainReason));
+				StuckTimer = FMath::Min(StuckTimer, StuckRecoveryDelay);
+				return;
+			}
+
+			// Reverser == this → I commit to reversing (logic below).
 
 			const EFrontObstacleType FrontType = ClassifyFrontObstacle();
 
@@ -4509,8 +4983,11 @@ void URoadPathFollowerComponent::UpdateOvertakeLogic()
 		// Already in passing lane
 		if (PassingLane == CurrentLaneIndex) break;
 
-		// Passing lane is clear
+		// Passing lane is clear (forward)
 		if (!IsPassingLaneClear(PassingLane)) break;
+
+		// Passing lane rear is clear (don't cut in front of a faster car)
+		if (!IsLaneChangeRearSafe(PassingLane, LaneChangeRearCheckDistance)) break;
 
 		// Initiate overtake
 		PreOvertakeLaneIndex = CurrentLaneIndex;
@@ -4565,6 +5042,7 @@ void URoadPathFollowerComponent::UpdateOvertakeLogic()
 
 		const bool bTargetPast = IsTargetVehiclePast(OvertakeMinPassDistance);
 		const bool bOrigLaneClear = IsOriginalLaneClear(PreOvertakeLaneIndex, OvertakeSafeDistance);
+		const bool bOrigLaneRearSafe = IsLaneChangeRearSafe(PreOvertakeLaneIndex, LaneChangeRearCheckDistance);
 
 		// 如果被超車已消失（destroyed / too far / gone）— 退回 fallback：
 		// 以純距離累積 OvertakeSafeDistance 當作已超過。
@@ -4580,8 +5058,9 @@ void URoadPathFollowerComponent::UpdateOvertakeLogic()
 			OvertakePassedDistAccum = 0.0f;  // only counts when target lost
 		}
 
-		const bool bReadyByTarget = (bTargetPast && bOrigLaneClear);
-		const bool bReadyByFallback = (bTargetLost && OvertakePassedDistAccum >= OvertakeSafeDistance && bOrigLaneClear);
+		const bool bReadyByTarget = (bTargetPast && bOrigLaneClear && bOrigLaneRearSafe);
+		const bool bReadyByFallback = (bTargetLost && OvertakePassedDistAccum >= OvertakeSafeDistance
+			&& bOrigLaneClear && bOrigLaneRearSafe);
 
 		if (bReadyByTarget || bReadyByFallback)
 		{
@@ -4600,10 +5079,11 @@ void URoadPathFollowerComponent::UpdateOvertakeLogic()
 			CurrentTurnSignal = ETurnSignal::Right;
 
 			UE_LOG(LogTemp, Warning,
-				TEXT("PathFollower: OVERTAKE PASSED — returning to Lane %d (targetPast=%s origClear=%s fallback=%s)"),
+				TEXT("PathFollower: OVERTAKE PASSED — returning to Lane %d (targetPast=%s origClear=%s origRearSafe=%s fallback=%s)"),
 				PreOvertakeLaneIndex,
 				bTargetPast ? TEXT("Y") : TEXT("N"),
 				bOrigLaneClear ? TEXT("Y") : TEXT("N"),
+				bOrigLaneRearSafe ? TEXT("Y") : TEXT("N"),
 				bReadyByFallback ? TEXT("Y") : TEXT("N"));
 			LogEvent(FString::Printf(TEXT("OVERTAKE PASSED → return lane=%d"), PreOvertakeLaneIndex));
 		}
