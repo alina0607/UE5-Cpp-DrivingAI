@@ -160,13 +160,6 @@ void ATrafficManager::SpawnAllVehicles()
 
 			SpawnedVehicles.Add(Vehicle);
 
-			UE_LOG(LogTemp, Warning,
-				TEXT("TrafficManager: Spawned vehicle [%d] class=%s speed=%.0f at (%.0f,%.0f,%.0f)"),
-				SpawnedVehicles.Num() - 1,
-				*Config.VehicleClass->GetName(),
-				PF ? PF->MaxSpeed : 0.0f,
-				SP.Position.X, SP.Position.Y, SP.Position.Z);
-
 			// Short delay before assigning destination (let car settle at spawn)
 			FTimerHandle TimerHandle;
 			FTimerDelegate TimerDelegate;
@@ -200,9 +193,6 @@ void ATrafficManager::AssignRandomDestination(ADrivingVehiclePawn* Vehicle)
 		return;
 	}
 
-	// 初次出場用 RequestDepartToParkingLot（會做 spot 順序控管）；
-	// 若 HasDepartedFromSource 已為 true（已離開原 spot），後續重新導航就直接呼叫
-	// NavigateToParkingLot — gating 只對出場的那一次有意義。
 	auto DispatchNavigate = [&](AParkingLotActor* DestLot, int32 DestSpot)
 	{
 		if (PF->HasDepartedFromSource())
@@ -223,9 +213,6 @@ void ATrafficManager::AssignRandomDestination(ADrivingVehiclePawn* Vehicle)
 		const int32 AvailableSpot = Lot->FindAvailableSpot();
 		if (AvailableSpot != INDEX_NONE)
 		{
-			UE_LOG(LogTemp, Warning,
-				TEXT("TrafficManager: Vehicle → ParkingLot '%s' spot=%d"),
-				*Lot->ParkingLotName, AvailableSpot);
 			DispatchNavigate(Lot, AvailableSpot);
 			return;
 		}

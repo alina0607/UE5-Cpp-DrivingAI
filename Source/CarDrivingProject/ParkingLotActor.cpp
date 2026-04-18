@@ -13,7 +13,6 @@ AParkingLotActor::AParkingLotActor()
 	SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
 	RootComponent = SceneRoot;
 
-	// 建物 / 停車場地板 Mesh — 在 BP 裡設定 Static Mesh
 	// Building / parking floor mesh — set Static Mesh in BP
 	BuildingMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("BuildingMesh"));
 	BuildingMesh->SetupAttachment(SceneRoot);
@@ -55,16 +54,8 @@ void AParkingLotActor::CollectSpotArrows()
 	SpotCount = SpotArrows.Num();
 	SpotOccupied.SetNumZeroed(SpotCount);
 	SpotVehicles.SetNum(SpotCount);
-	SpotEdgeIds.Init(INDEX_NONE, SpotCount);  // 預設 INDEX_NONE，由 BindParkingActorsToEdges 填入
+	SpotEdgeIds.Init(INDEX_NONE, SpotCount);
 
-	UE_LOG(LogTemp, Warning, TEXT("ParkingLot '%s': Found %d ArrowComponents as parking spots"), *ParkingLotName, SpotCount);
-	for (int32 i = 0; i < SpotArrows.Num(); ++i)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("  Spot[%d] = '%s' at %s fwd=%s"),
-			i, *SpotArrows[i]->GetName(),
-			*SpotArrows[i]->GetComponentLocation().ToString(),
-			*SpotArrows[i]->GetForwardVector().ToString());
-	}
 }
 
 // ================================================================
@@ -150,9 +141,6 @@ void AParkingLotActor::AssignBoundEdge(int32 EdgeId, const FVector& ProjectionPo
 		SpotEdgeIds[i] = EdgeId;
 	}
 
-	UE_LOG(LogTemp, Warning,
-		TEXT("[PARK-NAV] '%s' AssignBoundEdge EdgeId=%d ProjPt=(%.0f,%.0f,%.0f)"),
-		*ParkingLotName, EdgeId, ProjectionPoint.X, ProjectionPoint.Y, ProjectionPoint.Z);
 }
 
 // ================================================================
@@ -207,8 +195,6 @@ void AParkingLotActor::DetectRoadSide()
 		const float DotRight = FVector::DotProduct(ToLot, SplineRight);
 		bIsLeftSide = (DotRight < 0.0f);
 
-		UE_LOG(LogTemp, Log, TEXT("ParkingLot '%s': NearestEdge=%d, Side=%s"),
-			*ParkingLotName, BestEdgeId, bIsLeftSide ? TEXT("Left") : TEXT("Right"));
 	}
 }
 

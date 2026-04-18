@@ -1132,8 +1132,5 @@ int32 URoadNetworkSubsystem::FindNearestUTurnNode(int32 StartNodeId, int32 Exclu
     }
 
     // No valid U-turn node found — fallback: allow at StartNodeId anyway
-    UE_LOG(LogTemp, Warning,
-        TEXT("[U-TURN] No valid U-turn node found via BFS from Node %d — fallback to StartNodeId"),
-        StartNodeId);
     return StartNodeId;
 }

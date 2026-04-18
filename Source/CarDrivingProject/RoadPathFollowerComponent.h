@@ -167,6 +167,12 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Speed", meta = (ClampMin = "0"))
 	float BrakeDeceleration = 800.0f;
 
+	/// How quickly the target speed is allowed to RISE (FInterpTo rate).
+	/// Braking (target dropping) is always instant; this only smooths acceleration.
+	/// Lower = gentler start from stop (1.0–2.0); higher = snappier (5.0+).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Speed", meta = (ClampMin = "0.5", ClampMax = "20.0"))
+	float AccelerationSmoothRate = 2.5f;
+
 	/// Distance before end to start braking (cm)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Speed", meta = (ClampMin = "0"))
 	float BrakeDistance = 1500.0f;
@@ -512,6 +518,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane Change", meta = (ClampMin = "0.5"))
 	float LaneChangeRotInterpSpeed = 3.0f;
 
+	/// How fast the lateral-velocity steering component blends in at the START of a lane
+	/// change (FInterpTo rate).  Lower = softer initial turn-in; higher = snappier.
+	/// This controls the "first steer" feel — the moment the car nose first starts to turn.
+	/// Recommended range: 1.0 (very gentle) – 8.0 (nearly instant).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane Change", meta = (ClampMin = "0.5", ClampMax = "20.0"))
+	float LaneChangeSteerBlendRate = 3.0f;
+
 	/// Max seconds to wait for the rear lane to clear when forced to the outer
 	/// edge on the final segment. After this time the switch is committed anyway
 	/// so the car doesn't hang indefinitely.
@@ -756,6 +769,10 @@ private:
 	/// Current actual speed (cm/s)
 	float CurrentSpeed = 0.0f;
 
+	/// Low-pass filtered desired speed — rises slowly (AccelerationSmoothRate),
+	/// drops instantly so braking response is never delayed.
+	float SmoothedDesiredSpeed = 0.0f;
+
 	/// Current lateral offset (cm) — interpolating, may differ from target lane
 	float CurrentLateralOffset = 0.0f;
 
@@ -764,6 +781,9 @@ private:
 
 	/// Whether a lane change is in progress
 	bool bIsChangingLane = false;
+
+	/// Smoothed lateral velocity used for heading blend-in (avoids first-frame snap)
+	float SmoothedLateralVel = 0.0f;
 
 	bool bIsFollowing = false;
 	bool bPendingStart = false;
