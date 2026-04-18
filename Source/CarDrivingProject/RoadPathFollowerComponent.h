@@ -435,6 +435,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "1.0"))
 	float RearWaitMaxSec = 4.0f;
 
+	/// Distance threshold (cm) below which two touching vehicles are treated as a
+	/// hard overlap that must be resolved immediately (bypasses all delay gates).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "0.0"))
+	float EmergencyOverlapDistance = 20.0f;
+
 	/// Name of the actor tag ColliderSwitcher stamps on red-light blockers
 	static constexpr const TCHAR* TrafficSignalTagName = TEXT("TrafficSignal");
 
@@ -473,6 +478,24 @@ public:
 	/// Safety check distance for passing lane (cm)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Overtaking", meta = (ClampMin = "500"))
 	float OvertakeLateralCheckDistance = 2000.0f;
+
+	// ================================================================
+	//  Lane Change — Rear Safety
+	// ================================================================
+
+	/// How far behind (cm) to sweep for vehicles before any lane change
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane Change", meta = (ClampMin = "200"))
+	float LaneChangeRearCheckDistance = 800.0f;
+
+	/// Sphere radius (cm) used in the rear-safety sweep
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane Change", meta = (ClampMin = "20"))
+	float LaneChangeRearCheckRadius = 120.0f;
+
+	/// Max seconds to wait for the rear lane to clear when forced to the outer
+	/// edge on the final segment. After this time the switch is committed anyway
+	/// so the car doesn't hang indefinitely.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane Change", meta = (ClampMin = "1.0"))
+	float FinalEdgeLaneForceMaxWait = 4.0f;
 
 	// ================================================================
 	//  Maneuver Caution (U-turn / L-turn / R-turn / parking exit)
@@ -890,6 +913,19 @@ private:
 	/// @return true if no vehicle within RearClearDistance (safe to reverse)
 	bool IsRearClearOfVehicles(AActor*& OutRearVehicle) const;
 
+	/// Sweep backward in the target lane to check for an approaching vehicle.
+	/// Returns false (NOT safe) if a PathFollower is found within CheckDistance.
+	/// Called before every lane change to avoid cutting in front of rear traffic.
+	bool IsLaneChangeRearSafe(int32 InTargetLaneIndex, float CheckDistance) const;
+
+	/// Walk forward along the stuck chain and decide who should reverse to
+	/// break the deadlock (cycle, zombie-head, etc.).  Returns the reverser,
+	/// or nullptr if the situation is self-resolving.  OutChainGroup is filled
+	/// with every member of the detected group; OutReason is a short tag.
+	URoadPathFollowerComponent* FindChainReverser(
+		TArray<URoadPathFollowerComponent*>& OutChainGroup,
+		FString& OutReason) const;
+
 	/// Walk forward along (ObstacleActor→PF) links until the chain terminates
 	/// (no front, front is not stuck, or depth exceeded). Fills OutChain from
 	/// tail (me) to head (leader). Returns true if the walk terminated cleanly.
@@ -1013,6 +1049,20 @@ public:
 private:
 	/// True once we've entered the last segment of the path (bound edge).
 	bool bIsFinalEdge = false;
+
+	// ---- Final-edge deferred lane force (rear-safe) ----
+
+	/// True while a final-edge outer-lane force is pending rear-safety confirmation.
+	bool bPendingFinalEdgeForce = false;
+
+	/// Target lane for the pending final-edge force.
+	int32 PendingFinalEdgeTargetLane = 0;
+
+	/// Accumulated wait time for the pending final-edge lane force (seconds).
+	float FinalEdgeLaneForceWait = 0.0f;
+
+	/// Last time we logged "auto-lane change blocked by rear traffic" (throttle).
+	float LastAutoLaneRearBlockLogTime = -999.0f;
 
 	/// Called right after CurrentSegmentIndex is advanced — handles final-edge prep.
 	void HandleEnteredNewSegment();
