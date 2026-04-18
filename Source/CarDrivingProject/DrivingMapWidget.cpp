@@ -80,23 +80,43 @@ void UDrivingMapWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTim
 	{
 		UpdateFreeCamera(InDeltaTime);
 	}
-	// ---- Follow mode: RMB drag to orbit CameraBoom ----
+	// ---- Follow mode: RMB drag to orbit CameraBoom + scroll to zoom ----
 	else if (!bFreeCameraMode && SelectedVehiclePtr.IsValid() && !bIsFullscreen)
 	{
 		if (APlayerController* PC = GetOwningPlayer())
 		{
+			USpringArmComponent* Boom = SelectedVehiclePtr->FindComponentByClass<USpringArmComponent>();
+
+			// RMB orbit
 			if (PC->IsInputKeyDown(EKeys::RightMouseButton))
 			{
 				float DeltaX, DeltaY;
 				PC->GetInputMouseDelta(DeltaX, DeltaY);
 
-				USpringArmComponent* Boom = SelectedVehiclePtr->FindComponentByClass<USpringArmComponent>();
 				if (Boom)
 				{
 					FRotator BoomRot = Boom->GetRelativeRotation();
 					BoomRot.Yaw += DeltaX * OrbitSensitivity;
 					BoomRot.Pitch = FMath::Clamp(BoomRot.Pitch + DeltaY * OrbitSensitivity, -80.0f, -5.0f);
 					Boom->SetRelativeRotation(BoomRot);
+				}
+			}
+
+			// Scroll wheel zoom (widget is HitTestInvisible here so NativeOnMouseWheel
+			// never fires — poll the PC directly instead)
+			if (Boom)
+			{
+				if (PC->WasInputKeyJustPressed(EKeys::MouseScrollUp))
+				{
+					Boom->TargetArmLength = FMath::Clamp(
+						Boom->TargetArmLength - ZoomSpeed,
+						MinFollowDistance, MaxFollowDistance);
+				}
+				else if (PC->WasInputKeyJustPressed(EKeys::MouseScrollDown))
+				{
+					Boom->TargetArmLength = FMath::Clamp(
+						Boom->TargetArmLength + ZoomSpeed,
+						MinFollowDistance, MaxFollowDistance);
 				}
 			}
 		}
@@ -787,6 +807,9 @@ void UDrivingMapWidget::SelectVehicle(AActor* Vehicle)
 	if (APlayerController* PC = GetOwningPlayer())
 	{
 		PC->SetViewTargetWithBlend(Vehicle, 0.5f);
+		// Hide cursor only when minimap mode (fullscreen map still needs cursor to click)
+		if (!bIsFullscreen)
+			PC->bShowMouseCursor = false;
 	}
 }
 
@@ -826,6 +849,9 @@ void UDrivingMapWidget::DeselectVehicle()
 	{
 		if (FreeCameraActor)
 			PC->SetViewTargetWithBlend(FreeCameraActor, 0.3f);
+
+		// Free camera always shows the cursor
+		PC->bShowMouseCursor = true;
 	}
 }
 
