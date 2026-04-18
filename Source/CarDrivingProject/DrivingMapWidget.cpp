@@ -26,6 +26,7 @@ void UDrivingMapWidget::NativeConstruct()
 	SetVisibility(ESlateVisibility::HitTestInvisible);
 	BuildNodeCache();
 	InitFreeCamera();
+	bShowLogPanel = true;
 }
 
 void UDrivingMapWidget::NativeDestruct()
@@ -172,6 +173,14 @@ void UDrivingMapWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTim
 			}
 		}
 	}
+
+	if (APlayerController* PC = GetOwningPlayer())
+	{
+		if (PC->WasInputKeyJustPressed(EKeys::P))
+		{
+			bShowLogPanel = !bShowLogPanel;
+		}
+	}
 }
 
 // ================================================================
@@ -256,7 +265,7 @@ int32 UDrivingMapWidget::NativePaint(
 
 		bool bSelected = Vehicle.Actor.IsValid() && (Vehicle.Actor == SelectedVehiclePtr);
 		FLinearColor Color = bSelected ? SelectedColor : VehicleColor;
-		float ArrowSize = bIsFullscreen ? 10.0f : 7.0f;
+		float ArrowSize = bIsFullscreen ? 7.0f : 5.0f;
 
 		if (bSelected)
 		{
@@ -526,29 +535,31 @@ int32 UDrivingMapWidget::NativePaint(
 					}
 				}
 			}
-
-			// ---- Recent events (stuck / overtake / depart / segment) ----
-			TextY += LineH * 0.8f;
-			DrawPanelLine(TEXT("--- Recent Events ---"), TitleColor);
-			TextY += LineH * 0.2f;
-			{
-				const TArray<FString>& Events = PF->GetRecentEvents();
-				// Smaller font for log entries so more history fits.
-				FSlateFontInfo LogFont = FAppStyle::GetFontStyle("NormalFont");
-				LogFont.Size = FMath::Max(8, static_cast<int32>(8.0f * InfoPanelFontScale));
-				const float LogLineH = 16.0f * InfoPanelFontScale;
-				const FLinearColor LogColor(0.85f, 0.9f, 1.0f, 0.95f);
-				// Draw newest first — iterate backwards.
-				for (int32 i = Events.Num() - 1; i >= 0; --i)
+			if (bShowLogPanel) {
+				// ---- Recent events (stuck / overtake / depart / segment) ----
+				TextY += LineH * 0.8f;
+				DrawPanelLine(TEXT("--- Recent Events ---"), TitleColor);
+				TextY += LineH * 0.2f;
 				{
-					FSlateDrawElement::MakeText(OutDrawElements, LayerId + 2,
-						AllottedGeometry.ToPaintGeometry(
-							FVector2f(PanelWidth - 30.0f, LogLineH),
-							FSlateLayoutTransform(FVector2f(TextX, TextY))),
-						Events[i], LogFont, ESlateDrawEffect::None, LogColor);
-					TextY += LogLineH;
-					if (TextY > PanelTopY + PanelHeight - LogLineH) break;
+					const TArray<FString>& Events = PF->GetRecentEvents();
+					// Smaller font for log entries so more history fits.
+					FSlateFontInfo LogFont = FAppStyle::GetFontStyle("NormalFont");
+					LogFont.Size = FMath::Max(8, static_cast<int32>(8.0f * InfoPanelFontScale));
+					const float LogLineH = 16.0f * InfoPanelFontScale;
+					const FLinearColor LogColor(0.85f, 0.9f, 1.0f, 0.95f);
+					// Draw newest first — iterate backwards.
+					for (int32 i = Events.Num() - 1; i >= 0; --i)
+					{
+						FSlateDrawElement::MakeText(OutDrawElements, LayerId + 2,
+							AllottedGeometry.ToPaintGeometry(
+								FVector2f(PanelWidth - 30.0f, LogLineH),
+								FSlateLayoutTransform(FVector2f(TextX, TextY))),
+							Events[i], LogFont, ESlateDrawEffect::None, LogColor);
+						TextY += LogLineH;
+						if (TextY > PanelTopY + PanelHeight - LogLineH) break;
+					}
 				}
+
 			}
 
 			TextY += LineH * 0.8f;
@@ -735,6 +746,12 @@ void UDrivingMapWidget::ToggleMapSize()
 	if (!bIsFullscreen) HoveredParkingLot = nullptr;
 
 	SetVisibility(bIsFullscreen ? ESlateVisibility::Visible : ESlateVisibility::HitTestInvisible);
+
+	// Fullscreen always needs cursor; minimap shows cursor only in free camera mode
+	if (APlayerController* PC = GetOwningPlayer())
+	{
+		PC->bShowMouseCursor = bIsFullscreen || bFreeCameraMode;
+	}
 }
 
 void UDrivingMapWidget::SelectVehicle(AActor* Vehicle)
@@ -970,7 +987,7 @@ void UDrivingMapWidget::GetMapDrawRect(
 		FullSize.X = WidgetSize.X * 0.55;
 		FullSize.Y = WidgetSize.Y * FullscreenCoverage;
 		const float MarginY = (WidgetSize.Y - FullSize.Y) * 0.5;
-		const float MarginX = WidgetSize.X * 0.03;
+		const float MarginX = 0.0f;
 		OutOrigin = FVector2D(MarginX, MarginY);
 		OutSize = FullSize;
 	}

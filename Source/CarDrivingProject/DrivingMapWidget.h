@@ -235,7 +235,7 @@ protected:
 
 private:
 
-
+	bool bShowLogPanel;
 
 	// ---- Cache ----
 

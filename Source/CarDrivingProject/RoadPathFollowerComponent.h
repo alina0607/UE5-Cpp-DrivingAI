@@ -440,6 +440,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "0.0"))
 	float EmergencyOverlapDistance = 20.0f;
 
+	/// Distance threshold (cm) below which same-direction cars are treated as
+	/// overlapping rather than normal following (used in overlap-emergency logic).
+	UPROPERTY(EditAnywhere, Category = "StuckRecovery")
+	float OverlapSeparationThreshold = 200.0f;
+
 	/// Name of the actor tag ColliderSwitcher stamps on red-light blockers
 	static constexpr const TCHAR* TrafficSignalTagName = TEXT("TrafficSignal");
 
@@ -490,6 +495,22 @@ public:
 	/// Sphere radius (cm) used in the rear-safety sweep
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane Change", meta = (ClampMin = "20"))
 	float LaneChangeRearCheckRadius = 120.0f;
+
+	/// How far ahead (cm) to sweep in the TARGET lane before committing to a lane
+	/// change. If a vehicle is found within this distance, the change is blocked.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane Change", meta = (ClampMin = "100"))
+	float LaneChangeFrontCheckDistance = 1500.0f;
+
+	/// FInterpTo rate for lateral offset during a lane change.
+	/// Lower = slower, more natural car-like weave (1.5–3.0 recommended).
+	/// Replaces the old constant-rate FInterpConstantTo.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane Change", meta = (ClampMin = "0.1", ClampMax = "20.0"))
+	float LaneChangeSmoothRate = 2.0f;
+
+	/// Rotation interp speed while a lane change is active.
+	/// Lower than RotationInterpSpeed → heading turns more gradually, like a real car.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Lane Change", meta = (ClampMin = "0.5"))
+	float LaneChangeRotInterpSpeed = 3.0f;
 
 	/// Max seconds to wait for the rear lane to clear when forced to the outer
 	/// edge on the final segment. After this time the switch is committed anyway
@@ -838,6 +859,44 @@ private:
 	/// Timer for throttled obstacle detection when blocked
 	float ObstacleThrottleTimer = 0.0f;
 
+	/// Accumulates seconds while ObstacleDistance < EmergencyOverlapDistance.
+	/// When it exceeds ZeroDistTeleportTimeout the car is teleported to its
+	/// destination to break an unresolvable deadlock.
+	float ZeroDistStuckTimer = 0.0f;
+
+	/// Accumulated 0-cm time (seconds) before the car teleports.
+	/// Non-continuous: timer only resets after ZeroDistClearTimeout of no 0cm.
+	UPROPERTY(EditAnywhere, Category = "StuckRecovery")
+	float ZeroDistTeleportTimeout = 1.0f;
+
+	/// Seconds without a 0-cm event required to reset ZeroDistStuckTimer.
+	/// Prevents timer from carrying over between genuinely-resolved incidents.
+	UPROPERTY(EditAnywhere, Category = "StuckRecovery")
+	float ZeroDistClearTimeout = 5.0f;
+
+	/// Tracks how long the car has been continuously clear of 0-cm obstacles.
+	float ZeroDistClearTimer = 0.0f;
+
+	/// Post-teleport grace timer: blocks ZeroDistStuckTimer accumulation for
+	/// ZeroDistTeleportGraceDuration seconds after every ZERO-DIST teleport.
+	/// Prevents the infinite re-teleport loop when the destination already has
+	/// another car parked at 0 cm.
+	float ZeroDistTeleportGraceTimer = 0.0f;
+
+	/// How long (seconds) after a ZERO-DIST teleport to suppress ZeroDistStuckTimer.
+	/// Must be long enough for the car to start moving away from the destination.
+	UPROPERTY(EditAnywhere, Category = "StuckRecovery")
+	float ZeroDistTeleportGraceDuration = 6.0f;
+
+	/// Timer handle for deferred re-navigation after a ZERO-DIST teleport-to-spot.
+	/// Fires after ZeroDistTeleportGraceDuration and calls SwitchToNewRandomDestination.
+	FTimerHandle ZeroDistReNavigateTimerHandle;
+
+	/// Called by ZeroDistReNavigateTimerHandle after the grace period.
+	/// Switches the car to a new random parking lot so it is never repeatedly
+	/// stuck at the same location.
+	void ZeroDistReNavigateCallback();
+
 	/// Front obstacle actor (for overtaking: distinguish vehicle vs traffic light)
 	UPROPERTY()
 	TWeakObjectPtr<AActor> ObstacleActor;
@@ -853,6 +912,12 @@ private:
 	/// merge point by DepartureLaneCheckDistance) for vehicles. Returns true if
 	/// no PathFollower-bearing actor is within the scan window.
 	bool IsDepartureLaneClear() const;
+
+	/// Walk forward along ObstacleActor links (up to MaxChainWalkDepth steps).
+	/// Returns true if any car in the chain (including this one) is blocked by
+	/// a TrafficSignal — meaning the entire chain is just waiting at a red light
+	/// and must NOT be teleported.
+	bool IsChainHeadBlockedBySignal() const;
 
 	/// Before committing to a LEFT-turn junction curve, scan the oncoming lane
 	/// of NextSeg for straight-through traffic. Returns true if clear (safe to turn).
@@ -917,6 +982,10 @@ private:
 	/// Returns false (NOT safe) if a PathFollower is found within CheckDistance.
 	/// Called before every lane change to avoid cutting in front of rear traffic.
 	bool IsLaneChangeRearSafe(int32 InTargetLaneIndex, float CheckDistance) const;
+
+	/// Forward sweep in the target lane: returns false if a PathFollower vehicle
+	/// is found ahead within CheckDistance. Blocks lane changes into occupied lanes.
+	bool IsTargetLaneFrontClear(int32 InTargetLaneIndex, float CheckDistance) const;
 
 	/// Walk forward along the stuck chain and decide who should reverse to
 	/// break the deadlock (cycle, zombie-head, etc.).  Returns the reverser,

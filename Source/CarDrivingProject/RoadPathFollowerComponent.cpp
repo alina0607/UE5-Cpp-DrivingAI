@@ -806,6 +806,34 @@ void URoadPathFollowerComponent::SwitchToNewRandomDestination()
 }
 
 // ============================================================================
+//  ZeroDistReNavigateCallback — fires after ZeroDistTeleportGraceDuration
+//  The car was teleported to its parking spot and has been sitting there for
+//  the grace period.  Now pick a completely new random destination so the car
+//  never returns to the same (potentially congested) spot it just escaped from.
+// ============================================================================
+void URoadPathFollowerComponent::ZeroDistReNavigateCallback()
+{
+	AActor* Owner = GetOwner();
+	if (!Owner) return;
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("[STUCK] %s: ZERO-DIST grace expired → switching to new random destination"),
+		*Owner->GetName());
+	LogEvent(TEXT("ZERO-DIST grace done → SwitchToNewRandomDestination"));
+
+	// Arm the in-tick grace timer so that if the new start location also has a
+	// car nearby, the ZeroDistStuckTimer won't fire immediately again.
+	ZeroDistTeleportGraceTimer = ZeroDistTeleportGraceDuration;
+	ZeroDistStuckTimer  = 0.0f;
+	ZeroDistClearTimer  = 0.0f;
+
+	// Pick a different parking lot and start navigating there.
+	// SwitchToNewRandomDestination releases the current spot, picks a new lot,
+	// and calls NavigateToParkingLot (which sets bIsFollowing = true).
+	SwitchToNewRandomDestination();
+}
+
+// ============================================================================
 //  SetDepartureContext — 標記這台車原本停在哪個停車場的哪一格
 //  Must be called at spawn BEFORE the first NavigateTo*.
 // ============================================================================
@@ -836,6 +864,33 @@ void URoadPathFollowerComponent::SetDepartureContext(AParkingLotActor* SourceLot
 bool URoadPathFollowerComponent::IsPerformingManeuver() const
 {
 	return bOnJunctionCurve || bOnParkingCurve || bOnDepartureCurve;
+}
+
+// ============================================================================
+//  IsChainHeadBlockedBySignal — walk ObstacleActor links forward; return true
+//  if any car in the chain (including this one) is directly blocked by a
+//  TrafficSignal.  Used to suppress teleport when the whole queue is just
+//  waiting at a red light.
+// ============================================================================
+bool URoadPathFollowerComponent::IsChainHeadBlockedBySignal() const
+{
+	const URoadPathFollowerComponent* Current = this;
+	for (int32 Depth = 0; Depth < MaxChainWalkDepth; ++Depth)
+	{
+		const EFrontObstacleType Type = Current->ClassifyFrontObstacle();
+		if (Type == EFrontObstacleType::TrafficSignal)
+			return true;
+		if (Type != EFrontObstacleType::Vehicle)
+			return false;
+
+		const AActor* FrontActor = Current->ObstacleActor.Get();
+		if (!FrontActor) return false;
+		const URoadPathFollowerComponent* FrontPF =
+			FrontActor->FindComponentByClass<URoadPathFollowerComponent>();
+		if (!FrontPF) return false;
+		Current = FrontPF;
+	}
+	return false;
 }
 
 // ============================================================================
@@ -2574,11 +2629,15 @@ void URoadPathFollowerComponent::TickComponent(
 		}
 		else
 		{
-			const bool bRearSafe = IsLaneChangeRearSafe(DesiredLane, LaneChangeRearCheckDistance);
+			const bool bRearSafe  = IsLaneChangeRearSafe(DesiredLane, LaneChangeRearCheckDistance);
+			const bool bFrontClear = IsTargetLaneFrontClear(DesiredLane, LaneChangeFrontCheckDistance);
 			FinalEdgeLaneForceWait += DeltaTime;
-			const bool bTimedOut = (FinalEdgeLaneForceWait >= FinalEdgeLaneForceMaxWait);
+			// Timeout only overrides the REAR check (rear car will yield).
+			// If the FRONT lane is occupied we never force — just stay in current lane
+			// and let the parking curve run from wherever we end up.
+			const bool bTimedOut  = (FinalEdgeLaneForceWait >= FinalEdgeLaneForceMaxWait);
 
-			if (bRearSafe || bTimedOut)
+			if (bFrontClear && (bRearSafe || bTimedOut))
 			{
 				TargetLaneIndex = DesiredLane;
 				bIsChangingLane = true;
@@ -2591,6 +2650,19 @@ void URoadPathFollowerComponent::TickComponent(
 					FinalEdgeLaneForceWait));
 
 				FinalEdgeLaneForceWait = 0.0f;
+			}
+			else if (!bFrontClear)
+			{
+				// 前方有車，不切換，等到前方淨空再試
+				// Front occupied — don't cut in, keep waiting for a gap
+				const float NowT = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+				if (NowT - LastAutoLaneRearBlockLogTime > 2.0f)
+				{
+					LastAutoLaneRearBlockLogTime = NowT;
+					LogEvent(FString::Printf(
+						TEXT("FINAL-EDGE WAIT: front of lane %d blocked (wait=%.1fs)"),
+						DesiredLane, FinalEdgeLaneForceWait));
+				}
 			}
 		}
 	}
@@ -2642,15 +2714,18 @@ void URoadPathFollowerComponent::TickComponent(
 
 			if (DesiredLane != TargetLaneIndex && CurLaneCount > 1)
 			{
-				// Rear safety gate: don't cut in front of a car behind us in
-				// the target lane. When the junction is close enough we have
-				// to commit anyway (else we'll miss the turn), so the distance
-				// also acts as a "forced" window.
+				// Two-sided safety gate:
+				//   Rear  — don't cut in front of a following car.
+				//           Can be overridden when very close to the junction.
+				//   Front — don't merge into an occupied lane.
+				//           NEVER overridden: if blocked, stay in current lane
+				//           and take the junction from there.
 				const float ForceCommitDist = AutoLaneChangeDistance * 0.4f;
-				const bool bRearSafe = IsLaneChangeRearSafe(DesiredLane, LaneChangeRearCheckDistance);
+				const bool bRearSafe   = IsLaneChangeRearSafe(DesiredLane, LaneChangeRearCheckDistance);
+				const bool bFrontClear = IsTargetLaneFrontClear(DesiredLane, LaneChangeFrontCheckDistance);
 				const bool bMustCommit = (DistToJunction < ForceCommitDist);
 
-				if (bRearSafe || bMustCommit)
+				if (bFrontClear && (bRearSafe || bMustCommit))
 				{
 					RequestLaneChange(DesiredLane);
 					UE_LOG(LogTemp, Warning,
@@ -2662,14 +2737,16 @@ void URoadPathFollowerComponent::TickComponent(
 				}
 				else
 				{
-					// Throttled log so we don't spam while patiently waiting.
 					const float NowT = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
 					if (NowT - LastAutoLaneRearBlockLogTime > 2.0f)
 					{
 						LastAutoLaneRearBlockLogTime = NowT;
 						LogEvent(FString::Printf(
-							TEXT("LANE-CHANGE WAIT: rear traffic in lane %d (junction %.0fm)"),
-							DesiredLane, DistToJunction * 0.01f));
+							TEXT("LANE-CHANGE WAIT: lane %d blocked (front=%s rear=%s junction=%.0fm)"),
+							DesiredLane,
+							bFrontClear ? TEXT("ok") : TEXT("BLOCKED"),
+							bRearSafe   ? TEXT("ok") : TEXT("busy"),
+							DistToJunction * 0.01f));
 					}
 				}
 			}
@@ -2745,6 +2822,11 @@ void URoadPathFollowerComponent::TickComponent(
 	// ================================================================
 	UpdateStuckRecovery(DeltaTime);
 
+	// UpdateStuckRecovery may have teleported + parked the car (ResetFollowingState),
+	// which empties PathSegments and sets bIsFollowing=false.  Re-check before any
+	// code that dereferences PathSegments / Seg.Spline, or we crash on a dangling ptr.
+	if (!bIsFollowing || PathSegments.Num() == 0) return;
+
 	// If actively reversing to unstick, skip normal speed control / overtaking
 	if (!bIsStuckReversing)
 	{
@@ -2774,13 +2856,6 @@ void URoadPathFollowerComponent::TickComponent(
 				: BrakeDeceleration;
 
 			CurrentSpeed = FMath::Max(CurrentSpeed - EffectiveBrakeDecel * DeltaTime, DesiredSpeed);
-		}
-
-		// 如果障礙物在 StopDistance 內 → 直接歸零，不等減速
-		// If obstacle within StopDistance → immediate zero, don't wait for decel
-		if (ObstacleDistance >= 0.0f && ObstacleDistance <= ObstacleStopDistance)
-		{
-			CurrentSpeed = 0.0f;
 		}
 
 		// Ensure non-negative
@@ -3127,8 +3202,13 @@ void URoadPathFollowerComponent::TickComponent(
 
 	if (bIsChangingLane)
 	{
-		CurrentLateralOffset = FMath::FInterpConstantTo(
-			CurrentLateralOffset, TargetOffset, DeltaTime, LaneChangeSpeed);
+		// 使用指數插值（FInterpTo）取代等速插值（FInterpConstantTo）
+		// 靠近目標時自動減速，模擬真實車道轉向的自然感覺
+		// Use exponential interp (FInterpTo) instead of constant-rate:
+		// naturally decelerates as it approaches the target lane,
+		// matching the feel of a real car weaving over.
+		CurrentLateralOffset = FMath::FInterpTo(
+			CurrentLateralOffset, TargetOffset, DeltaTime, LaneChangeSmoothRate);
 
 		if (FMath::IsNearlyEqual(CurrentLateralOffset, TargetOffset, 1.0f))
 		{
@@ -3434,7 +3514,15 @@ void URoadPathFollowerComponent::TickComponent(
 			&& DestinationType == EDestinationType::ParkingLot)
 		{
 			// --- Parking Lot: full Hermite curve into spot ---
+			// 停止嘗試切車道（若前方有車一直沒切成功，就從當前位置做 curve）
+			// Stop any pending lane-force — if the outer lane was never reached
+			// the curve simply starts from wherever the car actually is.
+			bPendingFinalEdgeForce = false;
+			bIsChangingLane        = false;
 			ParkCurveP0 = Owner->GetActorLocation();
+			// 保持開進停車場前的高度，忽略 Arrow 的 Z 值
+			// Lock Z to the car's current height; ignore the arrow's Z
+			ParkCurveP1.Z = ParkCurveP0.Z;
 			const float CurveDist = (ParkCurveP1 - ParkCurveP0).Size();
 			ParkCurveT0 = Owner->GetActorForwardVector() * CurveDist * ParkingCurveTangentScale;
 			ParkCurveLength = CurveDist * 1.3f;
@@ -3567,8 +3655,11 @@ void URoadPathFollowerComponent::TickComponent(
 		}
 
 		const FRotator TargetRot = ActualMoveDir.Rotation();
+		// 換道中使用較低的旋轉插值速度，讓車頭轉動更像真實汽車
+		// Use a lower rotation interp speed during lane change for a natural steering feel
+		const float EffRotSpeed = bIsChangingLane ? LaneChangeRotInterpSpeed : RotationInterpSpeed;
 		FinalRot = FMath::RInterpTo(
-			CurrentRot, TargetRot, DeltaTime, RotationInterpSpeed);
+			CurrentRot, TargetRot, DeltaTime, EffRotSpeed);
 	}
 
 	Owner->SetActorLocationAndRotation(FinalPos, FinalRot);
@@ -3837,6 +3928,60 @@ bool URoadPathFollowerComponent::IsLaneChangeRearSafe(
 		{
 			return false;
 		}
+	}
+	return true;
+}
+
+// ============================================================================
+//  IsTargetLaneFrontClear — sphere-sweep FORWARD in the target lane to check
+//  whether a PathFollower vehicle is already occupying the space we'd merge into.
+//  Returns false (blocked) if any vehicle is found within CheckDistance ahead.
+// ============================================================================
+bool URoadPathFollowerComponent::IsTargetLaneFrontClear(
+	int32 InTargetLaneIndex, float CheckDistance) const
+{
+	UWorld* World = GetWorld();
+	AActor* Owner = GetOwner();
+	if (!World || !Owner) return true;
+	if (!PathSegments.IsValidIndex(CurrentSegmentIndex)) return true;
+
+	const FPathSegmentInternal& Seg = PathSegments[CurrentSegmentIndex];
+	if (!IsValid(Seg.Spline)) return true;
+
+	const float TargetOffset = ComputeTargetLaneOffset(InTargetLaneIndex);
+
+	// Current longitudinal reference
+	FVector CurPos, CurDir, CurRight;
+	SampleSplineAtDist(Seg, ReferenceDistance, TargetOffset, CurPos, CurDir, CurRight);
+
+	// Point ahead respecting segment direction
+	const float SegLo = FMath::Min(Seg.StartDist, Seg.EndDist);
+	const float SegHi = FMath::Max(Seg.StartDist, Seg.EndDist);
+	float AheadAbs = ReferenceDistance + Seg.Direction * CheckDistance;
+	AheadAbs = FMath::Clamp(AheadAbs, SegLo, SegHi);
+
+	FVector AheadPos, AheadDir2, AheadRight2;
+	SampleSplineAtDist(Seg, AheadAbs, TargetOffset, AheadPos, AheadDir2, AheadRight2);
+
+	const FVector Start = CurPos   + FVector(0.0f, 0.0f, ObstacleTraceZOffset);
+	const FVector End   = AheadPos + FVector(0.0f, 0.0f, ObstacleTraceZOffset);
+
+	if (FVector::DistSquared(Start, End) < 1.0f) return true;
+
+	TArray<FHitResult> Hits;
+	FCollisionQueryParams Params;
+	Params.AddIgnoredActor(Owner);
+
+	World->SweepMultiByChannel(Hits, Start, End, FQuat::Identity,
+		ECC_ObstacleDetect,
+		FCollisionShape::MakeSphere(LaneChangeRearCheckRadius), Params);
+
+	for (const FHitResult& H : Hits)
+	{
+		AActor* A = H.GetActor();
+		if (!A || A == Owner) continue;
+		if (A->FindComponentByClass<URoadPathFollowerComponent>())
+			return false;
 	}
 	return true;
 }
@@ -4209,6 +4354,123 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 	TimeSinceLastStuck += DeltaTime;
 
 	// ================================================================
+	// PRE-PHASE: ZERO-DIST TELEPORT SAFETY VALVE
+	//
+	// 必須在 Phase 0/2 之前無條件執行。
+	// Phase 0 (cooldown) 和 Phase 2 (reversing + blocked rear) 都會 early-return，
+	// 如果只放在 Phase 1 裡，在上述狀態下計時器永遠跑不到。
+	//
+	// Runs UNCONDITIONALLY before Phase 0/2 early-returns.
+	//
+	// 計時策略（非連續累積）：
+	//   • 0cm 時累加計時器，並重置「淨空計時器」
+	//   • 非 0cm 時，若計時器 > 0 → 淨空計時器累加
+	//     淨空計時器超過 ZeroDistClearTimeout (5s) → 才重置計時器（真正脫困）
+	//   • 只用速度判斷容易被後退/冷卻期誤觸發，改用「持續淨空時長」
+	// ================================================================
+	{
+		// ---- Post-teleport grace period ----
+		// After any ZERO-DIST teleport we suppress ZeroDistStuckTimer for
+		// ZeroDistTeleportGraceDuration seconds.  Without this, if the
+		// destination already has another car at 0 cm, the timer fires
+		// again immediately → infinite teleport loop every 1 second.
+		if (ZeroDistTeleportGraceTimer > 0.0f)
+		{
+			ZeroDistTeleportGraceTimer -= DeltaTime;
+			ZeroDistStuckTimer = 0.0f;
+			ZeroDistClearTimer = 0.0f;
+			// PRE-PHASE done for this tick — fall through to Phase 0
+		}
+		else
+		{
+			const bool bAtZeroDist =
+				(ObstacleDistance >= 0.0f && ObstacleDistance < EmergencyOverlapDistance)
+				&& !IsChainHeadBlockedBySignal();
+
+			if (bAtZeroDist)
+			{
+				ZeroDistStuckTimer += DeltaTime;
+				ZeroDistClearTimer  = 0.0f;  // 重置淨空計時器 / reset clear timer
+
+				if (ZeroDistStuckTimer >= ZeroDistTeleportTimeout)
+				{
+					ZeroDistStuckTimer = 0.0f;
+					ZeroDistClearTimer = 0.0f;
+
+					const FVector TeleportDest = DestinationWorldLocation;
+
+					UE_LOG(LogTemp, Warning,
+						TEXT("[STUCK] ZERO-DIST-TELEPORT: %s @ 0cm (accum≥%.1fs, reversing=%s, cooldown=%.1f) → (%.0f,%.0f,%.0f)"),
+						*Owner->GetName(), ZeroDistTeleportTimeout,
+						bIsStuckReversing ? TEXT("Y") : TEXT("N"), StuckCooldownTimer,
+						TeleportDest.X, TeleportDest.Y, TeleportDest.Z);
+					LogEvent(FString::Printf(
+						TEXT("ZERO-DIST-TELEPORT → dest=(%.0f,%.0f,%.0f)"),
+						TeleportDest.X, TeleportDest.Y, TeleportDest.Z));
+
+					// ── Teleport to the ACTUAL PARKING SPOT (not the road node) ──────
+					// Placing the car at the spot itself guarantees:
+					//   • Each car lands at its own unique, reserved spot → no two cars
+					//     share the same destination world position.
+					//   • Navigation is fully cleared, so there is no old spline path
+					//     that could drag the car back.
+					//   • After ZeroDistTeleportGraceDuration seconds the car picks a
+					//     DIFFERENT random destination via SwitchToNewRandomDestination(),
+					//     ensuring it never teleports to the same place twice.
+					if (DestinationType == EDestinationType::ParkingLot
+						&& TargetParkingLot.IsValid()
+						&& TargetParkingSpotIndex != INDEX_NONE)
+					{
+						const FVector SpotPos = TargetParkingLot->GetSpotWorldPosition(TargetParkingSpotIndex);
+						const FVector SpotFwd = TargetParkingLot->GetSpotWorldForward(TargetParkingSpotIndex);
+						Owner->SetActorLocationAndRotation(
+							SpotPos, SpotFwd.ToOrientationRotator(),
+							false, nullptr, ETeleportType::TeleportPhysics);
+					}
+					else
+					{
+						// Fallback (no valid spot): just move to destination node position
+						Owner->SetActorLocation(TeleportDest, false, nullptr, ETeleportType::TeleportPhysics);
+					}
+
+					// Park the car in place — wipe ALL navigation/curve/stuck state.
+					// Spot occupancy (TargetParkingLot/TargetParkingSpotIndex) is kept so
+					// SwitchToNewRandomDestination() can release it cleanly later.
+					ResetFollowingState();
+					NavState = ENavState::Parked;   // ResetFollowingState leaves NavState=Idle
+
+					// After grace duration, switch to a brand-new random destination.
+					// Using a timer handle so the countdown keeps running while parked
+					// (bIsFollowing=false → UpdateStuckRecovery is skipped in Tick).
+					if (UWorld* W = GetWorld())
+					{
+						W->GetTimerManager().ClearTimer(ZeroDistReNavigateTimerHandle);
+						W->GetTimerManager().SetTimer(
+							ZeroDistReNavigateTimerHandle,
+							this, &URoadPathFollowerComponent::ZeroDistReNavigateCallback,
+							ZeroDistTeleportGraceDuration, false);
+					}
+
+					return;
+				}
+			}
+			else if (ZeroDistStuckTimer > 0.0f)
+			{
+				// 不在 0cm，但曾經卡過：累計淨空時間
+				// Not at 0cm but was stuck before: accumulate clear time
+				ZeroDistClearTimer += DeltaTime;
+				if (ZeroDistClearTimer >= ZeroDistClearTimeout)
+				{
+					// 真正脫困（5s 淨空）→ 重置
+					// Genuinely free (5s clear) → reset
+					ZeroDistStuckTimer = 0.0f;
+					ZeroDistClearTimer = 0.0f;
+				}
+			}
+		}
+	}
+
+	// ================================================================
 	// Phase 0：冷卻期 / Cooldown period after reverse
 	// 倒退剛完成後，幾秒內不偵測（讓車子有時間實際移動出去）
 	// ================================================================
@@ -4230,25 +4492,68 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 		AActor* RearVehicle = nullptr;
 		if (!IsRearClearOfVehicles(RearVehicle))
 		{
-			const float PrevAccum = RearWaitAccum;
-			RearWaitAccum += DeltaTime;
-			if (RearWaitAccum < RearWaitMaxSec)
+			// ---- 判斷後車方向與距離 ----
+			// ---- Classify rear vehicle relationship ----
+			bool bRearShouldBlock = true;
+
+			if (RearVehicle)
 			{
-				CurrentSpeed = 0.0f;
-				if (PrevAccum <= 0.05f)  // first frame blocked
+				const FVector MyFwd2D   = Owner->GetActorForwardVector().GetSafeNormal2D();
+				const FVector RearFwd2D = RearVehicle->GetActorForwardVector().GetSafeNormal2D();
+				const float   RearDirDot = FVector::DotProduct(MyFwd2D, RearFwd2D);
+				const float   RearDist   = FVector::Dist2D(
+					Owner->GetActorLocation(), RearVehicle->GetActorLocation());
+
+				const bool bRearSameDir = (RearDirDot > 0.5f);
+				const bool bRearSameDirNormalDist = bRearSameDir
+					&& (RearDist >= OverlapSeparationThreshold);
+
+				if (bRearSameDirNormalDist)
 				{
-					LogEvent(FString::Printf(TEXT("REVERSE BLOCKED by rear=%s (waiting...)"),
+					// 同向且距離正常：這是正常的跟車場景。
+					// 後車跟我同方向行駛，我後退不會撞它（它在我後面同向，
+					// 我往後退它自然也要讓路或已在讓路中）。
+					// 不讓它阻擋我後退。
+					//
+					// Same-dir normal distance: normal following scenario.
+					// Rear car travels same direction — my reversing won't
+					// cause a head-on collision. Don't let it block me.
+					bRearShouldBlock = false;
+
+					LogEvent(FString::Printf(
+						TEXT("REAR-CLEAR SKIP: same-dir rear=%s dot=%.2f dist=%.0fcm → not blocking"),
+						*RearVehicle->GetName(), RearDirDot, RearDist));
+				}
+				// 其他情況（對向後車、同向重疊後車）→ 正常等待邏輯
+				// Other cases (opposite-dir or same-dir overlap) → normal wait logic
+			}
+
+			if (bRearShouldBlock)
+			{
+				const float PrevAccum = RearWaitAccum;
+				RearWaitAccum += DeltaTime;
+				if (RearWaitAccum < RearWaitMaxSec)
+				{
+					CurrentSpeed = 0.0f;
+					if (PrevAccum <= 0.05f)
+					{
+						LogEvent(FString::Printf(TEXT("REVERSE BLOCKED by rear=%s (waiting...)"),
+							RearVehicle ? *RearVehicle->GetName() : TEXT("?")));
+					}
+					return;
+				}
+				if (PrevAccum < RearWaitMaxSec)
+				{
+					LogEvent(FString::Printf(TEXT("REVERSE FORCED (rear-wait %.1fs timeout, rear=%s)"),
+						RearWaitAccum,
 						RearVehicle ? *RearVehicle->GetName() : TEXT("?")));
 				}
-				return;
 			}
-			// Timeout → force through. Log ONCE (first frame we cross the
-			// timeout boundary), not every frame while still blocked.
-			if (PrevAccum < RearWaitMaxSec)
+			else
 			{
-				LogEvent(FString::Printf(TEXT("REVERSE FORCED (rear-wait %.1fs timeout, rear=%s)"),
-					RearWaitAccum,
-					RearVehicle ? *RearVehicle->GetName() : TEXT("?")));
+				// 同向正常後車不阻擋 → 清 accum，直接後退
+				// Same-dir normal rear — no block, clear accum and proceed
+				RearWaitAccum = 0.0f;
 			}
 		}
 		else
@@ -4290,16 +4595,67 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 			LogEvent(FString::Printf(TEXT("STUCK reverse COMPLETE (%.0fcm, consec=%d)"),
 				CurrentStuckReverseTarget, ConsecutiveStuckCount));
 
-			// 連續卡住太多次 → 換個目的地
-			// Too many consecutive stucks → switch destination
-			if (ConsecutiveStuckCount >= MaxConsecutiveStucksBeforeSwitch)
+			// 連續卡住太多次 → 直接瞬移停到當前目標停車格，N秒後換個新目的地
+			// Too many consecutive stucks → teleport to current target spot, park,
+			// then pick a brand-new destination after the grace period.
+			// Skip teleport if the entire chain is only waiting at a red light.
+			if (ConsecutiveStuckCount >= MaxConsecutiveStucksBeforeSwitch
+				&& !IsChainHeadBlockedBySignal())
 			{
 				UE_LOG(LogTemp, Warning,
-					TEXT("[STUCK] %s: %d consecutive stucks → SWITCHING to random destination"),
-					*Owner->GetName(), ConsecutiveStuckCount);
+					TEXT("[STUCK] %s: %d consecutive stucks → TELEPORT-TO-SPOT + park + re-nav in %.1fs"),
+					*Owner->GetName(), ConsecutiveStuckCount, ZeroDistTeleportGraceDuration);
 				ConsecutiveStuckCount = 0;
-				CurrentStuckReverseTarget = StuckReverseDistance;  // reset escalation
-				SwitchToNewRandomDestination();
+				CurrentStuckReverseTarget = StuckReverseDistance;
+
+				bIsStuckReversing     = false;
+				StuckReversedSoFar    = 0.0f;
+				StuckTimer            = 0.0f;
+				StuckCooldownTimer    = 0.0f;
+				bMutualStuckResolved  = false;
+				RearWaitAccum         = 0.0f;
+				ZeroDistStuckTimer    = 0.0f;
+				ZeroDistClearTimer    = 0.0f;
+
+				// Teleport to the ACTUAL PARKING SPOT so there is no ambiguity
+				// about where the car lands. Each car lands at its own reserved spot.
+				if (DestinationType == EDestinationType::ParkingLot
+					&& TargetParkingLot.IsValid()
+					&& TargetParkingSpotIndex != INDEX_NONE)
+				{
+					const FVector SpotPos = TargetParkingLot->GetSpotWorldPosition(TargetParkingSpotIndex);
+					const FVector SpotFwd = TargetParkingLot->GetSpotWorldForward(TargetParkingSpotIndex);
+					Owner->SetActorLocationAndRotation(
+						SpotPos, SpotFwd.ToOrientationRotator(),
+						false, nullptr, ETeleportType::TeleportPhysics);
+
+					LogEvent(FString::Printf(
+						TEXT("CONSEC-TELEPORT-TO-SPOT → lot='%s' spot=%d"),
+						*TargetParkingLot->ParkingLotName, TargetParkingSpotIndex));
+				}
+				else
+				{
+					// Fallback: no reserved spot — move to destination node position
+					Owner->SetActorLocation(DestinationWorldLocation, false, nullptr, ETeleportType::TeleportPhysics);
+					LogEvent(TEXT("CONSEC-TELEPORT → dest node (no spot)"));
+				}
+
+				// Park the car — clear all path/curve/stuck state.
+				// Spot occupancy is preserved so SwitchToNewRandomDestination() can
+				// release it cleanly when the timer fires.
+				ResetFollowingState();
+				NavState = ENavState::Parked;
+
+				// After grace duration, switch to a new random destination.
+				if (UWorld* W = GetWorld())
+				{
+					W->GetTimerManager().ClearTimer(ZeroDistReNavigateTimerHandle);
+					W->GetTimerManager().SetTimer(
+						ZeroDistReNavigateTimerHandle,
+						this, &URoadPathFollowerComponent::ZeroDistReNavigateCallback,
+						ZeroDistTeleportGraceDuration, false);
+				}
+
 				return;
 			}
 
@@ -4382,17 +4738,26 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 				*ObstacleActor->GetName(), ObstacleDistance));
 		}
 
+		// Zero-dist teleport handled by PRE-PHASE block above.
+
 		// ================================================================
-		// TOP PRIORITY — EMERGENCY OVERLAP (Obstacle: 0 cm against Vehicle).
+		// TOP PRIORITY — EMERGENCY OVERLAP (Obstacle: ~0 cm against Vehicle).
 		// Physically touching another car is the most severe stuck state.
 		// Fires IMMEDIATELY, bypassing mutual / cycle / chain-leader / delay.
-		// Typical cause: a car cut lanes right in front, so we hit its
-		// rear bumper with 0 separation.
-		// Only deferrals:
-		//   * Already reversing / in cooldown → skip (we're handling it).
-		//   * Front car already reversing → let it separate us first.
-		// Otherwise: reverse NOW + cascade my rear chain so we unpack
-		// cleanly.
+		//
+		// 三種子情況 / Three sub-cases:
+		//   (A) 對向重疊 (dot < -0.5) — mutual / 對頭碰撞，兩者都需退開
+		//       Opposite-facing overlap — mutual collision, both need to separate.
+		//       → 用縱向投影決定誰退：dot < 0 代表 RC 在我前方，應由 RC 退
+		//       → Use longitudinal projection: RC in front → RC retreats
+		//   (B) 同向重疊但距離極近 (dot > 0.5, ActualDist < OverlapSeparationThreshold)
+		//       Same-dir overlap at extremely close range — teleport / spawn coincidence.
+		//       → 縱向上誰在後面誰退，前車不動
+		//       → Rearmost car reverses, front car stays
+		//   (C) 同向正常跟車距離 (dot > 0.5, ActualDist >= OverlapSeparationThreshold)
+		//       Same-dir normal following — front car blocks, NOT an overlap.
+		//       → 不觸發此 path，讓正常 chain/mutual 邏輯處理
+		//       → Skip this path; let normal chain/mutual logic handle it
 		// ================================================================
 		if (!bIsStuckReversing && StuckCooldownTimer <= 0.0f
 			&& ObstacleDistance < EmergencyOverlapDistance)
@@ -4404,36 +4769,167 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 			const bool bFrontAlreadyHandling = FPF_Emerg
 				&& (FPF_Emerg->IsStuckReversing() || FPF_Emerg->StuckCooldownTimer > 0.0f);
 
-			if (!bFrontAlreadyHandling)
+			if (!bFrontAlreadyHandling && FPF_Emerg)
 			{
-				// Drag my rear chain along so we all separate together.
+				// ---- 計算方向關係與實際距離 ----
+				// ---- Compute directional relationship and actual distance ----
+				const FVector MyFwd  = Owner->GetActorForwardVector().GetSafeNormal2D();
+				const FVector HisFwd = FA_Emerg->GetActorForwardVector().GetSafeNormal2D();
+				const float   DirDot = FVector::DotProduct(MyFwd, HisFwd);
+
+				const float ActualDist = FVector::Dist2D(
+					Owner->GetActorLocation(), FA_Emerg->GetActorLocation());
+
+				// ---- 縱向投影：Delta 點乘 MyFwd > 0 表示對方在我前方 ----
+				// ---- Longitudinal projection: Delta·MyFwd > 0 means he's ahead ----
+				const FVector Delta2D = (FA_Emerg->GetActorLocation()
+					- Owner->GetActorLocation()).GetSafeNormal2D();
+				const float LongDot = FVector::DotProduct(Delta2D, MyFwd);
+
+				// ---- 子情況判斷 / Sub-case classification ----
+				//   DirDot < -0.5  → 對向 (opposite-facing)
+				//   DirDot >  0.5  → 同向 (same-facing)
+				//   otherwise      → 橫向，當作對向處理
+				const bool bOpposite = (DirDot < -0.5f);
+				const bool bSameDir  = (DirDot >  0.5f);
+				const bool bSameDirOverlap = bSameDir
+					&& (ActualDist < OverlapSeparationThreshold);
+				const bool bSameDirNormal  = bSameDir
+					&& (ActualDist >= OverlapSeparationThreshold);
+
+				if (bSameDirNormal)
+				{
+					// 情況 (C)：同向正常跟車，不是重疊，交給後續 chain/mutual 邏輯
+					// Case (C): same-dir normal following — not an overlap, skip
+					goto AfterEmergencyOverlap;
+				}
+
+				// ---- 情況 (A) 對向 或 (B) 同向重疊 ----
+				// ---- Case (A) opposite or (B) same-dir overlap ----
+
+				// 決定誰退：
+				//   對向 (A)：LongDot > 0 = 對方在我前面，對方應退（前進空間在他前方）
+				//              LongDot < 0 = 對方在我後面（不正常，我退）
+				//   同向重疊 (B)：誰在縱向後面誰退（後車往更後方退，不會再撞前車）
+				//              LongDot > 0 = 他在我前面 → 我退（我是後車）
+				//              LongDot < 0 = 他在我後面 → 他退（他是後車）
+				//
+				// Decide who reverses:
+				//   Opposite (A): LongDot > 0 = he's ahead → he reverses (clears forward space)
+				//                 LongDot < 0 = he's behind (abnormal) → I reverse
+				//   Same-dir overlap (B): rearmost car reverses
+				//                 LongDot > 0 = he's ahead → I'm behind → I reverse
+				//                 LongDot < 0 = he's behind → he reverses
+				bool bIShouldReverse;
+				if (bOpposite)
+				{
+					// 對向：對方在前方 → 他退；對方在後方 → 我退
+					// Opposite: he's ahead → he reverses; he's behind → I reverse
+					bIShouldReverse = (LongDot <= 0.0f);
+				}
+				else
+				{
+					// 同向重疊：我在後 (LongDot > 0) → 我退
+					// Same-dir overlap: I'm behind (LongDot > 0) → I reverse
+					bIShouldReverse = (LongDot > 0.0f);
+				}
+
+				// 若對方也還沒決定，且應該是他退 → 讓對方自己在自己的 tick 觸發
+				// 為了讓雙方不同時觸發，用 bMutualStuckResolved 做 double-fire guard
+				if (!bIShouldReverse)
+				{
+					// 我不退。對方這幀/下幀 tick 會走同樣邏輯並判斷自己要退。
+					// 標記 resolved 避免後續 mutual 邏輯再次配對
+					bMutualStuckResolved = true;
+
+					UE_LOG(LogTemp, Warning,
+						TEXT("[STUCK] OVERLAP-EMERGENCY: %s [%s] @ %.0fcm vs %s | "
+							 "DirDot=%.2f ActualDist=%.0fcm LongDot=%.2f → %s should reverse (I yield)"),
+						*Owner->GetName(), *GetManeuverLabel(), ObstacleDistance,
+						*FA_Emerg->GetName(),
+						DirDot, ActualDist, LongDot,
+						*FA_Emerg->GetName());
+					LogEvent(FString::Printf(
+						TEXT("OVERLAP-EMERG: me[%s] yield, %s[dot=%.2f,long=%.2f] reverses"),
+						*GetManeuverLabel(), *FA_Emerg->GetName(), DirDot, LongDot));
+
+					goto AfterEmergencyOverlap;
+				}
+
+				// ---- 我應該退 ----
+				// ---- I should reverse ----
+
+				// Rear chain cascade：
+				//   對向 (A)：我後面的車也要退，讓整個後隊清空
+				//   同向重疊 (B)：我後面同向的車 cascade 退；對向後車不退
+				//              （對向後車跟我不同方向，退了反而壓縮對向空間）
+				// Rear chain cascade:
+				//   Opposite (A): cascade all rear cars (same logic, unpack the whole queue)
+				//   Same-dir overlap (B): only cascade same-direction rear cars;
+				//                         skip opposite-direction rear cars
 				TArray<URoadPathFollowerComponent*> MyRear;
 				const int32 MyRearN = CountStoppedRearChain(MyRear);
 
 				UE_LOG(LogTemp, Warning,
-					TEXT("[STUCK] OVERLAP-EMERGENCY: %s [%s] touching %s @ %.0fcm (rearN=%d) → reverse NOW"),
+					TEXT("[STUCK] OVERLAP-EMERGENCY: %s [%s] touching %s @ %.0fcm | "
+						 "DirDot=%.2f ActualDist=%.0fcm LongDot=%.2f Case=%s rearN=%d → I REVERSE"),
 					*Owner->GetName(), *GetManeuverLabel(),
-					FA_Emerg ? *FA_Emerg->GetName() : TEXT("?"),
-					ObstacleDistance, MyRearN);
+					*FA_Emerg->GetName(), ObstacleDistance,
+					DirDot, ActualDist, LongDot,
+					bOpposite ? TEXT("OPPOSITE") : TEXT("SAME-OVERLAP"),
+					MyRearN);
 				LogEvent(FString::Printf(
-					TEXT("OVERLAP-EMERGENCY: me[%s] @ %.0fcm vs %s (rearN=%d) → reverse"),
+					TEXT("OVERLAP-EMERG[%s]: me[%s] @ %.0fcm vs %s (rearN=%d) → I reverse"),
+					bOpposite ? TEXT("OPP") : TEXT("SAME"),
 					*GetManeuverLabel(), ObstacleDistance,
-					FA_Emerg ? *FA_Emerg->GetName() : TEXT("?"),
-					MyRearN));
+					*FA_Emerg->GetName(), MyRearN));
 
-				// Mark resolved so MUTUAL / N-CYCLE don't double-fire on us.
 				bMutualStuckResolved = true;
-				TriggerStuckReverse(-1.0f, TEXT("overlap-emergency-0cm"));
+				TriggerStuckReverse(-1.0f, TEXT("overlap-emergency"));
+
+				// 同向重疊：前車沿自身前向推出，讓雙方立即分離
+				// Same-dir overlap: nudge the front car forward so both cars
+				// separate immediately (one forward, one backward).
+				if (bSameDirOverlap && FPF_Emerg)
+				{
+					const FVector FrontFwd = FA_Emerg->GetActorForwardVector().GetSafeNormal();
+					FA_Emerg->SetActorLocation(
+						FA_Emerg->GetActorLocation() + FrontFwd * OverlapSeparationThreshold,
+						false, nullptr, ETeleportType::TeleportPhysics);
+					FPF_Emerg->ZeroDistStuckTimer = 0.0f;
+					FPF_Emerg->StuckTimer = 0.0f;
+
+					UE_LOG(LogTemp, Warning,
+						TEXT("[STUCK] OVERLAP-EMERG SAME-DIR: nudged %s forward %.0fcm"),
+						*FA_Emerg->GetName(), OverlapSeparationThreshold);
+				}
+
 				for (URoadPathFollowerComponent* RC : MyRear)
 				{
-					if (RC && !RC->IsStuckReversing())
+					if (!RC || RC->IsStuckReversing()) continue;
+
+					if (bSameDirOverlap)
 					{
-						RC->TriggerStuckReverse(-1.0f, TEXT("overlap-emergency-cascade"));
+						// 同向重疊 cascade：只帶同向後車一起退
+						// Same-dir overlap cascade: only bring same-direction rear cars
+						const AActor* RCOwner = RC->GetOwner();
+						if (!RCOwner) continue;
+						const FVector RCFwd = RCOwner->GetActorForwardVector().GetSafeNormal2D();
+						const float RCDirDot = FVector::DotProduct(MyFwd, RCFwd);
+						if (RCDirDot <= 0.5f)
+						{
+							// 非同向後車，跳過
+							// Non-same-dir rear car — skip
+							continue;
+						}
 					}
+					// 對向 (A) 或已通過同向方向篩選 → cascade
+					RC->TriggerStuckReverse(-1.0f, TEXT("overlap-emergency-cascade"));
 				}
 				return;
 			}
 		}
+		AfterEmergencyOverlap:;
 
 		// ============================================================
 		// MUTUAL-STUCK fast-path — fires IMMEDIATELY (no delay wait)
@@ -5010,15 +5506,28 @@ void URoadPathFollowerComponent::UpdateOvertakeLogic()
 
 	case EOvertakeState::Passing:
 	{
-		// Near junction → force cancel, return to original lane
+		// Near junction → cancel overtake, but only if original lane is clear.
+		// If original lane has vehicles ahead, stay in the passing lane rather
+		// than forcing a cut into blocked traffic.
 		if (DistToJunction < AutoLaneChangeDistance)
 		{
-			RequestLaneChange(PreOvertakeLaneIndex);
-			OvertakeState = EOvertakeState::Returning;
-			CurrentTurnSignal = ETurnSignal::Right;
-			UE_LOG(LogTemp, Warning,
-				TEXT("PathFollower: OVERTAKE CANCEL (near junction) — returning to Lane %d"),
-				PreOvertakeLaneIndex);
+			const bool bJunctionOrigClear =
+				IsOriginalLaneClear(PreOvertakeLaneIndex, OvertakeSafeDistance);
+			if (bJunctionOrigClear)
+			{
+				RequestLaneChange(PreOvertakeLaneIndex);
+				OvertakeState = EOvertakeState::Returning;
+				CurrentTurnSignal = ETurnSignal::Right;
+				UE_LOG(LogTemp, Warning,
+					TEXT("PathFollower: OVERTAKE CANCEL (near junction) — returning to Lane %d"),
+					PreOvertakeLaneIndex);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("PathFollower: OVERTAKE CANCEL deferred — near junction but Lane %d blocked, staying in outer lane"),
+					PreOvertakeLaneIndex);
+			}
 			break;
 		}
 
