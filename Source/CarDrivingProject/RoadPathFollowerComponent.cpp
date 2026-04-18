@@ -2802,13 +2802,16 @@ void URoadPathFollowerComponent::TickComponent(
 	// ================================================================
 	//     Lane change interpolation
 	// ================================================================
-	const float PrevLateralOffset = CurrentLateralOffset;  // Save for heading calc
 	const float TargetOffset = ComputeTargetLaneOffset(TargetLaneIndex);
 
-	// Lateral interpolation runs unconditionally — not blocked by red-light early-returns
-	// inside the junction zone. This lets the car shift to the target lane even while
-	// stopped at a red light, so it arrives at the junction already in the correct lane.
-	if (bIsChangingLane && !bOnJunctionCurve)
+	// Approach-phase lane change: silently shift lateral position during normal driving
+	// so the car arrives at the junction already in the correct lane.
+	// PrevLateralOffset is captured AFTER this update so FrameLateralDelta = 0,
+	// meaning SmoothedLateralVel never builds up from this — the car slides to the
+	// target lane without any heading tilt. Heading tilt only comes from the junction
+	// curve itself. Gated by speed: no movement while stopped (avoids position snap
+	// when red-light early-return skips SetActorLocationAndRotation).
+	if (bIsChangingLane && !bOnJunctionCurve && CurrentSpeed > 0.5f)
 	{
 		CurrentLateralOffset = FMath::FInterpTo(
 			CurrentLateralOffset, TargetOffset, DeltaTime, LaneChangeSmoothRate);
@@ -2820,6 +2823,10 @@ void URoadPathFollowerComponent::TickComponent(
 			bIsChangingLane = false;
 		}
 	}
+
+	// Capture AFTER the silent approach shift so FrameLateralDelta only reflects
+	// in-junction-zone movement (which SHOULD tilt the heading during curve following).
+	const float PrevLateralOffset = CurrentLateralOffset;
 
 	// ================================================================
 	//     Sample position + detect junction → generate Hermite curve
@@ -2953,27 +2960,32 @@ void URoadPathFollowerComponent::TickComponent(
 					FCollisionQueryParams ScanParams;
 					ScanParams.AddIgnoredActor(ScanOwner);
 
-					FHitResult ScanHit;
-					const bool bScanHit = ScanWorld->SweepSingleByChannel(
-						ScanHit, ScanStart, ScanEnd, FQuat::Identity,
+					// Use Multi sweep so a vehicle or static object in front of the
+					// traffic signal doesn't shadow it (Single only returns the first hit).
+					TArray<FHitResult> ScanHits;
+					ScanWorld->SweepMultiByChannel(
+						ScanHits, ScanStart, ScanEnd, FQuat::Identity,
 						ECC_ObstacleDetect,
 						FCollisionShape::MakeSphere(JunctionRedLightScanRadius),
 						ScanParams);
 
 					bool bRedLightAhead = false;
-					if (bScanHit && ScanHit.GetActor())
+					const FHitResult* SignalHit = nullptr;
+					for (const FHitResult& H : ScanHits)
 					{
-						AActor* HitAct = ScanHit.GetActor();
-						// Only block on TrafficSignal-tagged objects (not vehicles)
+						AActor* HitAct = H.GetActor();
+						if (!HitAct || HitAct == ScanOwner) continue;
 						const bool bIsVehicle = HitAct->FindComponentByClass<URoadPathFollowerComponent>() != nullptr;
 						const bool bIsSignal = HitAct->Tags.Contains(FName(TrafficSignalTagName));
 						if (bIsSignal && !bIsVehicle)
 						{
 							bRedLightAhead = true;
+							SignalHit = &H;
+							break;
 						}
 					}
 
-					if (bRedLightAhead)
+					if (bRedLightAhead && SignalHit)
 					{
 						JunctionRedLightWaitAccum += DeltaTime;
 						CurrentSpeed = 0.0f;
@@ -2986,8 +2998,8 @@ void URoadPathFollowerComponent::TickComponent(
 							LastYieldLogTime = NowT;
 							LogEvent(FString::Printf(
 								TEXT("YIELD PRE-CURVE: red-light=%s @ %.0fcm (waited %.1fs)"),
-								*ScanHit.GetActor()->GetName(),
-								ScanHit.Distance,
+								*SignalHit->GetActor()->GetName(),
+								SignalHit->Distance,
 								JunctionRedLightWaitAccum));
 						}
 						return;
