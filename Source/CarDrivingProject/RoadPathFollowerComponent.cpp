@@ -2494,8 +2494,12 @@ void URoadPathFollowerComponent::TickComponent(
 
 		if (T >= 1.0f)
 		{
-			// Departure curve done → continue normal spline following
+			// Departure curve done → continue normal spline following.
+			// Sync SmoothedDesiredSpeed to CurrentSpeed so the post-curve
+			// acceleration ramps up from the current low speed instead of
+			// from the pre-accumulated high value (which causes a lurch).
 			bOnDepartureCurve = false;
+			SmoothedDesiredSpeed = CurrentSpeed;
 		}
 		return; // Departure curve in progress → skip normal logic
 	}
@@ -2565,6 +2569,12 @@ void URoadPathFollowerComponent::TickComponent(
 		bOnJunctionCurve = false;
 		bIsUTurnCurve = false;
 		bIsGapBridgeCurve = false;
+
+		// Sync SmoothedDesiredSpeed to CurrentSpeed so post-curve acceleration
+		// ramps up gradually from the current (slow) junction speed instead of
+		// from the pre-accumulated high target (which causes a sudden lurch).
+		SmoothedDesiredSpeed = CurrentSpeed;
+
 		CurrentSegmentIndex++;
 
 		if (CurrentSegmentIndex >= PathSegments.Num())
@@ -2795,11 +2805,11 @@ void URoadPathFollowerComponent::TickComponent(
 	const float PrevLateralOffset = CurrentLateralOffset;  // Save for heading calc
 	const float TargetOffset = ComputeTargetLaneOffset(TargetLaneIndex);
 
-	if (bIsChangingLane)
+	// Lateral interpolation runs unconditionally — not blocked by red-light early-returns
+	// inside the junction zone. This lets the car shift to the target lane even while
+	// stopped at a red light, so it arrives at the junction already in the correct lane.
+	if (bIsChangingLane && !bOnJunctionCurve)
 	{
-		// Use exponential interp (FInterpTo) instead of constant-rate:
-		// naturally decelerates as it approaches the target lane,
-		// matching the feel of a real car weaving over.
 		CurrentLateralOffset = FMath::FInterpTo(
 			CurrentLateralOffset, TargetOffset, DeltaTime, LaneChangeSmoothRate);
 
@@ -2809,18 +2819,6 @@ void URoadPathFollowerComponent::TickComponent(
 			CurrentLaneIndex = TargetLaneIndex;
 			bIsChangingLane = false;
 		}
-	}
-	else if (NavState == ENavState::Parking
-		&& DestinationType == EDestinationType::None)
-	{
-		// Default parking: gradual lateral offset to target
-		CurrentLateralOffset = FMath::FInterpConstantTo(
-			CurrentLateralOffset, ParkingTargetOffset, DeltaTime, LaneChangeSpeed);
-	}
-	else
-	{
-		CurrentLateralOffset = FMath::FInterpTo(
-			CurrentLateralOffset, TargetOffset, DeltaTime, PositionInterpSpeed);
 	}
 
 	// ================================================================
@@ -2933,6 +2931,87 @@ void URoadPathFollowerComponent::TickComponent(
 				}
 			}
 
+			// ----------------------------------------------------------
+			// PRE-CURVE RED-LIGHT SCAN: before starting a U-turn or any
+			// junction curve, sphere-trace forward for red-light colliders
+			// (TrafficSignal-tagged, non-vehicle). If blocked, stop and
+			// wait. Once clear the curve starts normally.
+			// "已經開始了就不管" is naturally satisfied: bOnJunctionCurve is
+			// false here, so this block is never reached mid-curve.
+			// ----------------------------------------------------------
+			if (JunctionRedLightScanDistance > 0.0f)
+			{
+				UWorld* ScanWorld = GetWorld();
+				AActor* ScanOwner = GetOwner();
+				if (ScanWorld && ScanOwner)
+				{
+					const FVector ScanStart = ScanOwner->GetActorLocation()
+						+ FVector(0, 0, ObstacleTraceZOffset);
+					const FVector ScanEnd = ScanStart
+						+ ScanOwner->GetActorForwardVector() * JunctionRedLightScanDistance;
+
+					FCollisionQueryParams ScanParams;
+					ScanParams.AddIgnoredActor(ScanOwner);
+
+					FHitResult ScanHit;
+					const bool bScanHit = ScanWorld->SweepSingleByChannel(
+						ScanHit, ScanStart, ScanEnd, FQuat::Identity,
+						ECC_ObstacleDetect,
+						FCollisionShape::MakeSphere(JunctionRedLightScanRadius),
+						ScanParams);
+
+					bool bRedLightAhead = false;
+					if (bScanHit && ScanHit.GetActor())
+					{
+						AActor* HitAct = ScanHit.GetActor();
+						// Only block on TrafficSignal-tagged objects (not vehicles)
+						const bool bIsVehicle = HitAct->FindComponentByClass<URoadPathFollowerComponent>() != nullptr;
+						const bool bIsSignal = HitAct->Tags.Contains(FName(TrafficSignalTagName));
+						if (bIsSignal && !bIsVehicle)
+						{
+							bRedLightAhead = true;
+						}
+					}
+
+					if (bRedLightAhead)
+					{
+						JunctionRedLightWaitAccum += DeltaTime;
+						CurrentSpeed = 0.0f;
+
+						const float NowT = ScanWorld->GetTimeSeconds();
+						const FString YStr = TEXT("pre-curve red-light");
+						if (YStr != LastYieldReason || (NowT - LastYieldLogTime) >= 3.0f)
+						{
+							LastYieldReason = YStr;
+							LastYieldLogTime = NowT;
+							LogEvent(FString::Printf(
+								TEXT("YIELD PRE-CURVE: red-light=%s @ %.0fcm (waited %.1fs)"),
+								*ScanHit.GetActor()->GetName(),
+								ScanHit.Distance,
+								JunctionRedLightWaitAccum));
+						}
+						return;
+					}
+					else
+					{
+						JunctionRedLightWaitAccum = 0.0f;
+					}
+				}
+			}
+
+
+			if (NavState == ENavState::Parking
+				&& DestinationType == EDestinationType::None)
+			{
+				// Default parking: gradual lateral offset to target
+				CurrentLateralOffset = FMath::FInterpConstantTo(
+					CurrentLateralOffset, ParkingTargetOffset, DeltaTime, LaneChangeSpeed);
+			}
+			else
+			{
+				CurrentLateralOffset = FMath::FInterpTo(
+					CurrentLateralOffset, TargetOffset, DeltaTime, PositionInterpSpeed);
+			}
 
 		// Curve end: normal turns go EffectiveBlendDist into next seg; U-turn stays near start
 		const bool bUpcomingUTurn = Seg.bUTurnAtEnd;
@@ -3069,8 +3148,16 @@ void URoadPathFollowerComponent::TickComponent(
 		{
 			JCurveP1 = NextPos;
 
-			// Tangent magnitude = distance × TangentScale, controls curve roundness
-			const float TangentScale = (JCurveP1 - JCurveP0).Size() * JunctionCurveTangentScale;
+			// Tangent magnitude = distance × TangentScale, controls curve roundness.
+			// For left turns from outer lanes, apply the same OffsetBoostRate factor used
+			// for EffectiveBlendDist so the arc is proportionally wider.
+			float EffTangentScale = JunctionCurveTangentScale;
+			if (CurrentTurnSignal == ETurnSignal::Left)
+			{
+				const float OffsetBoost = (CurrentLateralOffset / 100.0f) * OffsetBoostRate;
+				EffTangentScale *= (1.0f + FMath::Max(OffsetBoost, 0.0f));
+			}
+			const float TangentScale = (JCurveP1 - JCurveP0).Size() * EffTangentScale;
 			JCurveT0 = Owner->GetActorForwardVector() * TangentScale;
 			JCurveT1 = NextDir.GetSafeNormal() * TangentScale;
 
@@ -3737,6 +3824,18 @@ URoadPathFollowerComponent* URoadPathFollowerComponent::FindChainReverser(
 			const bool bBusy = Cur->IsStuckReversing() || Cur->StuckCooldownTimer > 0.0f;
 			if (bCurStopped && !bBusy)
 			{
+				// Guard: require the car to have been continuously obstacle-free AND
+				// stopped for at least StuckRecoveryDelay seconds before we treat it
+				// as a zombie. This prevents a car that was just blocked by a traffic
+				// signal (and transiently lost its ObstacleActor due to a detection
+				// throttle gap or signal flicker) from triggering a mass reversal of
+				// the entire queued chain behind it.
+				if (Cur->ZombieStuckTimer < Cur->StuckRecoveryDelay)
+				{
+					OutReason = TEXT("head-zombie-too-fresh");
+					return nullptr;
+				}
+
 				// Zombie head — nothing visibly blocks it, but it's frozen.
 				// If this is the ONLY car (Depth==0, self-loop), don't
 				// trigger (I'd reverse myself for no reason). Only trigger
@@ -4734,6 +4833,23 @@ void URoadPathFollowerComponent::UpdateStuckRecovery(float DeltaTime)
 		{
 			bMutualStuckResolved = false;
 		}
+	}
+
+	// ZombieStuckTimer: accumulates only when stopped with NO obstacle at all.
+	// Resets immediately the moment any ObstacleActor appears (red light, car, wall).
+	// This prevents a car that just lost its TrafficSignal actor for one throttle
+	// interval from being misclassified as a zombie head by the chain walker.
+	if (ObstacleActor.IsValid())
+	{
+		ZombieStuckTimer = 0.0f;
+	}
+	else if (bAmStopped)
+	{
+		ZombieStuckTimer += DeltaTime;
+	}
+	else
+	{
+		ZombieStuckTimer = FMath::Max(ZombieStuckTimer - DeltaTime * 2.0f, 0.0f);
 	}
 
 	// ================================================================

@@ -570,6 +570,15 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Maneuver", meta = (ClampMin = "0"))
 	float LeftTurnYieldMaxSec = 5.0f;
 
+	/// Distance (cm) ahead to scan for red-light obstacles before starting a
+	/// U-turn or junction curve. 0 = disabled.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Maneuver", meta = (ClampMin = "0"))
+	float JunctionRedLightScanDistance = 1000.0f;
+
+	/// Sphere radius (cm) for the pre-curve red-light scan
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Maneuver", meta = (ClampMin = "10"))
+	float JunctionRedLightScanRadius = 120.0f;
+
 	// ---- Lane Offset Adjustments ----
 
 	/// bTwoRoads=true  / Two Roads median adjust (cm)
@@ -987,6 +996,9 @@ private:
 	/// queues can't deadlock each other forever.
 	float LeftTurnYieldAccum = 0.0f;
 
+	/// Accumulated wait time for pre-curve red-light scan (U-turn / junction curve)
+	float JunctionRedLightWaitAccum = 0.0f;
+
 	/// Update stuck/overlap recovery logic (called in Tick)
 	void UpdateStuckRecovery(float DeltaTime);
 
@@ -1047,6 +1059,13 @@ private:
 	/// Kept out of the main StuckTimer so its long 3× delay doesn't
 	/// interfere with vehicle-vs-vehicle logic.
 	float StaticStuckTimer = 0.0f;
+
+	/// Accumulates while the car is stopped with NO ObstacleActor at all.
+	/// Used to gate zombie-head detection: a car that was recently blocked by a
+	/// traffic signal may transiently lose its ObstacleActor (throttle gap, signal
+	/// flicker) and must not be mistaken for a genuine zombie. Only after this
+	/// timer reaches StuckRecoveryDelay is the car treated as a zombie head.
+	float ZombieStuckTimer = 0.0f;
 
 	/// Pick a new random parking lot destination (different from current) — called on repeated stuck
 	void SwitchToNewRandomDestination();
