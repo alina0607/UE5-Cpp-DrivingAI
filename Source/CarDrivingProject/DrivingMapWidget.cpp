@@ -1006,8 +1006,8 @@ void UDrivingMapWidget::GetMapDrawRect(
 	FVector2D WidgetSize = Geometry.GetLocalSize();
 
 	if (bIsFullscreen)
-	{
-		// 全螢幕地圖放左側（佔螢幕 55% 寬），右側留給路徑面板
+	{ 
+		/*
 		// Fullscreen map on left side (55% of screen), right side for route panel
 		FVector2D FullSize;
 		FullSize.X = WidgetSize.X * 0.55;
@@ -1016,6 +1016,24 @@ void UDrivingMapWidget::GetMapDrawRect(
 		const float MarginX = 0.0f;
 		OutOrigin = FVector2D(MarginX, MarginY);
 		OutSize = FullSize;
+		*/
+		double WorldWidth = WorldBoundsMax.Y - WorldBoundsMin.Y;
+		double WorldHeight = WorldBoundsMax.X - WorldBoundsMin.X;
+		if (WorldWidth < 1.0) WorldWidth = 1.0;
+		if (WorldHeight < 1.0) WorldHeight = 1.0;
+
+		const float AvailableHeight = WidgetSize.Y * FullscreenCoverage;
+		const float WorldAspect = static_cast<float>(WorldWidth / WorldHeight);
+		const float FittedWidth = AvailableHeight * WorldAspect;
+
+		//const float MarginY = (WidgetSize.Y - AvailableHeight) * 0.5f;
+		const float MarginY = 0.0f;
+
+		OutOrigin = FVector2D(0.0f, MarginY);
+		OutSize = FVector2D(FittedWidth, AvailableHeight);
+
+		// 比例已處理，跳過下面的共用 aspect 修正
+		return;
 	}
 	else
 	{
