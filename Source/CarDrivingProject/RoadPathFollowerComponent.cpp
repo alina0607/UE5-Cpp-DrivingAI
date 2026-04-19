@@ -2823,8 +2823,12 @@ void URoadPathFollowerComponent::TickComponent(
 
 			LogEvent(FString::Printf(TEXT("(bIsChangingLane)")));
 		}
-
 		if (FMath::IsNearlyEqual(CurrentLateralOffset, TargetOffset, 10.0f))
+		{
+			CurrentLaneIndex = TargetLaneIndex;
+
+		}
+		if (FMath::IsNearlyEqual(CurrentLateralOffset, TargetOffset, 1.0f))
 		{
 			CurrentLateralOffset = TargetOffset;
 			CurrentLaneIndex = TargetLaneIndex;
