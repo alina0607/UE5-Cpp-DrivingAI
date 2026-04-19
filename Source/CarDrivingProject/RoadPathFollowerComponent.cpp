@@ -2431,6 +2431,7 @@ void URoadPathFollowerComponent::TickComponent(
 		// ================================================================
 		//      Overtaking logic (slow car → pass → return)
 		// ================================================================
+		// DISABLED — overtake suspected to cause SmoothedLateralVel accumulation bugs.
 		UpdateOvertakeLogic();
 
 		// ================================================================
@@ -2804,14 +2805,22 @@ void URoadPathFollowerComponent::TickComponent(
 	// ================================================================
 	const float TargetOffset = ComputeTargetLaneOffset(TargetLaneIndex);
 
-	// Approach-phase lane change: silently shift lateral position during normal driving
-	// so the car arrives at the junction already in the correct lane.
-	// PrevLateralOffset is captured AFTER this update so FrameLateralDelta = 0,
-	// meaning SmoothedLateralVel never builds up from this — the car slides to the
-	// target lane without any heading tilt. Heading tilt only comes from the junction
-	// curve itself. Gated by speed: no movement while stopped (avoids position snap
-	// when red-light early-return skips SetActorLocationAndRotation).
-	if (bIsChangingLane && !bOnJunctionCurve && CurrentSpeed > 0.5f)
+	// Saved BEFORE this frame's lateral update — the rotation system computes
+	// FrameLateralDelta from this, but ONLY applies it when bIsChangingLane is true
+	// (see heading update below). This means no tilt ever leaks out of a real lane change.
+	const float PrevLateralOffset = CurrentLateralOffset;
+
+	//dirty code
+	if (ObstacleActor.IsValid()) {
+		bIsChangingLane = false;
+		SmoothedLateralVel = 0.0f;
+	}
+
+	// Approach-phase lane change: shift lateral position during normal driving so the
+	// car arrives at the junction already in the correct lane.
+	// Gated by no obstacle ahead — CurrentSpeed is unreliable here because the car
+	// can still have speed while decelerating for an obstacle in front.
+	if (bIsChangingLane && !bOnJunctionCurve && !ObstacleActor.IsValid())
 	{
 		CurrentLateralOffset = FMath::FInterpTo(
 			CurrentLateralOffset, TargetOffset, DeltaTime, LaneChangeSmoothRate);
@@ -2819,14 +2828,14 @@ void URoadPathFollowerComponent::TickComponent(
 		if (FMath::IsNearlyEqual(CurrentLateralOffset, TargetOffset, 1.0f))
 		{
 			CurrentLateralOffset = TargetOffset;
-			CurrentLaneIndex = TargetLaneIndex;
-			bIsChangingLane = false;
+			CurrentLaneIndex     = TargetLaneIndex;
+			bIsChangingLane      = false;
+			SmoothedLateralVel   = 0.0f;  // clear residual steering after lane change completes
 		}
-	}
 
-	// Capture AFTER the silent approach shift so FrameLateralDelta only reflects
-	// in-junction-zone movement (which SHOULD tilt the heading during curve following).
-	const float PrevLateralOffset = CurrentLateralOffset;
+		LogEvent(FString::Printf(TEXT("(bIsChangingLane)")));
+
+	}
 
 	// ================================================================
 	//     Sample position + detect junction → generate Hermite curve
@@ -3038,22 +3047,24 @@ void URoadPathFollowerComponent::TickComponent(
 		const float NextHi = FMath::Max(NextSeg.StartDist, NextSeg.EndDist);
 		const float NextSampleDist = FMath::Clamp(NextSampleDistRaw, NextLo, NextHi);
 
-		// Determine target lane in next segment based on turn direction
+		// Determine target lane in next segment based on turn direction.
+		// MaxNextLane guards against NextLaneCount == 0 (single-lane roads map to lane 0).
 		const int32 NextLaneCount = NextSeg.DrivingRule.ForwardLaneCount;
+		const int32 MaxNextLane   = FMath::Max(0, NextLaneCount - 1);
 		if (CurrentTurnSignal == ETurnSignal::Right)
 		{
-			// Right turn ,outermost lane
-			JCurveNextLaneIndex = NextLaneCount - 1;
+			// Right turn → outermost lane of next segment (already the max)
+			JCurveNextLaneIndex = MaxNextLane;
 		}
 		else if (CurrentTurnSignal == ETurnSignal::Left)
 		{
-			// Left turn ,same lane, clamped
-			JCurveNextLaneIndex = FMath::Min(TargetLaneIndex, NextLaneCount - 1);
+			// Left turn → same target lane, hard-clamped to next segment's lane range
+			JCurveNextLaneIndex = FMath::Clamp(TargetLaneIndex, 0, MaxNextLane);
 		}
 		else
 		{
-			// Straight , same lane, clamped
-			JCurveNextLaneIndex = FMath::Min(TargetLaneIndex, NextLaneCount - 1);
+			// Straight → keep current lane, clamped to next segment's lane range
+			JCurveNextLaneIndex = FMath::Clamp(TargetLaneIndex, 0, MaxNextLane);
 		}
 
 		// Sample curve endpoint using next segment's target lane offset
@@ -3181,6 +3192,19 @@ void URoadPathFollowerComponent::TickComponent(
 		JCurveNextRefDist = NextSampleDist;
 
 		bOnJunctionCurve = true;
+
+		// Immediately cap CurrentSpeed to the curve speed limit.
+		// ComputeDesiredSpeed() will enforce this every tick too, but the ramp-down
+		// via BrakeDeceleration can lag one frame behind on curve entry — snapping here
+		// ensures the car never overshoots the curve with approach speed.
+		if (!bIsGapBridgeCurve)
+		{
+			const float CurveSpeedLimit = bIsUTurnCurve
+				? FMath::Max(MaxSpeed * UTurnSpeedRatio, 400.0f)
+				: MaxSpeed * JunctionMinSpeedRatio;
+			CurrentSpeed = FMath::Min(CurrentSpeed, CurveSpeedLimit);
+		}
+
 		LogEvent(FString::Printf(TEXT("JUNCTION ENTER %s%s len=%.0f"),
 			bIsUTurnCurve ? TEXT("U-TURN ") : TEXT(""),
 			bIsGapBridgeCurve ? TEXT("GAP ") : TEXT(""),
@@ -3335,11 +3359,13 @@ void URoadPathFollowerComponent::TickComponent(
 	{
 		FVector ActualMoveDir = RefDir.GetSafeNormal();
 
-		// If lateral offset changed this frame, blend lateral velocity into heading.
-		// SmoothedLateralVel ramps up gradually at lane-change start (LaneChangeSteerBlendRate)
-		// so the car nose turns in softly instead of snapping on the first frame.
+		// Heading tilt: ONLY applied during an active lane change (bIsChangingLane).
+		// Any lateral drift from junction-zone tracking, post-curve correction, or
+		// normal spline following must NOT rotate the car — those are position-only
+		// adjustments. Zeroing SmoothedLateralVel immediately when not lane-changing
+		// prevents any residual tilt from leaking into normal driving or red-light stops.
 		const float FrameLateralDelta = CurrentLateralOffset - PrevLateralOffset;
-		if (FMath::Abs(FrameLateralDelta) > 0.01f && DeltaTime > SMALL_NUMBER)
+		if (bIsChangingLane && FMath::Abs(FrameLateralDelta) > 0.01f && DeltaTime > SMALL_NUMBER)
 		{
 			const float RawLateralVel = FrameLateralDelta / DeltaTime;
 			SmoothedLateralVel = FMath::FInterpTo(
@@ -3348,8 +3374,8 @@ void URoadPathFollowerComponent::TickComponent(
 		}
 		else
 		{
-			// No lateral motion — decay smoothed vel back to zero
-			SmoothedLateralVel = FMath::FInterpTo(SmoothedLateralVel, 0.0f, DeltaTime, LaneChangeSteerBlendRate);
+			// Not lane-changing (or no delta) — snap lateral steering to zero immediately.
+			SmoothedLateralVel = 0.0f;
 		}
 
 		const FRotator TargetRot = ActualMoveDir.Rotation();
@@ -3357,6 +3383,16 @@ void URoadPathFollowerComponent::TickComponent(
 		const float EffRotSpeed = bIsChangingLane ? LaneChangeRotInterpSpeed : RotationInterpSpeed;
 		FinalRot = FMath::RInterpTo(
 			CurrentRot, TargetRot, DeltaTime, EffRotSpeed);
+	}
+	else
+	{
+		// Car is stopped or nearly stopped (speed <= 1 cm/s).
+		// The rotation block above doesn't run, so SmoothedLateralVel would otherwise
+		// sit at whatever value it had when the car last decelerated — and then
+		// re-accumulate on the next green-light departure, compounding each red-light
+		// cycle until every car ends up permanently tilted.
+		// Clearing it here ensures the slate is always clean before the next move.
+		SmoothedLateralVel = 0.0f;
 	}
 
 	Owner->SetActorLocationAndRotation(FinalPos, FinalRot);

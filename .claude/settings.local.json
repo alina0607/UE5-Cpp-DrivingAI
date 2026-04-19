@@ -13,7 +13,9 @@
       "Bash(awk '{print \"Total lines:\", NR}')",
       "Bash(rtk git:*)",
       "Bash(awk '/^\\\\s*public:/{s=\"pub\"} /^\\\\s*private:/{s=\"priv\"} /BlueprintReadWrite/{print NR\": \"s\": \"$0}' \"C:/UE5/UE5-Cpp-DrivingAI/Source/CarDrivingProject/RoadPathFollowerComponent.h\")",
-      "Bash(sort -t: -k2 -n)"
+      "Bash(sort -t: -k2 -n)",
+      "Bash(powershell -command \"Select-String -Path 'C:\\\\UE5\\\\UE5-Cpp-DrivingAI\\\\Source\\\\CarDrivingProject\\\\RoadPathFollowerComponent.cpp' -Pattern 'void URoadPathFollowerComponent::UpdateOvertakeLogic' | Select-Object LineNumber\")",
+      "Bash(powershell -command \"\\(Get-Content 'C:\\\\UE5\\\\UE5-Cpp-DrivingAI\\\\Source\\\\CarDrivingProject\\\\RoadPathFollowerComponent.cpp'\\).Count\")"
     ]
   }
 }
