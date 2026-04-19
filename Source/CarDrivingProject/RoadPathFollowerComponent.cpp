@@ -2810,30 +2810,30 @@ void URoadPathFollowerComponent::TickComponent(
 	// (see heading update below). This means no tilt ever leaks out of a real lane change.
 	const float PrevLateralOffset = CurrentLateralOffset;
 
-	//dirty code
-	if (ObstacleActor.IsValid()) {
-		bIsChangingLane = false;
-		SmoothedLateralVel = 0.0f;
-	}
 
 	// Approach-phase lane change: shift lateral position during normal driving so the
 	// car arrives at the junction already in the correct lane.
 	// Gated by no obstacle ahead — CurrentSpeed is unreliable here because the car
 	// can still have speed while decelerating for an obstacle in front.
-	if (bIsChangingLane && !bOnJunctionCurve && !ObstacleActor.IsValid())
+	if (bIsChangingLane && !bOnJunctionCurve)
 	{
-		CurrentLateralOffset = FMath::FInterpTo(
-			CurrentLateralOffset, TargetOffset, DeltaTime, LaneChangeSmoothRate);
+		if (!ObstacleActor.IsValid()) {
+			CurrentLateralOffset = FMath::FInterpTo(
+				CurrentLateralOffset, TargetOffset, DeltaTime, LaneChangeSmoothRate);
 
-		if (FMath::IsNearlyEqual(CurrentLateralOffset, TargetOffset, 1.0f))
-		{
-			CurrentLateralOffset = TargetOffset;
-			CurrentLaneIndex     = TargetLaneIndex;
-			bIsChangingLane      = false;
-			SmoothedLateralVel   = 0.0f;  // clear residual steering after lane change completes
+			LogEvent(FString::Printf(TEXT("(bIsChangingLane)")));
 		}
 
-		LogEvent(FString::Printf(TEXT("(bIsChangingLane)")));
+		if (FMath::IsNearlyEqual(CurrentLateralOffset, TargetOffset, 10.0f))
+		{
+			CurrentLateralOffset = TargetOffset;
+			CurrentLaneIndex = TargetLaneIndex;
+			bIsChangingLane = false;
+			SmoothedLateralVel = 0.0f;  // clear residual steering after lane change completes
+		}
+
+		
+
 
 	}
 
@@ -3131,6 +3131,11 @@ void URoadPathFollowerComponent::TickComponent(
 				const float CurOff = FMath::Abs(CurrentLateralOffset);
 				const float NextOff = FMath::Abs(NextSegLaneOffset);
 				R = FMath::Max((CurOff + NextOff) * 0.5f + UTurnRadiusPadding, 50.0f);
+
+				if (CurrentLaneIndex > 0)
+				{
+					R += OuterOffset * CurrentLaneIndex;
+				}
 			}
 			else
 			{

@@ -273,6 +273,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|U-Turn", meta = (ClampMin = "1.0", ClampMax = "30.0"))
 	float PostUTurnBlendSpeed = 6.0f;
 
+	/// Post-U-turn position blend speed — higher = faster convergence to spline
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|U-Turn", meta = (ClampMin = "1.0", ClampMax = "500.0"))
+	float OuterOffset = 50.0f;
+
 	// ================================================================
 	//  Lane Control
 	// ================================================================
@@ -378,7 +382,6 @@ public:
 
 	// ================================================================
 	//  Stuck / Overlap Recovery
-	//  卡住 / 重疊恢復：偵測完全停止 → 倒退分離 → 重新導航
 	// ================================================================
 
 	/// If obstacle distance < this, consider vehicles overlapping (cm)
@@ -408,17 +411,14 @@ public:
 	bool bRerouteAfterStuckRecovery = true;
 
 	/// Cooldown after a reverse completes — stuck detection disabled for this long (seconds)
-	/// 倒退完成後的冷卻時間，避免立刻又觸發
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "0.5"))
 	float StuckCooldownDuration = 3.0f;
 
 	/// Window to count consecutive stucks (seconds) — resets if no stuck within this time
-	/// 判斷「連續卡住」的時窗
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "5.0"))
 	float ConsecutiveStuckWindow = 15.0f;
 
 	/// After N consecutive stucks, switch to a new random destination (parking lot)
-	/// 連續卡住幾次後就換個隨機目的地
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Path|Stuck Recovery", meta = (ClampMin = "2"))
 	int32 MaxConsecutiveStucksBeforeSwitch = 3;
 
@@ -455,7 +455,7 @@ public:
 	static constexpr const TCHAR* TrafficSignalTagName = TEXT("TrafficSignal");
 
 	// ================================================================
-	//  Sequential Departure (源停車場出場順序)
+	//  Sequential Departure
 	// ================================================================
 
 	/// Poll interval when waiting for the previous spot's car to clear (seconds)
